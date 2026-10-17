@@ -35,10 +35,14 @@ All of JanusGraph's tests are written for JUnit.  JanusGraph's JUnit tests are a
 
 ### Marking tests as flaky
 
-If a test should be marked as flaky add following annotation to the test and open an issue.
+If a test should be marked as flaky, then first [open an issue](https://github.com/JanusGraph/janusgraph/issues/new?assignees=&labels=testing%2Fflaky&projects=&template=flaky-test.md)
+where you can add information about the flaky test that could be helpful later to others to understand why the test is
+marked as flaky and hopefully for fixing it.
+Afterwards, add the annotation to the test and link to the issue you just created:
 
 ```java
-@RepeatedIfExceptionsTest(repeats = 4, minSuccess = 2)
+// flaky test: https://github.com/JanusGraph/janusgraph/issues/[ISSUE_NUMBER]
+@RepeatedIfExceptionsTest(repeats = 3)
 public void testFlakyFailsSometimes(){}
 ```
 
@@ -87,17 +91,19 @@ mvn clean install -pl janusgraph-solr
 ```
 
 Additional Maven profiles are defined for testing against default versions of other supported major Solr releases.
-(Currently, only Solr 7 and Solr 8 are supported.)
+(Currently, Solr 8 and 9 are supported.)
 
 ```bash
-mvn clean install -pl janusgraph-solr -Psolr7
 mvn clean install -pl janusgraph-solr -Psolr8
+mvn clean install -pl janusgraph-solr -Psolr9
 ```
 
 Finally the `solr.docker.version` property can be used to test against arbitrary Solr versions.
+For Solr 9, use 9.4 or newer: the tests connect to the embedded ZooKeeper of the Solr container, which Solr 9.0 to
+9.3 only bind to the container's localhost.
 
 ```bash
-mvn clean install -pl janusgraph-solr -Dsolr.docker.version=7.0.0
+mvn clean install -pl janusgraph-solr -Dsolr.docker.version=9.9.0
 ```
 
 ## Running Elasticsearch Tests
@@ -124,11 +130,21 @@ mvn clean install -pl janusgraph-es -Delasticsearch.docker.image=elasticsearch
 mvn clean install -pl janusgraph-es -Delasticsearch.docker.version=6.0.0 -Delasticsearch.docker.image=elasticsearch
 ```
 
+The `opensearch2` and `opensearch3` profiles run the Elasticsearch tests against OpenSearch. Other OpenSearch versions
+can be tested with an OpenSearch image. The tests recognize an image whose repository is named `opensearch`; for an
+OpenSearch image with another name, set `elasticsearch.docker.distribution` to `opensearch`.
+
+```bash
+mvn clean install -pl janusgraph-es -Popensearch3
+mvn clean install -pl janusgraph-es -Delasticsearch.docker.image=opensearchproject/opensearch -Delasticsearch.docker.version=2.18.0
+mvn clean install -pl janusgraph-es -Delasticsearch.docker.image=registry.example.com/search -Delasticsearch.docker.version=3.9.0 -Delasticsearch.docker.distribution=opensearch
+```
+
 ## Running CQL Tests
 
 **Note** Running CQL tests require Docker.
 
-CQL tests are executed using [testcontainers-java](https://www.testcontainers.org/). 
+CQL tests are executed using [testcontainers-java](https://www.testcontainers.org/).
 CQL tests can be executed against a Cassandra 3 using the profile `cassandra3`, or a Scylla 3 using the profile `scylladb`.
 
 ```bash
@@ -140,13 +156,13 @@ mvn clean install -pl janusgraph-cql -Pscylladb
 
 System properties to configure CQL test executions:
 
-| Property | Description | Default value |
-| -------- | ----------- | ------------- |
-| `cassandra.docker.image` | Docker image to pull and run. | `cassandra` |
-| `cassandra.docker.version` | Docker image tag to pull and run  | `3.11.10` |
-| `cassandra.docker.partitioner` | Set the cassandra partitioner. Supported partitioner are `murmur`, or `byteordered`| `murmur` |
-| `cassandra.docker.useSSL` | Activate SSL **Note: This property currently only works with the partitioner set to `murmur`.** | `false` |
-| `cassandra.docker.useDefaultConfigFromImage` | If set to `false` default configs of the image are used. **Note: `cassandra.docker.partitioner` and `cassandra.docker.useSSL` are ignored.** | `false` |
+| Property                                     | Description                                                                                                                                 | Default value |
+|----------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|---------------|
+| `cassandra.docker.image`                     | Docker image to pull and run.                                                                                                               | `cassandra`   |
+| `cassandra.docker.version`                   | Docker image tag to pull and run                                                                                                            | `3.11.10`     |
+| `cassandra.docker.partitioner`               | Set the cassandra partitioner. Supported partitioner are `murmur`, or `byteordered`                                                         | `murmur`      |
+| `cassandra.docker.useSSL`                    | Activate SSL **Note: This property currently only works with the partitioner set to `murmur`.**                                             | `false`       |
+| `cassandra.docker.useDefaultConfigFromImage` | If set to `true` default configs of the image are used. **Note: `cassandra.docker.partitioner` and `cassandra.docker.useSSL` are ignored.** | `false`       |
 
 The following examples show possible configuration combinations.
 
@@ -156,26 +172,12 @@ mvn clean install -pl janusgraph-cql -Dcassandra.docker.image=cassandra
 mvn clean install -pl janusgraph-cql -Dcassandra.docker.image=cassandra -Dcassandra.docker.version=3.11.2
 ```
 
-### Running hbase tests
-
-**Note** Running HBase tests require Docker.
-
-### Special versions of HBase
-
-System properties to configure HBase test executions:
-
-| Property | Description | Default value |
-| -------- | ----------- | ------------- |
-| `hbase.docker.version` | HBase version to be used in the docker image. | `2.2.7` |
-| `hbase.docker.uid` | Uid used to run inside HBase of the container | 1000 |
-| `hbase.docker.gid` | Gid used to run inside HBase of the container | 1000 |
-
 ### TinkerPop tests
 
-The CQL backend is tested with TinkerPop tests using following command. 
+The CQL backend is tested with TinkerPop tests using following command.
 
-**Note: Profiles are not supported during running TinkerPop tests. 
-If you do not want to use the default config, you can set `cassandra.docker.image`, 
+**Note: Profiles are not supported during running TinkerPop tests.
+If you do not want to use the default config, you can set `cassandra.docker.image`,
 `cassandra.docker.version`, or `cassandra.docker.partitioner`.**
 
 ```bash
@@ -185,6 +187,20 @@ mvn clean install -Dtest.skip.tp=false -DskipTests=true -pl janusgraph-cql \
 
 ### Create new configuration files for new Versions of Cassandra
 
-The file `janusgraph-cql/src/test/resources/docker/docker-compose.yml` can be used to generate new configuration files. 
-Therefore, you have to start a Cassandra instance using `docker-compose up`. 
+The file `janusgraph-cql/src/test/resources/docker/docker-compose.yml` can be used to generate new configuration files.
+Therefore, you have to start a Cassandra instance using `docker-compose up`.
 Afterward, you can extract the configuration which is located in the following file `/etc/cassandra/cassandra.yaml`.
+
+## Running hbase tests
+
+**Note** Running HBase tests require Docker.
+
+### Special versions of HBase
+
+System properties to configure HBase test executions:
+
+| Property | Description | Default value |
+| -------- | ----------- | ------------- |
+| `hbase.docker.version` | HBase version to be used in the docker image. | `2.6.0` |
+| `hbase.docker.uid` | Uid used to run inside HBase of the container | 999 |
+| `hbase.docker.gid` | Gid used to run inside HBase of the container | 999 |

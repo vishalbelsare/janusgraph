@@ -23,10 +23,8 @@ import org.janusgraph.graphdb.internal.ElementLifeCycle;
 import org.janusgraph.graphdb.internal.InternalRelation;
 import org.janusgraph.graphdb.internal.InternalVertex;
 import org.janusgraph.graphdb.transaction.RelationConstructor;
+import org.janusgraph.graphdb.transaction.StandardJanusGraphTx;
 import org.janusgraph.graphdb.types.system.ImplicitKey;
-
-import java.util.ArrayList;
-import java.util.List;
 
 /**
  * @author Matthias Broecheler (me@matthiasb.com)
@@ -51,8 +49,7 @@ public class CacheVertexProperty extends AbstractVertexProperty {
         if (startVertex.hasAddedRelations() && startVertex.hasRemovedRelations()) {
             //Test whether this relation has been replaced
             final long id = longId();
-            it = Iterables.getOnlyElement(startVertex.getAddedRelations(
-                internalRelation -> (internalRelation instanceof StandardVertexProperty) && ((StandardVertexProperty) internalRelation).getPreviousID() == id), null);
+            it = Iterables.getOnlyElement(startVertex.findPreviousRelation(id), null);
         }
 
         return (it != null) ? it : super.it();
@@ -72,15 +69,15 @@ public class CacheVertexProperty extends AbstractVertexProperty {
         copy.remove();
 
         Long id = type.getConsistencyModifier() != ConsistencyModifier.FORK ? longId() : null;
-        StandardVertexProperty u = (StandardVertexProperty) tx().addProperty(getVertex(0), propertyKey(), value(), id);
-        u.setPreviousID(longId());
+        StandardVertexProperty u = (StandardVertexProperty) tx().addProperty(getVertex(0), propertyKey(), value(), id, longId());
         copyProperties(u);
         return u;
     }
 
     private RelationCache getPropertyMap() {
         RelationCache map = data.getCache();
-        if (map == null || !map.hasProperties()) {
+        //A header-only parse has to be completed; a full parse without properties is complete and is kept
+        if (map == null || !map.isFullyParsed()) {
             map = RelationConstructor.readRelationCache(data, tx());
         }
         return map;
@@ -94,12 +91,8 @@ public class CacheVertexProperty extends AbstractVertexProperty {
     @Override
     public Iterable<PropertyKey> getPropertyKeysDirect() {
         RelationCache map = getPropertyMap();
-        List<PropertyKey> types = new ArrayList<>(map.numProperties());
-
-        for (LongObjectCursor<Object> entry : map) {
-            types.add(tx().getExistingPropertyKey(entry.key));
-        }
-        return types;
+        StandardJanusGraphTx currentTx = tx();
+        return Iterables.transform(map, entry -> currentTx.getExistingPropertyKey(entry.key));
     }
 
     @Override

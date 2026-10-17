@@ -14,7 +14,6 @@
 
 package org.janusgraph.diskstorage.solr;
 
-import io.github.artsok.RepeatedIfExceptionsTest;
 import org.janusgraph.diskstorage.configuration.ModifiableConfiguration;
 import org.janusgraph.diskstorage.configuration.WriteConfiguration;
 import org.janusgraph.graphdb.JanusGraphIndexTest;
@@ -31,7 +30,7 @@ public abstract class SolrJanusGraphIndexTest extends JanusGraphIndexTest {
     protected static JanusGraphSolrContainer solrContainer = new JanusGraphSolrContainer();
 
     protected SolrJanusGraphIndexTest() {
-        super(true, true, true);
+        super(true, true, true, true);
     }
 
     @Override
@@ -82,9 +81,7 @@ public abstract class SolrJanusGraphIndexTest extends JanusGraphIndexTest {
     }
 
     @Override
-    @RepeatedIfExceptionsTest(repeats = 10, suspend = 1000L)
-    public void testIndexReplay() throws Exception {
-        super.testIndexReplay();
+    public boolean supportsGeoShapePrefixTreeMapping() {
+        return true;
     }
-
 }

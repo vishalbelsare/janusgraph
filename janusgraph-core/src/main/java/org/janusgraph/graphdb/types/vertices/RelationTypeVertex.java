@@ -22,24 +22,31 @@ import org.janusgraph.graphdb.internal.InternalRelationType;
 import org.janusgraph.graphdb.internal.Order;
 import org.janusgraph.graphdb.transaction.StandardJanusGraphTx;
 import org.janusgraph.graphdb.types.IndexType;
+import org.janusgraph.graphdb.types.SchemaSource;
 import org.janusgraph.graphdb.types.TypeDefinitionCategory;
 import org.janusgraph.graphdb.types.TypeUtil;
+import org.janusgraph.graphdb.types.indextype.IndexReferenceType;
 import org.janusgraph.graphdb.util.CollectionsUtil;
 
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
-import java.util.stream.Stream;
+import java.util.Map;
 
 /**
  * @author Matthias Broecheler (me@matthiasb.com)
  */
 public abstract class RelationTypeVertex extends JanusGraphSchemaVertex implements InternalRelationType {
 
-    private ConsistencyModifier consistency = null;
-    private Integer ttl = null;
-    private List<IndexType> indexes = null;
+    //Built from the definition and the related schema elements on first read and cleared by resetCache(), under the
+    //same rules as the caches of JanusGraphSchemaVertex: kept only if no reset overlapped the read, and volatile.
+    private volatile ConsistencyModifier consistency = null;
+    private volatile Integer ttl = null;
+    private volatile List<IndexType> indexes = null;
+    private volatile List<IndexReferenceType> indexesReferences = null;
 
-    public RelationTypeVertex(StandardJanusGraphTx tx, long id, byte lifecycle) {
+    public RelationTypeVertex(StandardJanusGraphTx tx, Object id, byte lifecycle) {
         super(tx, id, lifecycle);
     }
 
@@ -70,18 +77,24 @@ public abstract class RelationTypeVertex extends JanusGraphSchemaVertex implemen
 
     @Override
     public ConsistencyModifier getConsistencyModifier() {
-        if (consistency==null) {
-            consistency = TypeUtil.getConsistencyModifier(this);
+        ConsistencyModifier result = consistency;
+        if (result == null) {
+            final long resetsBefore = cacheResets();
+            result = TypeUtil.getConsistencyModifier(this);
+            keepUnlessReset(resetsBefore, result, value -> consistency = value);
         }
-        return consistency;
+        return result;
     }
 
     @Override
     public Integer getTTL() {
-        if (null == ttl) {
-            ttl = TypeUtil.getTTL(this);
+        Integer result = ttl;
+        if (result == null) {
+            final long resetsBefore = cacheResets();
+            result = TypeUtil.getTTL(this);
+            keepUnlessReset(resetsBefore, result, value -> ttl = value);
         }
-        return ttl;
+        return result;
     }
 
     @Override
@@ -94,34 +107,72 @@ public abstract class RelationTypeVertex extends JanusGraphSchemaVertex implemen
 
     @Override
     public Iterable<InternalRelationType> getRelationIndexes() {
-        return Stream.concat(
-            Stream.of(this),
-            getRelated(TypeDefinitionCategory.RELATIONTYPE_INDEX, Direction.OUT).stream()
-                .map(entry -> {
-                    assert entry.getSchemaType() instanceof InternalRelationType;
-                    return (InternalRelationType) entry.getSchemaType();
-                }))::iterator;
+        return Iterables.concat(
+            Collections.singletonList(this),
+            Iterables.transform(getRelated(TypeDefinitionCategory.RELATIONTYPE_INDEX,Direction.OUT), entry -> {
+                assert entry.getSchemaType() instanceof InternalRelationType;
+                return (InternalRelationType) entry.getSchemaType();
+            })
+        );
     }
 
     @Override
     public Iterable<IndexType> getKeyIndexes() {
         List<IndexType> result = indexes;
-        if (result==null) {
-            result = Collections.unmodifiableList(
-                CollectionsUtil.toArrayList(
-                    getRelated(TypeDefinitionCategory.INDEX_FIELD,Direction.IN),
-                    entry -> entry.getSchemaType().asIndexType()
-                )
-            );
-            indexes=result;
+        if (result == null) {
+            final long resetsBefore = cacheResets();
+            result = getIndexes();
+            keepUnlessReset(resetsBefore, result, value -> indexes = value);
         }
-        assert result!=null;
         return result;
+    }
+
+    @Override
+    public Iterable<IndexReferenceType> getKeyIndexesReferences() {
+        List<IndexReferenceType> result = indexesReferences;
+        if (result == null) {
+            final long resetsBefore = cacheResets();
+            result = getIndexesReferences();
+            keepUnlessReset(resetsBefore, result, value -> indexesReferences = value);
+        }
+        return result;
+    }
+
+    private List<IndexType> getIndexes() {
+        return Collections.unmodifiableList(
+            CollectionsUtil.toArrayList(
+                getRelated(TypeDefinitionCategory.INDEX_FIELD, Direction.IN),
+                entry -> entry.getSchemaType().asIndexType()
+            )
+        );
+    }
+
+    private List<IndexReferenceType> getIndexesReferences() {
+        Map<String, IndexReferenceType> relatedIndexes = new HashMap<>();
+
+        for (Entry entry : getRelated(TypeDefinitionCategory.INDEX_FIELD, Direction.IN)) {
+            SchemaSource index = entry.getSchemaType();
+            IndexReferenceType item = new IndexReferenceType(false, index.asIndexType());
+            relatedIndexes.put(index.name(), item);
+        }
+
+        for (Entry entry : getRelated(TypeDefinitionCategory.INDEX_INLINE_KEY, Direction.IN)) {
+            SchemaSource index = entry.getSchemaType();
+            if (!relatedIndexes.containsKey(index.name())) {
+                IndexReferenceType item = new IndexReferenceType(true, index.asIndexType());
+                relatedIndexes.put(index.name(), item);
+            }
+        }
+
+        return new ArrayList<>(relatedIndexes.values());
     }
 
     @Override
     public void resetCache() {
         super.resetCache();
-        indexes=null;
+        consistency = null;
+        ttl = null;
+        indexes = null;
+        indexesReferences = null;
     }
 }

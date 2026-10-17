@@ -21,13 +21,16 @@ import org.janusgraph.core.JanusGraphVertex;
 import org.janusgraph.core.JanusGraphVertexProperty;
 import org.janusgraph.core.JanusGraphVertexQuery;
 import org.janusgraph.core.VertexList;
+import org.janusgraph.diskstorage.StaticBuffer;
 import org.janusgraph.diskstorage.keycolumnvalue.SliceQuery;
+import org.janusgraph.graphdb.database.idhandling.IDHandler;
 import org.janusgraph.graphdb.internal.InternalVertex;
 import org.janusgraph.graphdb.internal.RelationCategory;
 import org.janusgraph.graphdb.query.BackendQueryHolder;
 import org.janusgraph.graphdb.query.QueryProcessor;
 import org.janusgraph.graphdb.query.profile.QueryProfiler;
 
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -47,6 +50,16 @@ import java.util.List;
  * @author Matthias Broecheler (me@matthiasb.com)
  */
 public class VertexCentricQueryBuilder extends BasicVertexCentricQueryBuilder<VertexCentricQueryBuilder> implements JanusGraphVertexQuery<VertexCentricQueryBuilder> {
+
+    //The slice query with which the properties of a vertex are preloaded, as a vertex caches it
+    //Shared, and never mutated: it is only handed to hasLoadedRelations, which reads it, so that the fast path allocates
+    //no query per access
+    static final SliceQuery ALL_PROPERTIES_SLICE = allPropertiesQuery();
+
+    private static SliceQuery allPropertiesQuery() {
+        final StaticBuffer[] bounds = IDHandler.getBounds(RelationCategory.PROPERTY, false);
+        return new SliceQuery(bounds[0], bounds[1]);
+    }
 
     /**
     The base vertex of this query
@@ -72,23 +85,44 @@ public class VertexCentricQueryBuilder extends BasicVertexCentricQueryBuilder<Ve
     protected<Q> Q execute(RelationCategory returnType, ResultConstructor<Q> resultConstructor) {
         BaseVertexCentricQuery bq = super.constructQuery(returnType);
         if (bq.isEmpty()) return resultConstructor.emptyResult();
-        if (returnType==RelationCategory.PROPERTY && hasSingleType() && !hasQueryOnlyLoaded()
-                && tx.getConfiguration().hasPropertyPrefetching()) {
-            //Preload properties
+        boolean prefetchAllVertexProperties = returnType==RelationCategory.PROPERTY && hasSingleType() && !hasQueryOnlyLoaded()
+            && tx.getConfiguration().hasPropertyPrefetching();
+        //Preload properties, unless the vertex holds them already: the preload is a query of its own, which costs more
+        //than the read of one property it is meant to serve. A partitioned vertex keeps its properties on its canonical
+        //representative, which the query for one property reads
+        if (prefetchAllVertexProperties && !propertiesLoaded(vertex)) {
             vertex.query().properties().iterator().hasNext();
         }
 
-        if (isPartitionedVertex(vertex) && !hasQueryOnlyGivenVertex()) { //If it's a preloaded vertex we shouldn't preload data explicitly
+        if (isPartitionedVertex(vertex)) { //If it's a preloaded vertex we shouldn't preload data explicitly
             List<InternalVertex> vertices = allRequiredRepresentatives(vertex);
             profiler.setAnnotation(QueryProfiler.PARTITIONED_VERTEX_ANNOTATION,true);
             profiler.setAnnotation(QueryProfiler.NUMVERTICES_ANNOTATION,vertices.size());
             if (vertices.size()>1) {
-                for (BackendQueryHolder<SliceQuery> sq : bq.getQueries()) {
-                    tx.executeMultiQuery(vertices, sq.getBackendQuery(),sq.getProfiler());
+                if(bq.getQueries().size() == 1){
+                    BackendQueryHolder<SliceQuery> query = bq.getQueries().get(0);
+                    // if it's just a single query - there is no need to group any queries together.
+                    // Thus, we can execute `executeMultiQuery` instead of `executeMultiSliceMultiQuery`
+                    tx.executeMultiQuery(vertices, query.getBackendQuery(),query.getProfiler());
+                } else {
+                    tx.executeMultiSliceMultiQuery(vertices, bq.getQueries(), profiler);
                 }
             }
-        } else profiler.setAnnotation(QueryProfiler.NUMVERTICES_ANNOTATION,1);
+        } else {
+            profiler.setAnnotation(QueryProfiler.NUMVERTICES_ANNOTATION,1);
+            // in case there are more than 1 slice query expected for the provided vertex
+            // then it still makes sense to pre-fetch vertex data via multi-slice query (all queries in parallel)
+            // instead of executing each separate query sequentially
+            if(!prefetchAllVertexProperties && bq.getQueries().size() > 1){
+                tx.executeMultiSliceMultiQuery(Collections.singletonList(vertex), bq.getQueries(), profiler);
+            }
+        }
         return resultConstructor.getResult(vertex,bq);
+    }
+
+    private boolean propertiesLoaded(InternalVertex vertex) {
+        final InternalVertex holder = isPartitionedVertex(vertex) ? tx.getCanonicalVertex(vertex) : vertex;
+        return holder.hasLoadedRelations(ALL_PROPERTIES_SLICE);
     }
 
     //#### RELATIONS

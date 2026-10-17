@@ -27,6 +27,12 @@ reindexing job has completed, the index is fully populated and ready to
 be used. The index must then be enabled to be used during query
 processing.
 
+!!! info
+    A reindex job executed through `JanusGraphManagement` automatically enables the index once it has completed —
+    unless the index is in the `WRITE_ONLY_ENABLED` state, in which case the state is preserved and the index has
+    to be enabled explicitly with `SchemaAction.ENABLE_INDEX` when needed. See
+    [Index Lifecycle](index-lifecycle.md) for details on the write-only workflow.
+
 ## Prior to Reindex
 
 The starting point of the reindexing process is the construction of an
@@ -75,7 +81,7 @@ the steps to run a reindex job using this class:
 - If the index has not yet been enabled, enable it through `JanusGraphManagement`
 
 This class implements an `updateIndex` method that supports only the
-`REINDEX` and `REMOVE_INDEX` actions for its `SchemaAction` parameter.
+`REINDEX` and `DISCARD_INDEX` actions for its `SchemaAction` parameter.
 The class starts a Hadoop MapReduce job using the Hadoop configuration
 and jars on the classpath. Both Hadoop 1 and 2 are supported. This class
 gets metadata about the index and storage backend (e.g. the Cassandra
@@ -149,10 +155,10 @@ graph = JanusGraphFactory.open("conf/janusgraph-cql-es.properties")
 g.V().has("desc", containsText("baz"))
 ```
 
-## Executing a Reindex job on JanusGraphManagement
+## Executing a Reindex job on ManagementSystem
 
-To run a reindex job on JanusGraphManagement, invoke
-`JanusGraphManagement.updateIndex` with the `SchemaAction.REINDEX`
+To run a reindex job on ManagementSystem, invoke
+`ManagementSystem.updateIndex` with the `SchemaAction.REINDEX`
 argument. For example:
 ```groovy
 m = graph.openManagement()
@@ -161,11 +167,21 @@ m.updateIndex(i, SchemaAction.REINDEX).get()
 m.commit()
 ```
 
-### Example for JanusGraphManagement
+ManagementSystem uses a local thread pool to run reindexing
+jobs concurrently. By default, the concurrency level equals
+the number of available processors. If you want to change the
+concurrency level, you can add a parameter like this:
+```groovy
+// only use one thread to run reindexing
+m.updateIndex(i, SchemaAction.REINDEX, 1).get()
+```
+
+
+### Example for ManagementSystem
 
 The following loads some sample data into a BerkeleyDB-backed JanusGraph
 database, defines an index after the fact, reindexes using
-JanusGraphManagement, and finally enables and uses the index:
+ManagementSystem, and finally enables and uses the index:
 ```groovy
 import org.janusgraph.graphdb.database.management.ManagementSystem
 
@@ -199,7 +215,7 @@ i = m.getGraphIndex('names')
 m.updateIndex(i, SchemaAction.REINDEX)
 m.commit()
 
-// Enable the index
+// Wait for the index to be enabled
 ManagementSystem.awaitGraphIndexStatus(graph, 'names').status(SchemaStatus.ENABLED).call()
 
 // Run a query -- JanusGraph will use the new index, no planner warning
@@ -223,10 +239,10 @@ built, the job might fail with an exception like one of the following:
 
     The index mixedExample is in an invalid state and cannot be indexed.
     The following index keys have invalid status: desc has status INSTALLED
-    (status must be one of [REGISTERED, ENABLED])
+    (status must be one of [REGISTERED, ENABLED, DISABLED, WRITE_ONLY_ENABLED])
 
     The index mixedExample is in an invalid state and cannot be indexed.
-    The index has status INSTALLED, but one of [REGISTERED, ENABLED] is required
+    The index has status INSTALLED, but one of [REGISTERED, ENABLED, DISABLED, WRITE_ONLY_ENABLED] is required
 
 When an index is built, its existence is broadcast to all other
 JanusGraph instances in the cluster. Those must acknowledge the
@@ -264,3 +280,12 @@ index as defined when building the index should be specified. When
 reindexing a global graph index, the name of the index must be given in
 addition to the name of the edge label or property key on which the
 vertex-centric index is defined.
+
+### Stale index entries
+
+A reindex job is additive: it restores missing and outdated index entries for elements that currently exist in the
+graph, but it never removes entries. In particular, an index entry that points to an element which no longer exists
+(for example because the element was deleted while an index status change was still propagating through the cluster,
+or while the index was disabled) is not cleaned up by `REINDEX` and may surface in query results as a ghost vertex.
+Such entries can be removed with `SchemaAction.REMOVE_STALE_ENTRIES`.
+See [Consistency during status transitions](index-lifecycle.md#consistency-during-status-transitions) for details.

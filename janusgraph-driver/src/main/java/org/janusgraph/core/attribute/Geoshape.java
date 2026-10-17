@@ -54,6 +54,7 @@ import java.text.ParseException;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -108,7 +109,7 @@ public class Geoshape {
         }
 
         public static Type fromGson(String gsonShape) {
-            return Type.valueOf(gsonShape.toUpperCase());
+            return Type.valueOf(gsonShape.toUpperCase(Locale.ROOT));
         }
 
         @Override
@@ -213,6 +214,14 @@ public class Geoshape {
         Preconditions.checkArgument(getType()==Type.CIRCLE,"This shape is not a circle");
         double radiusInDeg = ((Circle) shape).getRadius();
         return DistanceUtils.degrees2Dist(radiusInDeg, DistanceUtils.EARTH_MEAN_RADIUS_KM);
+    }
+
+    /**
+     * Returns the radius in meters of this circle. Only applicable to circle shapes.
+     * @return
+     */
+    public double getRadiusMeters() {
+        return getRadius() * 1000;
     }
 
     private SpatialRelation getSpatialRelation(Geoshape other) {

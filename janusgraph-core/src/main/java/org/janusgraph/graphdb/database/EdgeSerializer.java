@@ -43,8 +43,11 @@ import org.janusgraph.graphdb.internal.Order;
 import org.janusgraph.graphdb.internal.RelationCategory;
 import org.janusgraph.graphdb.relations.EdgeDirection;
 import org.janusgraph.graphdb.relations.RelationCache;
+import org.janusgraph.graphdb.types.TypeDefinitionCategory;
+import org.janusgraph.graphdb.types.TypeDefinitionMap;
 import org.janusgraph.graphdb.types.TypeInspector;
 import org.janusgraph.graphdb.types.system.ImplicitKey;
+import org.janusgraph.graphdb.types.vertices.PropertyKeyVertex;
 import org.janusgraph.util.datastructures.Interval;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -76,7 +79,10 @@ public class EdgeSerializer implements RelationReader {
 
     public RelationCache readRelation(Entry data, boolean parseHeaderOnly, TypeInspector tx) {
         RelationCache map = data.getCache();
-        if (map == null || !(parseHeaderOnly || map.hasProperties())) {
+        //A cached parse serves a header-only read whatever it is, and a full read when it is a full parse. That is
+        //told apart from a header-only parse by whether the properties were parsed, not by whether there are any:
+        //a relation without properties is parsed once like any other
+        if (map == null || !(parseHeaderOnly || map.isFullyParsed())) {
             map = parseRelation(data, parseHeaderOnly, tx);
             data.setCache(map);
         }
@@ -87,6 +93,12 @@ public class EdgeSerializer implements RelationReader {
         RelationCache map = data.getCache();
         if (map != null) return map.direction;
         return IDHandler.readRelationType(data.asReadBuffer()).dirID.getDirection();
+    }
+
+    public long parseTypeId(Entry data) {
+        RelationCache map = data.getCache();
+        if (map != null) return map.typeId;
+        return IDHandler.readRelationType(data.asReadBuffer()).typeId;
     }
 
     @Override
@@ -108,13 +120,13 @@ public class EdgeSerializer implements RelationReader {
         int startKeyPos = in.getPosition();
         int endKeyPos = 0;
         if (relationType.isEdgeLabel()) {
-            long otherVertexId;
+            Object otherVertexId;
             if (multiplicity.isConstrained()) {
                 if (multiplicity.isUnique(dir)) {
-                    otherVertexId = VariableLong.readPositive(in);
+                    otherVertexId = IDHandler.readVertexId(in, true);
                 } else {
                     in.movePositionTo(data.getValuePosition());
-                    otherVertexId = VariableLong.readPositiveBackward(in);
+                    otherVertexId = IDHandler.readVertexId(in, false);
                     in.movePositionTo(data.getValuePosition());
                 }
                 relationId = VariableLong.readPositive(in);
@@ -122,7 +134,7 @@ public class EdgeSerializer implements RelationReader {
                 in.movePositionTo(data.getValuePosition());
 
                 relationId = VariableLong.readPositiveBackward(in);
-                otherVertexId = VariableLong.readPositiveBackward(in);
+                otherVertexId = IDHandler.readVertexId(in, false);
                 endKeyPos = in.getPosition();
                 in.movePositionTo(data.getValuePosition());
             }
@@ -147,7 +159,8 @@ public class EdgeSerializer implements RelationReader {
 
         if (!excludeProperties) {
 
-            LongObjectHashMap<Object> properties = new LongObjectHashMap<>(4);
+            //Allocated by the first property; most relations have none besides their value or other end
+            LongObjectHashMap<Object> properties = null;
 
             if (!multiplicity.isConstrained() && keySignature.length > 0) {
                 int currentPos = in.getPosition();
@@ -157,19 +170,19 @@ public class EdgeSerializer implements RelationReader {
                 in.movePositionTo(startKeyPos);
                 ReadBuffer inKey = in;
                 if (def.getSortOrder() == Order.DESC) inKey = in.subrange(keyLength, true);
-                readInlineTypes(keySignature, properties, inKey, tx, InlineType.KEY);
+                properties = readInlineTypes(keySignature, properties, inKey, tx, InlineType.KEY);
                 in.movePositionTo(currentPos);
             }
 
             //read value signature
-            readInlineTypes(def.getSignature(), properties, in, tx, InlineType.SIGNATURE);
+            properties = readInlineTypes(def.getSignature(), properties, in, tx, InlineType.SIGNATURE);
 
             //Third: read rest
             while (in.hasRemaining()) {
                 PropertyKey type = tx.getExistingPropertyKey(IDHandler.readInlineRelationType(in));
                 Object propertyValue = readInline(in, type, InlineType.NORMAL);
                 assert propertyValue != null;
-                properties.put(type.longId(), propertyValue);
+                properties = put(properties, type.longId(), propertyValue);
             }
 
             if (data.hasMetaData()) {
@@ -177,24 +190,53 @@ public class EdgeSerializer implements RelationReader {
                     ImplicitKey key = ImplicitKey.MetaData2ImplicitKey.get(metas.getKey());
                     if (key != null) {
                         assert metas.getValue() != null;
-                        properties.put(key.longId(),metas.getValue());
+                        properties = put(properties, key.longId(), metas.getValue());
                     }
                 }
             }
 
-            return new RelationCache(dir, typeId, relationId, other, properties);
+            return properties == null
+                ? RelationCache.withoutProperties(dir, typeId, relationId, other)
+                : new RelationCache(dir, typeId, relationId, other, properties);
+        } else if (!in.hasRemaining() && keySignature.length == 0 && def.getSignature().length == 0
+            && !hasPropertyMetaData(data)) {
+            //Nothing is left which a full parse would read: no bytes after the header, no sort key, no signature and
+            //no metadata which stands for a property. The relation has no properties, and this parse is as complete
+            //as a full one, so a later read of the properties doesn't parse the entry again
+            return RelationCache.withoutProperties(dir, typeId, relationId, other);
         } else {
             return new RelationCache(dir, typeId, relationId, other);
         }
     }
 
-    private void readInlineTypes(long[] keyIds, LongObjectHashMap<Object> properties, ReadBuffer in, TypeInspector tx,
-                                 InlineType inlineType) {
+    //Whether the entry carries metadata which a full parse turns into a property, such as a timestamp or a TTL. Other
+    //metadata, such as the row key of a grouped multi-key read, doesn't stand for a property
+    private static boolean hasPropertyMetaData(Entry data) {
+        if (!data.hasMetaData()) {
+            return false;
+        }
+        for (EntryMetaData metaData : data.getMetaData().keySet()) {
+            if (ImplicitKey.MetaData2ImplicitKey.containsKey(metaData)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private LongObjectHashMap<Object> readInlineTypes(long[] keyIds, LongObjectHashMap<Object> properties, ReadBuffer in,
+                                                      TypeInspector tx, InlineType inlineType) {
         for (long keyId : keyIds) {
             PropertyKey keyType = tx.getExistingPropertyKey(keyId);
             Object value = readInline(in, keyType, inlineType);
-            if (value != null) properties.put(keyId, value);
+            if (value != null) properties = put(properties, keyId, value);
         }
+        return properties;
+    }
+
+    private static LongObjectHashMap<Object> put(LongObjectHashMap<Object> properties, long key, Object value) {
+        if (properties == null) properties = new LongObjectHashMap<>(4);
+        properties.put(key, value);
+        return properties;
     }
 
     private Object readInline(ReadBuffer read, PropertyKey key, InlineType inlineType) {
@@ -253,7 +295,6 @@ public class EdgeSerializer implements RelationReader {
         DirectionID dirID = getDirID(dir, relation.isProperty() ? RelationCategory.PROPERTY : RelationCategory.EDGE);
 
         DataOutput out = serializer.getDataOutput(DEFAULT_CAPACITY);
-        int valuePosition;
         IDHandler.writeRelationType(out, typeId, dirID, type.isInvisibleType());
         Multiplicity multiplicity = type.multiplicity();
 
@@ -268,19 +309,20 @@ public class EdgeSerializer implements RelationReader {
         long relationId = relation.longId();
 
         //How multiplicity is handled for edges and properties is slightly different
+        int valuePosition;
         if (relation.isEdge()) {
-            long otherVertexId = relation.getVertex((position + 1) % 2).longId();
+            Object otherVertexId = relation.getVertex((position + 1) % 2).id();
             if (multiplicity.isConstrained()) {
                 if (multiplicity.isUnique(dir)) {
                     valuePosition = out.getPosition();
-                    VariableLong.writePositive(out, otherVertexId);
+                    IDHandler.writeVertexId(out, otherVertexId, true);
                 } else {
-                    VariableLong.writePositiveBackward(out, otherVertexId);
+                    IDHandler.writeVertexId(out, otherVertexId, false);
                     valuePosition = out.getPosition();
                 }
                 VariableLong.writePositive(out, relationId);
             } else {
-                VariableLong.writePositiveBackward(out, otherVertexId);
+                IDHandler.writeVertexId(out, otherVertexId, false);
                 VariableLong.writePositiveBackward(out, relationId);
                 valuePosition = out.getPosition();
             }
@@ -396,7 +438,6 @@ public class EdgeSerializer implements RelationReader {
         Preconditions.checkNotNull(dir);
         Preconditions.checkArgument(type.isUnidirected(Direction.BOTH) || type.isUnidirected(dir));
 
-
         StaticBuffer sliceStart = null, sliceEnd = null;
         RelationCategory rt = type.isPropertyKey() ? RelationCategory.PROPERTY : RelationCategory.EDGE;
         if (dir == Direction.BOTH) {
@@ -434,17 +475,21 @@ public class EdgeSerializer implements RelationReader {
 
                 } else {
                     assert !type.multiplicity().isConstrained();
-                    assert propertyKey.longId() == sortKeyIDs[i];
+                    assert propertyKey.id().equals(sortKeyIDs[i]);
                 }
 
                 if (interval == null || interval.isEmpty()) {
                     break;
                 }
                 if (interval.isPoints()) {
-                    if (propertyKey==ImplicitKey.JANUSGRAPHID || propertyKey==ImplicitKey.ADJACENT_ID) {
+                    if (propertyKey==ImplicitKey.JANUSGRAPHID) {
                         assert !type.multiplicity().isUnique(dir);
-                        VariableLong.writePositiveBackward(colStart, (Long)interval.getStart());
-                        VariableLong.writePositiveBackward(colEnd, (Long)interval.getEnd());
+                        VariableLong.writePositiveBackward(colStart, (Long) interval.getStart());
+                        VariableLong.writePositiveBackward(colEnd, (Long) interval.getEnd());
+                    } else if (propertyKey==ImplicitKey.ADJACENT_ID) {
+                        assert !type.multiplicity().isUnique(dir);
+                        IDHandler.writeVertexId(colStart, interval.getStart(), false);
+                        IDHandler.writeVertexId(colEnd, interval.getEnd(), false);
                     } else {
                         writeInline(colStart, propertyKey, interval.getStart(), InlineType.KEY);
                         writeInline(colEnd, propertyKey, interval.getEnd(), InlineType.KEY);
@@ -496,7 +541,20 @@ public class EdgeSerializer implements RelationReader {
                 sliceEnd = BufferUtil.nextBiggerBuffer(sliceStart);
             }
         }
-        return new SliceQuery(sliceStart, sliceEnd, type.name());
+        return new SliceQuery(sliceStart, sliceEnd, type.name()).setDirectColumnByStartOnlyAllowed(isDirectColumnByStartOnlyAllowed(type));
+    }
+
+    public static boolean isDirectColumnByStartOnlyAllowed(InternalRelationType type){
+        if(type instanceof PropertyKeyVertex){
+            TypeDefinitionMap definitionMap = ((PropertyKeyVertex) type).getDefinition();
+            if(definitionMap != null){
+                Multiplicity multiplicity = (Multiplicity)definitionMap.get(TypeDefinitionCategory.MULTIPLICITY);
+                if(multiplicity != null){
+                    return Cardinality.SINGLE.equals(multiplicity.getCardinality());
+                }
+            }
+        }
+        return false;
     }
 
     public static class TypedInterval {

@@ -37,6 +37,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Supplier;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
@@ -77,6 +78,30 @@ public class JanusGraphAssert {
 
     public static<V extends Element> void assertNotEmpty(Object object) {
         assertFalse(isEmpty(object));
+    }
+
+    public static <E extends Element> void assertTraversalAndIndexUsage(List<String> containsText,
+            Supplier<GraphTraversal<?, E>> traversal,
+            E... expectedElements) {
+
+        // assert expected results
+        assertTraversal(traversal.get(), expectedElements);
+
+        // assert index usage
+        String profileStr = traversal.get().profile().toList().toString();
+
+        // let's drop the postfix coming from dynamic field definition so comparison will not fail for Solr
+        // all dynamic field definitions are in janusgraph-solr/src/test/resources/solr/core-template/schema.xml
+        // multi-valued date and date postfix
+        profileStr = profileStr.replace("_dts", "").replace("_dt", "");
+        // multi-valued string and string postfix
+        profileStr = profileStr.replace("_ss", "").replace("_s", "");
+        // multi-valued double and double postfix
+        profileStr = profileStr.replace("_ds", "").replace("_d", "");
+
+        for (String text : containsText) {
+            assertTrue(profileStr.contains(text));
+        }
     }
 
     public static<E extends Element> void assertTraversal(GraphTraversal<?, E> req, E... expectedElements) {
@@ -200,5 +225,40 @@ public class JanusGraphAssert {
             }
         }
         return null;
+    }
+
+
+    /**
+     * Checks that the amount of steps of given type is equal to the provided amount.
+     */
+    public static void assertStepExists(Traversal traversal, Class<? extends Step> expectedStepType, int stepsCount) {
+
+        String traversalString = traversal.toString();
+
+        int lastStepIndex = traversalString.indexOf(expectedStepType.getSimpleName());
+
+        if(stepsCount <= 0){
+            assertEquals(-1, lastStepIndex);
+        }
+
+        int stepsFound = 0;
+
+        while (lastStepIndex != -1){
+            ++stepsFound;
+            lastStepIndex = traversalString.indexOf(expectedStepType.getSimpleName(), lastStepIndex+1);
+        }
+
+        assertEquals(stepsCount, stepsFound);
+    }
+
+    public static Metrics getLastStepMetrics(TraversalMetrics traversalMetrics, Class<? extends Step> stepClass){
+        String stepMetricsName = stepClass.getSimpleName();
+        Metrics metricsToReturn = null;
+        for(Metrics metrics : traversalMetrics.getMetrics()){
+            if(metrics.getName().startsWith(stepMetricsName)){
+                metricsToReturn = metrics;
+            }
+        }
+        return metricsToReturn;
     }
 }

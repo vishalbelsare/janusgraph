@@ -16,6 +16,10 @@ package org.janusgraph.graphdb.transaction;
 
 import org.janusgraph.core.schema.DefaultSchemaMaker;
 import org.janusgraph.diskstorage.BaseTransactionConfig;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryDropStepStrategyMode;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryHasStepStrategyMode;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryLabelStepStrategyMode;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryPropertiesStrategyMode;
 
 /**
  * Provides configuration options for {@link org.janusgraph.core.JanusGraphTransaction}.
@@ -189,5 +193,37 @@ public interface TransactionConfiguration extends BaseTransactionConfig {
      * Returns true if the queried partitions should be restricted in this transaction
      */
     boolean hasRestrictedPartitions();
+
+    /**
+     * Returns true if read queries should skip accessing JanusGraph database level cache (db-cache).
+     * Doesn't have any effect if database level cache was disabled via config `cache.db-cache`.
+     */
+    boolean isSkipDBCacheRead();
+
+    /**
+     * Returns true if all properties and edges are lazy-loaded: ids and values are deserialized upon demand.
+     * When enabled, it can have a boost on large scale read operations, when only certain type of relations are being read.
+     */
+    boolean isLazyLoadRelations();
+
+    /**
+     * @return Has step strategy mode used for the transaction. Can be configured via config `query.batch.has-step-mode`.
+     */
+    MultiQueryHasStepStrategyMode getHasStepStrategyMode();
+
+    /**
+     * @return Properties strategy mode used for the transaction. Can be configured via config `query.batch.properties-mode`.
+     */
+    MultiQueryPropertiesStrategyMode getPropertiesStrategyMode();
+
+    /**
+     * @return Label step strategy mode used for the transaction. Can be configured via config `query.batch.label-step-mode`.
+     */
+    MultiQueryLabelStepStrategyMode getLabelStepStrategyMode();
+
+    /**
+     * @return Drop step strategy mode used for the transaction. Can be configured via config `query.batch.drop-step-mode`.
+     */
+    MultiQueryDropStepStrategyMode getDropStepStrategyMode();
 
 }

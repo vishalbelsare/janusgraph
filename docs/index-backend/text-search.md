@@ -59,6 +59,7 @@ Full-text search is case-insensitive.
 -   `textContainsFuzzy`: is true if (at least) one word inside the text
     string is similar to the query String (based on Levenshtein edit
     distance)
+-   `textContainsPhrase`: is true if the text string does contain the sequence of words in the query string
 
 ```groovy
 import static org.janusgraph.core.attribute.Text.*
@@ -66,6 +67,7 @@ g.V().has('booksummary', textContains('unicorns'))
 g.V().has('booksummary', textContainsPrefix('uni'))
 g.V().has('booksummary', textContainsRegex('.*corn.*'))
 g.V().has('booksummary', textContainsFuzzy('unicorn'))
+g.V().has('booksummary', textContainsPhrase('unicorn horn'))
 ```
 
 The Elasticsearch backend extends this functionality and includes support for negations
@@ -132,9 +134,17 @@ filtering in memory which can be very costly.
 
 ### Full text and string search
 
-If you are using Elasticsearch it is possible to index properties as
-both text and string allowing you to use all of the predicates for exact
-and fuzzy matching.
+Elasticsearch, OpenSearch, Solr and Lucene can index properties as
+both text and string, `Mapping.TEXTSTRING`, allowing you to use all of
+the predicates for exact and fuzzy matching. The full-text search
+predicates match the words of the text, case-insensitively, and the
+string search predicates, as well as `lt`, `lte`, `gt`, `gte` and
+`between`, match the whole string, case-sensitively. A key with a
+custom string analyzer
+([`ParameterType.STRING_ANALYZER`](field-mapping.md#custom-analyzer))
+is the exception: `eq` and `neq` first split their value with that
+analyzer, and the other string predicates and the ranges compare their
+value with the terms which the analyzer gives.
 
 ```groovy
 mgmt = graph.openManagement()
@@ -163,19 +173,20 @@ g.V().has('bookname', containing('nico'))
 By default, JanusGraph supports indexing geo properties with point type
 and querying geo properties by circle or box. To index a non-point geo
 property with support for querying by any geoshape type, specify the
-mapping as `Mapping.PREFIX_TREE`:
+mapping as `Mapping.BKD` (preferred for ElasticSearch) or `Mapping.PREFIX_TREE` (Supported in Solr, Lucene, and ElasticSearch 6. 
+Deprecated in ElasticSearch 7. Support was removed in ElasticSearch 8):
 
 ```groovy
 mgmt = graph.openManagement()
 name = mgmt.makePropertyKey('border').dataType(Geoshape.class).make()
-mgmt.buildIndex('borderIndex', Vertex.class).addKey(name, Mapping.PREFIX_TREE.asParameter()).buildMixedIndex("search")
+mgmt.buildIndex('borderIndex', Vertex.class).addKey(name, Mapping.BKD.asParameter()).buildMixedIndex("search")
 mgmt.commit()
 ```
 
-Additional parameters can be specified to tune the configuration of the
-underlying prefix tree mapping. These optional parameters include the
-number of levels used in the prefix tree as well as the associated
-precision.
+When `Mapping.PREFIX_TREE` is used it is possible to specify additional 
+parameters to tune the configuration of the underlying prefix tree mapping. 
+These optional parameters include the number of levels used in the prefix 
+tree as well as the associated precision.
 
 ```groovy
 mgmt = graph.openManagement()
@@ -187,3 +198,12 @@ mgmt.commit()
 Note that some indexing backends (e.g. Solr) may require additional
 external schema configuration to support and tune indexing non-point
 properties.
+
+!!! info
+    `Mapping.BKD` mapping which is preferred for ElasticSearch doesn't support Circle shape. 
+    Instead of indexing a Circle as it was with `Mapping.PREFIX_TREE` there are Circle 
+    processors available which transform Circle into other shapes and index those shapes instead. 
+    Depending on the precision configuration used, search for such circles may behave differently. 
+    The higher the precision the more points is used during indexing which may affect storage size
+    and index time. See `index.[X].bkd-circle-processor` configuration properties for more information
+    about BKD circle processors.

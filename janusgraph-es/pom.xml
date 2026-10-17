@@ -3,7 +3,7 @@
     <parent>
         <groupId>org.janusgraph</groupId>
         <artifactId>janusgraph</artifactId>
-        <version>1.0.0-SNAPSHOT</version>
+        <version>1.2.0-SNAPSHOT</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
     <artifactId>janusgraph-es</artifactId>
@@ -11,17 +11,28 @@
     <url>https://janusgraph.org</url>
     <properties>
         <top.level.basedir>${basedir}/..</top.level.basedir>
-        <elasticsearch60.docker.version>6.0.1</elasticsearch60.docker.version>
         <elasticsearch6.docker.version>6.6.0</elasticsearch6.docker.version>
-        <elasticsearch7.docker.version>${elasticsearch.version}</elasticsearch7.docker.version>
-        <elasticsearch.docker.version>${elasticsearch7.docker.version}</elasticsearch.docker.version>
+        <elasticsearch7.docker.version>7.17.8</elasticsearch7.docker.version>
+        <elasticsearch8.docker.version>8.15.3</elasticsearch8.docker.version>
+        <elasticsearch9.docker.version>${elasticsearch.version}</elasticsearch9.docker.version>
+        <elasticsearch.docker.version>${elasticsearch9.docker.version}</elasticsearch.docker.version>
         <skip.es.test>${skipTests}</skip.es.test>
         <elasticsearch.docker.image>docker.elastic.co/elasticsearch/elasticsearch</elasticsearch.docker.image>
+        <opensearch2.docker.version>2.19.6</opensearch2.docker.version>
+        <opensearch3.docker.version>3.9.0</opensearch3.docker.version>
+        <opensearch.docker.image>opensearchproject/opensearch</opensearch.docker.image>
+        <!-- elasticsearch or opensearch; empty derives it from the image name -->
+        <elasticsearch.docker.distribution></elasticsearch.docker.distribution>
     </properties>
     <dependencies>
         <dependency>
             <groupId>org.janusgraph</groupId>
             <artifactId>janusgraph-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.janusgraph</groupId>
+            <artifactId>janusgraph-mixed-index-utils</artifactId>
             <version>${project.version}</version>
         </dependency>
         <dependency>
@@ -70,21 +81,24 @@
         <!-- Logging backends. -->
         <!-- Enforce a classpath ordering constraint to ensure log4j is used for logging. -->
         <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-log4j12</artifactId>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-slf4j-impl</artifactId>
+            <scope>runtime</scope>
             <optional>true</optional>
         </dependency>
         <dependency>
             <groupId>ch.qos.logback</groupId>
             <artifactId>logback-classic</artifactId>
+            <scope>runtime</scope>
+            <optional>true</optional>
         </dependency>
         <!-- End logging backends. -->
 
         <dependency>
             <groupId>org.mockito</groupId>
-            <artifactId>mockito-inline</artifactId>
-			<scope>test</scope>
-		</dependency>
+            <artifactId>mockito-core</artifactId>
+            <scope>test</scope>
+        </dependency>
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers</artifactId>
@@ -92,17 +106,17 @@
         </dependency>
         <dependency>
             <groupId>org.testcontainers</groupId>
-            <artifactId>cassandra</artifactId>
+            <artifactId>testcontainers-cassandra</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.testcontainers</groupId>
-            <artifactId>elasticsearch</artifactId>
+            <artifactId>testcontainers-elasticsearch</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.testcontainers</groupId>
-            <artifactId>junit-jupiter</artifactId>
+            <artifactId>testcontainers-junit-jupiter</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -160,6 +174,7 @@
                             <systemPropertyVariables>
                                 <elasticsearch.docker.image>${elasticsearch.docker.image}</elasticsearch.docker.image>
                                 <elasticsearch.docker.version>${elasticsearch.docker.version}</elasticsearch.docker.version>
+                                <elasticsearch.docker.distribution>${elasticsearch.docker.distribution}</elasticsearch.docker.distribution>
                             </systemPropertyVariables>
                         </configuration>
                     </execution>
@@ -170,12 +185,6 @@
 
     <profiles>
         <profile>
-            <id>elasticsearch60</id>
-            <properties>
-                <elasticsearch.docker.version>${elasticsearch60.docker.version}</elasticsearch.docker.version>
-            </properties>
-        </profile>
-        <profile>
             <id>elasticsearch6</id>
             <properties>
                 <elasticsearch.docker.version>${elasticsearch6.docker.version}</elasticsearch.docker.version>
@@ -183,11 +192,40 @@
         </profile>
         <profile>
             <id>elasticsearch7</id>
+            <properties>
+                <elasticsearch.docker.version>${elasticsearch7.docker.version}</elasticsearch.docker.version>
+            </properties>
+        </profile>
+        <profile>
+            <id>elasticsearch8</id>
+            <properties>
+                <elasticsearch.docker.version>${elasticsearch8.docker.version}</elasticsearch.docker.version>
+            </properties>
+        </profile>
+        <profile>
+            <id>elasticsearch9</id>
             <activation>
                 <activeByDefault>true</activeByDefault>
             </activation>
             <properties>
-                <elasticsearch.docker.version>${elasticsearch7.docker.version}</elasticsearch.docker.version>
+                <elasticsearch.docker.version>${elasticsearch9.docker.version}</elasticsearch.docker.version>
+            </properties>
+        </profile>
+
+        <profile>
+            <id>opensearch2</id>
+            <properties>
+                <elasticsearch.docker.distribution>opensearch</elasticsearch.docker.distribution>
+                <elasticsearch.docker.image>${opensearch.docker.image}</elasticsearch.docker.image>
+                <elasticsearch.docker.version>${opensearch2.docker.version}</elasticsearch.docker.version>
+            </properties>
+        </profile>
+        <profile>
+            <id>opensearch3</id>
+            <properties>
+                <elasticsearch.docker.distribution>opensearch</elasticsearch.docker.distribution>
+                <elasticsearch.docker.image>${opensearch.docker.image}</elasticsearch.docker.image>
+                <elasticsearch.docker.version>${opensearch3.docker.version}</elasticsearch.docker.version>
             </properties>
         </profile>
 

@@ -26,6 +26,10 @@ public class ESCompatUtils {
                 return new ES6Compat();
             case SEVEN:
                 return new ES7Compat();
+            case EIGHT:
+                return new ES8Compat();
+            case NINE:
+                return new ES9Compat();
             default:
                 throw new PermanentBackendException("Unsupported Elasticsearch version: " + elasticMajorVersion);
         }

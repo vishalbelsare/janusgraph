@@ -5,7 +5,7 @@
 [Apache HBase](https://hbase.apache.org/) is a scalable, distributed big data
 store.
 
-[Apache Solr](https://lucene.apache.org/solr/) is a scalable, distributed
+[Apache Solr](https://solr.apache.org/) is a scalable, distributed
 search engine.
 
 > Check the JanusGraph [version compatibility](https://docs.janusgraph.org/changelog/#version-compatibility)
@@ -29,11 +29,6 @@ for additional details.
 you can store multiple graphs on the same HBase and Solr servers. Refer to
 the JanusGraph [configuration reference](https://docs.janusgraph.org/basics/configuration-reference/)
 for additional properties.
-
-* [`logback.xml`](conf/logback.xml) configures logging with [Logback](https://logback.qos.ch/).
-The example configuration logs to the console and adjusts the logging level
-for some noisier packages. Refer to the Logback [manual](https://logback.qos.ch/manual/index.html)
-for additional details.
 
 ### HBase configuration
 
@@ -63,12 +58,6 @@ The required Maven dependencies for HBase:
             <version>${janusgraph.version}</version>
             <scope>runtime</scope>
         </dependency>
-        <dependency>
-            <groupId>org.apache.hbase</groupId>
-            <artifactId>hbase-shaded-client</artifactId>
-            <version>${hbase1.version}</version>
-            <scope>runtime</scope>
-        </dependency>
 ```
 
 The required Maven dependency for Solr:
@@ -93,10 +82,6 @@ name `jgex` matches the properties file value for `index.jgex.solr.configset`.
 Make sure the Zookeeper url matches the properties value for `index.jgex.solr.zookeeper-url`.
 
 ```
-# Solr 5
-$SOLR_HOME/server/scripts/cloud-scripts/zkcli.sh -z 127.0.0.1:9983 -cmd upconfig -d $JANUSGRAPH_HOME/conf/solr -n jgex
-
-# Solr 6 or higher
 $SOLR_HOME/bin/solr zk upconfig -z 127.0.0.1:9983 -d $JANUSGRAPH_HOME/conf/solr -n jgex
 ```
 
@@ -126,10 +111,6 @@ The configset is stored in Zookeeper under `/configs/jgex` where the name
 Make sure the Zookeeper url matches the properties value for `index.jgex.solr.zookeeper-url`.
 
 ```
-# Solr 5
-$SOLR_HOME/server/scripts/cloud-scripts/zkcli.sh -z 127.0.0.1:9983 -cmd clear /configs/jgex
-
-# Solr 6
 $SOLR_HOME/bin/solr zk rm -r /configs/jgex -z 127.0.0.1:9983
 ```
 

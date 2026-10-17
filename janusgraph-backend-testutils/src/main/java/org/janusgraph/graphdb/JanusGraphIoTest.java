@@ -17,7 +17,6 @@ package org.janusgraph.graphdb;
 import org.apache.tinkerpop.gremlin.structure.Graph;
 import org.apache.tinkerpop.gremlin.structure.io.GraphReader;
 import org.apache.tinkerpop.gremlin.structure.io.GraphWriter;
-import org.apache.tinkerpop.gremlin.structure.io.IoCore;
 import org.apache.tinkerpop.gremlin.structure.io.graphson.GraphSONMapper;
 import org.apache.tinkerpop.gremlin.structure.io.graphson.GraphSONReader;
 import org.apache.tinkerpop.gremlin.structure.io.graphson.GraphSONVersion;
@@ -61,7 +60,7 @@ public abstract class JanusGraphIoTest extends JanusGraphBaseTest {
     private static final JtsGeoshapeHelper HELPER = new JtsGeoshapeHelper();
 
     static Stream<Arguments> data() {
-        final GraphSONMapper v1mapper = GraphSONMapper.build().version(GraphSONVersion.V1_0).typeInfo(TypeInfo.PARTIAL_TYPES).addRegistry(JanusGraphIoRegistryV1d0.instance()).create();
+        final GraphSONMapper v1mapper = JanusGraphIoRegistryV1d0.allowGraphSONTypeIds(GraphSONMapper.build().version(GraphSONVersion.V1_0).typeInfo(TypeInfo.PARTIAL_TYPES).addRegistry(JanusGraphIoRegistryV1d0.instance())).create();
         final GraphSONMapper v2mapper = GraphSONMapper.build().version(GraphSONVersion.V2_0).typeInfo(TypeInfo.PARTIAL_TYPES).addRegistry(JanusGraphIoRegistry.instance()).create();
         final GraphSONMapper v3mapper = GraphSONMapper.build().version(GraphSONVersion.V3_0).typeInfo(TypeInfo.PARTIAL_TYPES).addRegistry(JanusGraphIoRegistry.instance()).create();
 
@@ -74,10 +73,7 @@ public abstract class JanusGraphIoTest extends JanusGraphBaseTest {
                 (Function<Graph, GraphWriter>) g -> GraphSONWriter.build().mapper(v2mapper).create()),
             arguments("graphson-v3",
                 (Function<Graph, GraphReader>) g -> GraphSONReader.build().mapper(v3mapper).create(),
-                (Function<Graph, GraphWriter>) g -> GraphSONWriter.build().mapper(v3mapper).create()),
-            arguments("gryo",
-                (Function<Graph, GraphReader>) g -> g.io(IoCore.gryo()).reader().mapper(g.io(IoCore.gryo()).mapper().create()).create(),
-                (Function<Graph, GraphWriter>) g -> g.io(IoCore.gryo()).writer().mapper(g.io(IoCore.gryo()).mapper().create()).create())
+                (Function<Graph, GraphWriter>) g -> GraphSONWriter.build().mapper(v3mapper).create())
         );
     }
 

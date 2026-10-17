@@ -15,6 +15,10 @@
 package org.janusgraph.core;
 
 import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryDropStepStrategyMode;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryHasStepStrategyMode;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryLabelStepStrategyMode;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryPropertiesStrategyMode;
 
 import java.time.Instant;
 
@@ -67,7 +71,7 @@ public interface TransactionBuilder {
     TransactionBuilder propertyPrefetching(boolean enabled);
 
     /**
-     * Enable or disable multi-query, i.e. query.batch
+     * Enable or disable multi-query, i.e. `query.batch.enabled`
      *
      * @param enabled
      * @return Object containing properties that will enable/disable multi-query
@@ -138,6 +142,59 @@ public interface TransactionBuilder {
      */
     TransactionBuilder commitTime(Instant instant);
 
+    /**
+     * Skips usage of JanusGraph database level cache during read operations.
+     * <p>
+     * Doesn't have any effect if database level cache was disabled via config `cache.db-cache`.
+     *
+     * @return Object with the skip db-cache reads check settings
+     */
+    TransactionBuilder skipDBCacheRead();
+
+    /**
+     * Set lazy-load for all properties and edges: ids and values are deserialized upon demand.
+     * <p>
+     * When enabled, it can have a boost on large scale read operations, when only certain type of relations are being read.
+     *
+     * @return Object with lazy-load setting.
+     */
+    TransactionBuilder lazyLoadRelations();
+
+    /**
+     * Sets `has` step strategy mode.
+     * <p>
+     * Doesn't have any effect if multi-query was disabled via config `query.batch.enabled = false`.
+     *
+     * @return Object with the set `has` step strategy mode settings
+     */
+    TransactionBuilder setHasStepStrategyMode(MultiQueryHasStepStrategyMode hasStepStrategyMode);
+
+    /**
+     * Sets properties strategy mode.
+     * <p>
+     * Doesn't have any effect if multi-query was disabled via config `query.batch.enabled = false`.
+     *
+     * @return Object with the set properties strategy mode settings
+     */
+    TransactionBuilder setPropertiesStrategyMode(MultiQueryPropertiesStrategyMode propertiesStrategyMode);
+
+    /**
+     * Sets `label` step strategy mode.
+     * <p>
+     * Doesn't have any effect if multi-query was disabled via config `query.batch.enabled = false`.
+     *
+     * @return Object with the set labels strategy mode settings
+     */
+    TransactionBuilder setLabelsStepStrategyMode(MultiQueryLabelStepStrategyMode labelStepStrategyMode);
+
+    /**
+     * Sets `drop` step strategy mode.
+     * <p>
+     * Doesn't have any effect if multi-query was disabled via config `query.batch.enabled = false`.
+     *
+     * @return Object with the set drop strategy mode settings
+     */
+    TransactionBuilder setDropStepStrategyMode(MultiQueryDropStepStrategyMode dropStepStrategyMode);
 
     /**
      * Sets the group name for this transaction which provides a way for gathering

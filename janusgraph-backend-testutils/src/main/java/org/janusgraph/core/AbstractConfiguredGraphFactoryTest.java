@@ -24,19 +24,23 @@ import org.janusgraph.graphdb.database.StandardJanusGraph;
 import org.janusgraph.graphdb.management.ConfigurationManagementGraph;
 import org.janusgraph.graphdb.management.JanusGraphManager;
 import org.janusgraph.graphdb.management.utils.ConfigurationManagementGraphNotEnabledException;
-import org.janusgraph.util.system.ConfigurationUtil;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import javax.script.Bindings;
 import javax.script.SimpleBindings;
 
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.CONNECTION_TIMEOUT;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.GRAPH_NAME;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.STORAGE_BACKEND;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.STORAGE_HOSTS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -215,6 +219,27 @@ public abstract class AbstractConfiguredGraphFactoryTest {
     }
 
     @Test
+    public void updateConfigurationShouldNotUpdateUserProvidedMap() throws Exception {
+        final MapConfiguration graphConfig = getGraphConfig();
+        final String graphName = graphConfig.getString(GRAPH_NAME.toStringWithoutRoot());
+
+        try {
+            ConfiguredGraphFactory.createConfiguration(graphConfig);
+            final StandardJanusGraph graph = (StandardJanusGraph) ConfiguredGraphFactory.open(graphName);
+            assertNotNull(graph);
+
+            final Map<String, Object> map = new HashMap<>();
+            ConfiguredGraphFactory.updateConfiguration(graphName, new MapConfiguration(map));
+
+            // Map should not contain the "graph.graphname" property added in ConfiguredGraphFactory.updateConfiguration
+            assertTrue(map.isEmpty());
+        } finally {
+            ConfiguredGraphFactory.removeConfiguration(graphName);
+            ConfiguredGraphFactory.close(graphName);
+        }
+    }
+
+    @Test
     public void updateConfigurationShouldRemoveGraphFromCache() throws Exception {
         final MapConfiguration graphConfig = getGraphConfig();
         final String graphName = graphConfig.getString(GRAPH_NAME.toStringWithoutRoot());
@@ -224,9 +249,17 @@ public abstract class AbstractConfiguredGraphFactoryTest {
             final StandardJanusGraph graph = (StandardJanusGraph) ConfiguredGraphFactory.open(graphName);
             assertNotNull(graph);
 
+            // string-delimited hosts are recognized
             final Map<String, Object> map = graphConfig.getMap();
-            map.put(STORAGE_BACKEND.toStringWithoutRoot(), "bogusBackend");
-            ConfiguredGraphFactory.updateConfiguration(graphName, ConfigurationUtil.loadMapConfiguration(map));
+            map.put(STORAGE_HOSTS.toStringWithoutRoot(), "localhost,localhost");
+            ConfiguredGraphFactory.updateConfiguration(graphName, new MapConfiguration(map));
+            assertNull(gm.getGraph(graphName));
+            assertNotNull(ConfiguredGraphFactory.open(graphName));
+
+            // bogus backend will prevent the graph from being opened
+            final Map<String, Object> map2 = graphConfig.getMap();
+            map2.put(STORAGE_BACKEND.toStringWithoutRoot(), "bogusBackend");
+            ConfiguredGraphFactory.updateConfiguration(graphName, new MapConfiguration(map2));
             assertNull(gm.getGraph(graphName));
             // we should throw an error since the config has been updated and we are attempting
             // to open a bogus backend
@@ -251,6 +284,85 @@ public abstract class AbstractConfiguredGraphFactoryTest {
 
             ConfiguredGraphFactory.removeConfiguration(graphName);
             assertNull(gm.getGraph(graphName));
+        } finally {
+            ConfiguredGraphFactory.removeConfiguration(graphName);
+            ConfiguredGraphFactory.close(graphName);
+        }
+    }
+
+    @Test
+    public void removeConfigurationFailsToRemovingGraphNameKey() throws Exception {
+        final MapConfiguration graphConfig = getGraphConfig();
+        final String graphName = graphConfig.getString(GRAPH_NAME.toStringWithoutRoot());
+
+        try {
+            ConfiguredGraphFactory.createConfiguration(graphConfig);
+            final StandardJanusGraph graph = (StandardJanusGraph) ConfiguredGraphFactory.open(graphName);
+            assertNotNull(graph);
+
+            // Set cannot contain the "graph.graphname" property
+            assertThrows(IllegalArgumentException.class,
+                () -> ConfiguredGraphFactory.removeConfiguration(graphName, Collections.singleton(GRAPH_NAME.toStringWithoutRoot())));
+        } finally {
+            ConfiguredGraphFactory.removeConfiguration(graphName);
+            ConfiguredGraphFactory.close(graphName);
+        }
+    }
+
+    @Test
+    public void removeConfigurationShouldRemoveOneKey() throws Exception {
+        final MapConfiguration graphConfig = getGraphConfig();
+        final String graphName = graphConfig.getString(GRAPH_NAME.toStringWithoutRoot());
+
+        try {
+            ConfiguredGraphFactory.createConfiguration(graphConfig);
+            final StandardJanusGraph graph = (StandardJanusGraph) ConfiguredGraphFactory.open(graphName);
+            assertNotNull(graph);
+
+            // Add a STORAGE_HOSTS configuration key to the graph
+            final Map<String, Object> map = graphConfig.getMap();
+            map.put(STORAGE_HOSTS.toStringWithoutRoot(), "localhost");
+            ConfiguredGraphFactory.updateConfiguration(graphName, new MapConfiguration(map));
+            assertNotNull(ConfiguredGraphFactory.open(graphName));
+
+            // After checking that the STORAGE_HOSTS configuration key exists, delete it and check that it's unset
+            assertEquals("localhost", ConfiguredGraphFactory.getConfiguration(graphName).get(STORAGE_HOSTS.toStringWithoutRoot()));
+            ConfiguredGraphFactory.removeConfiguration(graphName, Collections.singleton(STORAGE_HOSTS.toStringWithoutRoot()));
+            assertNotNull(ConfiguredGraphFactory.open(graphName));
+            assertFalse(ConfiguredGraphFactory.getConfiguration(graphName).containsKey(STORAGE_HOSTS.toStringWithoutRoot()));
+        } finally {
+            ConfiguredGraphFactory.removeConfiguration(graphName);
+            ConfiguredGraphFactory.close(graphName);
+        }
+    }
+
+    @Test
+    public void removeConfigurationShouldRemoveMultipleKeys() throws Exception {
+        final MapConfiguration graphConfig = getGraphConfig();
+        final String graphName = graphConfig.getString(GRAPH_NAME.toStringWithoutRoot());
+
+        try {
+            ConfiguredGraphFactory.createConfiguration(graphConfig);
+            final StandardJanusGraph graph = (StandardJanusGraph) ConfiguredGraphFactory.open(graphName);
+            assertNotNull(graph);
+
+            // Add a STORAGE_HOSTS configuration key to the graph
+            final Map<String, Object> map = graphConfig.getMap();
+            map.put(STORAGE_HOSTS.toStringWithoutRoot(), "localhost");
+            map.put(CONNECTION_TIMEOUT.toStringWithoutRoot(), 20000L);
+            ConfiguredGraphFactory.updateConfiguration(graphName, new MapConfiguration(map));
+            assertNotNull(ConfiguredGraphFactory.open(graphName));
+
+            // After checking that the STORAGE_HOSTS and CONNECTION_TIMEOUT configuration keys exist, delete them and check that they're unset
+            assertEquals("localhost", ConfiguredGraphFactory.getConfiguration(graphName).get(STORAGE_HOSTS.toStringWithoutRoot()));
+            assertEquals(20000L, ConfiguredGraphFactory.getConfiguration(graphName).get(CONNECTION_TIMEOUT.toStringWithoutRoot()));
+            Set<String> configurationKeys = new HashSet<>();
+            configurationKeys.add(STORAGE_HOSTS.toStringWithoutRoot());
+            configurationKeys.add(CONNECTION_TIMEOUT.toStringWithoutRoot());
+            ConfiguredGraphFactory.removeConfiguration(graphName, configurationKeys);
+            assertNotNull(ConfiguredGraphFactory.open(graphName));
+            assertFalse(ConfiguredGraphFactory.getConfiguration(graphName).containsKey(STORAGE_HOSTS.toStringWithoutRoot()));
+            assertFalse(ConfiguredGraphFactory.getConfiguration(graphName).containsKey(CONNECTION_TIMEOUT.toStringWithoutRoot()));
         } finally {
             ConfiguredGraphFactory.removeConfiguration(graphName);
             ConfiguredGraphFactory.close(graphName);
@@ -288,6 +400,24 @@ public abstract class AbstractConfiguredGraphFactoryTest {
         } finally {
             ConfiguredGraphFactory.removeConfiguration(graphName);
             ConfiguredGraphFactory.close(graphName);
+        }
+    }
+
+    @Test
+    public void shouldBeAbleToDropBogusGraph() throws Exception {
+        final MapConfiguration graphConfig = getGraphConfig();
+        final String graphName = graphConfig.getString(GRAPH_NAME.toStringWithoutRoot());
+
+        try {
+            ConfiguredGraphFactory.createConfiguration(graphConfig);
+            final StandardJanusGraph graph = (StandardJanusGraph) ConfiguredGraphFactory.open(graphName);
+            assertNotNull(graph);
+
+            ConfiguredGraphFactory.drop(graphName);
+            RuntimeException exception = assertThrows(RuntimeException.class, () -> ConfiguredGraphFactory.open(graphName));
+            assertEquals("Please create configuration for this graph using the ConfigurationManagementGraph#createConfiguration API.", exception.getMessage());
+        } finally {
+            ConfiguredGraphFactory.drop(graphName);
         }
     }
 

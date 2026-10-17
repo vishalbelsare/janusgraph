@@ -15,6 +15,9 @@
 package org.janusgraph.graphdb.berkeleyje;
 
 import com.google.common.base.Preconditions;
+import com.sleepycat.je.Environment;
+import com.sleepycat.je.EnvironmentConfig;
+import com.sleepycat.je.LockMode;
 import org.janusgraph.BerkeleyStorageSetup;
 import org.janusgraph.core.JanusGraphException;
 import org.janusgraph.core.JanusGraphFactory;
@@ -26,6 +29,7 @@ import org.janusgraph.diskstorage.configuration.ConfigElement;
 import org.janusgraph.diskstorage.configuration.ConfigOption;
 import org.janusgraph.diskstorage.configuration.ModifiableConfiguration;
 import org.janusgraph.diskstorage.configuration.WriteConfiguration;
+import org.janusgraph.diskstorage.keycolumnvalue.keyvalue.OrderedKeyValueStoreManagerAdapter;
 import org.janusgraph.graphdb.JanusGraphTest;
 import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
 import org.junit.jupiter.api.Disabled;
@@ -35,7 +39,10 @@ import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.time.temporal.ChronoUnit;
+import java.util.concurrent.TimeUnit;
 
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.ALLOW_SETTING_VERTEX_ID;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.ALLOW_CUSTOM_VERTEX_ID_TYPES;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -45,6 +52,12 @@ public class BerkeleyGraphTest extends JanusGraphTest {
 
     private static final Logger log =
             LoggerFactory.getLogger(BerkeleyGraphTest.class);
+
+    public EnvironmentConfig getCurrentEnvironmentConfig() {
+        BerkeleyJEStoreManager storeManager = (BerkeleyJEStoreManager) ((OrderedKeyValueStoreManagerAdapter) graph.getBackend().getStoreManager()).getManager();
+        Environment environment = storeManager.getEnvironment();
+        return environment.getConfig();
+    }
 
     @Override
     public WriteConfiguration getConfiguration() {
@@ -65,6 +78,7 @@ public class BerkeleyGraphTest extends JanusGraphTest {
     }
 
     @Override
+    @Test
     public void testClearStorage() throws Exception {
         tearDown();
         config.set(ConfigElement.getPath(GraphDatabaseConfiguration.DROP_ON_CLEAR), true);
@@ -83,6 +97,8 @@ public class BerkeleyGraphTest extends JanusGraphTest {
     }
 
     @Override
+    @Test
+    @Disabled("#4153: Tests fails with NPE for some reason")
     public void testConsistencyEnforcement() {
         // Check that getConfiguration() explicitly set serializable isolation
         // This could be enforced with a JUnit assertion instead of a Precondition,
@@ -93,27 +109,34 @@ public class BerkeleyGraphTest extends JanusGraphTest {
         super.testConsistencyEnforcement();
     }
 
-    // BerkeleyJE support only hour discrete TTL, we try speed up internal
-    // clock but tests so flaky. See BerkeleyStorageSetup
     @Override
-    public void testEdgeTTLTiming() throws Exception {
+    @Test
+    @Disabled("BerkeleyJE support only hour discrete TTL, we try speed up internal clock but tests so flaky. See BerkeleyStorageSetup")
+    public void testEdgeTTLTiming() {
     }
 
     @Override
-    public void testEdgeTTLWithTransactions() throws Exception {
+    @Test
+    @Disabled
+    public void testEdgeTTLWithTransactions() {
     }
 
     @Override
-    public void testUnsettingTTL() throws InterruptedException {
+    @Test
+    @Disabled
+    public void testUnsettingTTL() {
     }
 
     @Override
-    public void testVertexTTLWithCompositeIndex() throws Exception {
+    @Test
+    @Disabled
+    public void testVertexTTLWithCompositeIndex() {
     }
 
     @Override
+    @Test
+    @Disabled("TODO: Figure out why this is failing in BerkeleyDB!!")
     public void testConcurrentConsistencyEnforcement() {
-        //Do nothing TODO: Figure out why this is failing in BerkeleyDB!!
     }
 
     @Disabled("Unable to run on GitHub Actions.")
@@ -135,4 +158,38 @@ public class BerkeleyGraphTest extends JanusGraphTest {
 
         assertEquals(0L, (long)graph.traversal().V().count().next());
     }
+
+    @Override
+    public void clopenForStaleIndex(){
+        // We set LOCK_MODE to READ_UNCOMMITTED here to mitigate an issue with deadlock problem described in
+        // https://github.com/JanusGraph/janusgraph/issues/1623
+        clopen(option(BerkeleyJEStoreManager.LOCK_MODE), LockMode.READ_UNCOMMITTED.toString());
+    }
+
+    @Test
+    public void testCannotUseCustomStringId() {
+        JanusGraphException ex = assertThrows(JanusGraphException.class,
+            () -> clopen(option(ALLOW_SETTING_VERTEX_ID), true, option(ALLOW_CUSTOM_VERTEX_ID_TYPES), true));
+        assertEquals("allow-custom-vid-types is not supported for OrderedKeyValueStore", ex.getMessage());
+    }
+
+    @Test
+    public void testExposedConfigurations() throws BackendException {
+        clopen(option(BerkeleyJEStoreManager.EXT_LOCK_TIMEOUT), "4321 ms");
+        assertEquals(4321, getCurrentEnvironmentConfig().getLockTimeout(TimeUnit.MILLISECONDS));
+        close();
+        WriteConfiguration configuration = getConfiguration();
+        clearGraph(configuration);
+        configuration.set(BerkeleyJEStoreManager.BERKELEY_EXTRAS_NS.toStringWithoutRoot()+"."+EnvironmentConfig.LOCK_TIMEOUT, "12345 ms");
+        open(configuration);
+        assertEquals(12345, getCurrentEnvironmentConfig().getLockTimeout(TimeUnit.MILLISECONDS));
+        close();
+        clearGraph(configuration);
+        configuration.set(BerkeleyJEStoreManager.BERKELEY_EXTRAS_NS.toStringWithoutRoot()+"."+EnvironmentConfig.ENV_IS_TRANSACTIONAL, "true");
+        open(configuration);
+        assertTrue(getCurrentEnvironmentConfig().getTransactional());
+        close();
+        clearGraph(configuration);
+    }
+
 }

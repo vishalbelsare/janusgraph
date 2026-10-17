@@ -18,6 +18,11 @@ import com.datastax.oss.driver.api.core.config.DefaultDriverOption;
 import org.janusgraph.diskstorage.configuration.ConfigElement;
 import org.janusgraph.diskstorage.configuration.ConfigNamespace;
 import org.janusgraph.diskstorage.configuration.ConfigOption;
+import org.janusgraph.diskstorage.configuration.Configuration;
+import org.janusgraph.diskstorage.configuration.ExecutorServiceBuilder;
+import org.janusgraph.diskstorage.cql.strategy.GroupedExecutionStrategyBuilder;
+import org.janusgraph.diskstorage.util.backpressure.QueryBackPressure;
+import org.janusgraph.diskstorage.util.backpressure.builder.QueryBackPressureBuilder;
 import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
 import org.janusgraph.graphdb.configuration.PreInitializeConfigOptions;
 
@@ -39,6 +44,16 @@ public interface CQLConfigOptions {
             ConfigOption.Type.LOCAL,
             "janusgraph");
 
+    ConfigOption<Boolean> CDC = new ConfigOption<>(
+            CQL_NS,
+            "cdc",
+            "Enable Apache Cassandra Change-Data-Capture by setting the cdc=true table option on JanusGraph's " +
+            "edgestore table. This allows an external CDC pipeline (e.g. Debezium + Kafka, consumed by the " +
+            "janusgraph-cdc worker) to capture graph mutations and keep mixed indexes eventually consistent. " +
+            "Requires the Cassandra cluster to be started with cdc_enabled=true.",
+            ConfigOption.Type.MASKABLE,
+            false);
+
     ConfigOption<Integer> PROTOCOL_VERSION = new ConfigOption<>(
             CQL_NS,
             "protocol-version",
@@ -59,6 +74,13 @@ public interface CQLConfigOptions {
             "The consistency level of write operations against Cassandra",
             ConfigOption.Type.MASKABLE,
             CQLStoreManager.CONSISTENCY_QUORUM);
+
+    ConfigOption<Integer> INIT_WAIT_TIME = new ConfigOption<>(
+            CQL_NS,
+            "init-wait-time",
+            "Number of milliseconds to sleep after creating each keyspace/table, only needed if table creation " +
+            "is asynchronous, e.g. Amazon Keyspace",
+            ConfigOption.Type.LOCAL, Integer.class);
 
     ConfigOption<Boolean> ONLY_USE_LOCAL_CONSISTENCY_FOR_SYSTEM_OPERATIONS =
         new ConfigOption<>(CQL_NS, "only-use-local-consistency-for-system-operations",
@@ -95,27 +117,46 @@ public interface CQLConfigOptions {
             ConfigOption.Type.MASKABLE,
             false);
 
+    ConfigOption<Boolean> IDEMPOTENT_WRITES = new ConfigOption<>(
+            CQL_NS,
+            "idempotent-writes",
+            "Whether JanusGraph marks its writes idempotent while `graph.assign-timestamp` is `true`, so that the " +
+                "driver may send a write again, to the same node or another one, after a closed connection, an " +
+                "overloaded node or a server error, ask its retry policy about a write which timed out, and run " +
+                "speculative executions of it. A write sent again writes the same cells with the same timestamp, but " +
+                "an insert with a TTL sent again can expire later. With `false`, or without assigned timestamps, " +
+                "writes keep the driver's default idempotence, `basic.request.default-idempotence`.",
+            ConfigOption.Type.MASKABLE,
+            true);
+
     // Replication
+
+    String SIMPLE_REPLICATION_STRATEGY = "SimpleStrategy";
+    String NETWORK_TOPOLOGY_REPLICATION_STRATEGY = "NetworkTopologyStrategy";
+
+    ConfigOption<String> REPLICATION_STRATEGY = new ConfigOption<>(
+        CQL_NS,
+        "replication-strategy-class",
+        "The replication strategy to use for JanusGraph keyspace. Available strategies: "+
+            String.join(",",new String[]{SIMPLE_REPLICATION_STRATEGY, NETWORK_TOPOLOGY_REPLICATION_STRATEGY})+".",
+        ConfigOption.Type.FIXED,
+        SIMPLE_REPLICATION_STRATEGY);
+
     ConfigOption<Integer> REPLICATION_FACTOR = new ConfigOption<>(
             CQL_NS,
             "replication-factor",
-            "The number of data replicas (including the original copy) that should be kept",
+        "The number of data replicas (including the original copy) that should be kept. This options is used when "
+            +ConfigElement.getPath(REPLICATION_STRATEGY)+" is set to "+SIMPLE_REPLICATION_STRATEGY,
             ConfigOption.Type.GLOBAL_OFFLINE,
             1);
-
-    ConfigOption<String> REPLICATION_STRATEGY = new ConfigOption<>(
-            CQL_NS,
-            "replication-strategy-class",
-            "The replication strategy to use for JanusGraph keyspace",
-            ConfigOption.Type.FIXED,
-            "SimpleStrategy");
 
     ConfigOption<String[]> REPLICATION_OPTIONS = new ConfigOption<>(
             CQL_NS,
             "replication-strategy-options",
             "Replication strategy options, e.g. factor or replicas per datacenter.  This list is interpreted as a " +
-                    "map.  It must have an even number of elements in [key,val,key,val,...] form.  A replication_factor set " +
-                    "here takes precedence over one set with " + ConfigElement.getPath(REPLICATION_FACTOR),
+                "map.  It must have an even number of elements in [key,val,key,val,...] form. This options is used when "
+                +ConfigElement.getPath(REPLICATION_STRATEGY)+" is set to "+NETWORK_TOPOLOGY_REPLICATION_STRATEGY+". " +
+                "`replication_factor` can be used to specify a replication factor.",
             ConfigOption.Type.FIXED,
             String[].class);
 
@@ -159,9 +200,9 @@ public interface CQLConfigOptions {
     ConfigOption<String> CF_COMPRESSION_TYPE = new ConfigOption<>(
             CQL_NS,
             "compression-type",
-            "The sstable_compression value JanusGraph uses when creating column families. " +
-                    "This accepts any value allowed by Cassandra's sstable_compression option. " +
-                    "Leave this unset to disable sstable_compression on JanusGraph-created CFs.",
+            "The compression class value JanusGraph uses when creating column families. " +
+                    "This accepts any value allowed by Cassandra's compression class option. " +
+                    "Leave this unset to disable compression on JanusGraph-created CFs.",
             ConfigOption.Type.MASKABLE,
             "LZ4Compressor");
 
@@ -193,6 +234,83 @@ public interface CQLConfigOptions {
             ConfigOption.Type.MASKABLE,
             1024);
 
+    ConfigOption<Integer> PARALLEL_SCAN_TOKEN_RANGES = new ConfigOption<>(
+            CQL_NS,
+            "parallel-scan-token-ranges",
+            "Number of disjoint Murmur3 token ranges a full-table scan (e.g. a mixed-index reindex or other " +
+                "OLAP job) is split into. With the default value of 1 the full scan is issued as a single query " +
+                "that funnels the whole table through one coordinator. When set above 1 and the Murmur3 " +
+                "partitioner is in use: scan jobs (reindex and other OLAP jobs run through the scan-job " +
+                "framework) drain each token range on its own set of threads, scanning all ranges fully in " +
+                "parallel; other callers of a whole-table scan receive the ranges as token-bounded queries " +
+                "streamed back-to-back in token order (bounded coordinator scans, not extra parallelism). " +
+                "Each range adds concurrent scan queries against the cluster (one per scan-job query, times " +
+                "the number of ranges), so values that are too high can overload the cluster; a small multiple " +
+                "of the cluster's node count is a sensible starting point.",
+            ConfigOption.Type.MASKABLE,
+            1);
+
+    ConfigOption<Integer> SCAN_PAGE_SIZE = new ConfigOption<>(
+            CQL_NS,
+            "scan-page-size",
+            "Page size (CQL rows per backend round trip) used for scan queries: whole-table and token-range " +
+                "scans on the Murmur3 partitioner as well as key-range scans on ordered partitioners - i.e. " +
+                "every getKeys-style key iteration, which is the path OLAP jobs (such as a mixed-index reindex) " +
+                "read through. Transactional slice reads keep using storage.page-size. When 0 or negative, " +
+                "storage.page-size is used for scans as well. A scan streams many rows per request, so a page " +
+                "size several times larger than the OLTP-oriented storage.page-size usually cuts scan round " +
+                "trips (and total scan time) substantially at the cost of slightly larger response payloads " +
+                "held in memory per scan thread.",
+            ConfigOption.Type.MASKABLE,
+            0);
+
+    ConfigOption<Boolean> SCAN_PER_PARTITION_LIMIT_ENABLED = new ConfigOption<>(
+            CQL_NS,
+            "scan-per-partition-limit-enabled",
+            "Push each scan query's per-key entry limit into the CQL full-scan queries as PER PARTITION LIMIT. " +
+                "Scan jobs (e.g. reindex) issue a grounding (key-existence) query with a per-key limit of 1; " +
+                "without the pushdown every cell of every row slice is streamed to the client and discarded " +
+                "there, so the grounding query alone transfers the whole table (including adjacency data " +
+                "irrelevant to the job). With the pushdown the server stops after the per-key limit, e.g. one " +
+                "cell per key for the grounding query. Requires PER PARTITION LIMIT support in the backend " +
+                "(Apache Cassandra 3.6+, ScyllaDB); a CQL-compatible service that rejects the clause (e.g. " +
+                "Amazon Keyspaces) automatically falls back to plain scan statements with a warning at store " +
+                "open, so leaving the option enabled is safe everywhere; set it to false to skip the attempt.",
+            ConfigOption.Type.MASKABLE,
+            true);
+
+    ConfigOption<Integer> BACK_PRESSURE_LIMIT = new ConfigOption<>(
+        CQL_NS,
+        "back-pressure-limit",
+        "The maximum number of concurrent requests which are allowed to be processed by CQL driver. " +
+            "If no value is provided or the value is set to `0` then the value will be calculated based on CQL driver " +
+            "session provided parameters by using formula ["+DefaultDriverOption.CONNECTION_MAX_REQUESTS.getPath()+" * "
+            +DefaultDriverOption.CONNECTION_POOL_LOCAL_SIZE.getPath()+" * available_nodes_amount]. " +
+            "It's not recommended to use any value which is above this limit because it may result in CQL driver overload " +
+            "but it's suggested to have a lower value to keep the driver healthy under pressure. In situations when remote " +
+            "nodes connections are in use then the bigger value might be relevant as well to improve parallelism.",
+        ConfigOption.Type.MASKABLE,
+        Integer.class);
+
+    ConfigOption<String> BACK_PRESSURE_CLASS = new ConfigOption<>(
+        CQL_NS,
+        "back-pressure-class",
+        "The implementation of `QueryBackPressure` to use. " +
+            "The full name of the class which extends `"+ QueryBackPressure.class.getSimpleName()+"` which has either " +
+            "a public constructor with `"+ Configuration.class.getSimpleName()+" janusGraphConfiguration` and `"+
+            Integer.class.getSimpleName()+" backPressureLimit` arguments (preferred constructor) or a public constructor with `"+
+            Configuration.class.getSimpleName()+" janusGraphConfiguration` argument (second preferred constructor) or "+
+            "a public parameterless constructor. Other accepted options are:<br> `"+
+            QueryBackPressureBuilder.SEMAPHORE_QUERY_BACK_PRESSURE_CLASS+"` - fair semaphore based back pressure implementation of `"
+            +BACK_PRESSURE_LIMIT.getName()+"` limit size (preferred implementation);<br> `"
+            +QueryBackPressureBuilder.SEMAPHORE_RELEASE_PROTECTED_QUERY_BACK_PRESSURE_CLASS+"` - fair semaphore based back pressure " +
+            "implementation of `"+BACK_PRESSURE_LIMIT.getName()+"` limit size with protected releasing logic (meant to be used for testing);<br> `"
+            +QueryBackPressureBuilder.PASS_ALL_QUERY_BACK_PRESSURE_CLASS+"` - turned off back pressure (it is recommended to tune " +
+            "CQL driver for the ongoing workload when this implementation is used);",
+        ConfigOption.Type.MASKABLE,
+        String.class,
+        QueryBackPressureBuilder.SEMAPHORE_QUERY_BACK_PRESSURE_CLASS);
+
     ConfigOption<Long> HEARTBEAT_INTERVAL = new ConfigOption<>(
         CQL_NS,
         "heartbeat-interval",
@@ -206,6 +324,15 @@ public interface CQLConfigOptions {
         "How long the driver waits for the response (in milliseconds) to a heartbeat.",
         ConfigOption.Type.MASKABLE,
         Long.class);
+
+    ConfigOption<Boolean> TTL_ENABLED = new ConfigOption<>(
+        CQL_NS,
+        "ttl-enabled",
+        "Whether TTL should be enabled or not. Must be turned off if the storage does not support TTL. " +
+            "Amazon Keyspace, for example, does not support TTL by default unless otherwise enabled.",
+        ConfigOption.Type.LOCAL,
+        Boolean.class,
+        true);
 
     ConfigOption<String> PARTITIONER_NAME = new ConfigOption<>(
         CQL_NS,
@@ -335,20 +462,18 @@ public interface CQLConfigOptions {
         "io-size",
         "The number of threads for the event loop group used for I/O operations " +
             "(reading and writing to Cassandra nodes). " +
-            "If this is set to 0, the driver will use `Runtime.getRuntime().availableProcessors() * 2`.",
+            "If this is not set, the driver will use `Runtime.getRuntime().availableProcessors() * 2`.",
         ConfigOption.Type.LOCAL,
-        Integer.class,
-        0);
+        Integer.class);
 
     ConfigOption<Integer> NETTY_ADMIN_SIZE = new ConfigOption<>(
         NETTY,
         "admin-size",
         "The number of threads for the event loop group used for admin tasks not related to request I/O " +
             "(handle cluster events, refresh metadata, schedule reconnections, etc.). " +
-            "If this is set to 0, the driver will use `Runtime.getRuntime().availableProcessors() * 2`.",
+            "If this is not set, the driver will use 2.",
         ConfigOption.Type.LOCAL,
-        Integer.class,
-        0);
+        Integer.class);
 
     ConfigOption<Long> NETTY_TIMER_TICK_DURATION = new ConfigOption<>(
         NETTY,
@@ -587,27 +712,14 @@ public interface CQLConfigOptions {
     ConfigNamespace EXECUTOR_SERVICE = new ConfigNamespace(
         CQL_NS,
         "executor-service",
-        "Configuration options for CQL executor service which is used to process CQL queries.");
-
-    ConfigOption<Boolean> EXECUTOR_SERVICE_ENABLED = new ConfigOption<>(
-        EXECUTOR_SERVICE,
-        "enabled",
-        "Whether to use CQL executor service to process queries or not. If not used, the parallelism will be " +
-            "controlled internally by the CQL driver via `"+MAX_REQUESTS_PER_CONNECTION.toStringWithoutRoot()+"` parameter " +
-            "which may be preferable in production environments. " +
-            "Disabling executor service reduces overhead of thread pool but might be more difficult to tune.",
-        ConfigOption.Type.LOCAL,
-        Boolean.class,
-        true);
+        "Configuration options for CQL executor service which is used to process deserialization of CQL queries.");
 
     ConfigOption<Integer> EXECUTOR_SERVICE_CORE_POOL_SIZE = new ConfigOption<>(
         EXECUTOR_SERVICE,
         GraphDatabaseConfiguration.PARALLEL_BACKEND_EXECUTOR_SERVICE_CORE_POOL_SIZE.getName(),
-        "Core pool size for executor service. May be ignored if custom executor service is used " +
-            "(depending on the implementation of the executor service).",
+        GraphDatabaseConfiguration.PARALLEL_BACKEND_EXECUTOR_SERVICE_CORE_POOL_SIZE.getDescription(),
         ConfigOption.Type.LOCAL,
-        Integer.class,
-        10);
+        Integer.class);
 
     ConfigOption<Integer> EXECUTOR_SERVICE_MAX_POOL_SIZE = new ConfigOption<>(
         EXECUTOR_SERVICE,
@@ -631,7 +743,7 @@ public interface CQLConfigOptions {
         GraphDatabaseConfiguration.PARALLEL_BACKEND_EXECUTOR_SERVICE_CLASS.getDescription(),
         ConfigOption.Type.LOCAL,
         String.class,
-        "fixed");
+        ExecutorServiceBuilder.FIXED_THREAD_POOL_CLASS);
 
     ConfigOption<Long> EXECUTOR_SERVICE_MAX_SHUTDOWN_WAIT_TIME = new ConfigOption<>(
         EXECUTOR_SERVICE,
@@ -656,7 +768,7 @@ public interface CQLConfigOptions {
         "request-timeout",
         "Timeout for CQL requests in milliseconds. See DataStax Java Driver option `" +
             DefaultDriverOption.REQUEST_TIMEOUT.getPath() + "` for more information.",
-        ConfigOption.Type.MASKABLE, 10000L);
+        ConfigOption.Type.MASKABLE, 12000L);
 
     ConfigNamespace INTERNAL_CONFIGURATION = new ConfigNamespace(
         CQL_NS,
@@ -715,4 +827,90 @@ public interface CQLConfigOptions {
         "Path to file with DataStax configuration.",
         ConfigOption.Type.LOCAL,
         String.class);
+
+    ConfigNamespace CQL_GROUPING_NS = new ConfigNamespace(
+        CQL_NS,
+        "grouping",
+        "Configuration options for controlling CQL queries grouping");
+
+    String MAX_IN_CONFIG_MSG = "Notice, for ScyllaDB this option should not exceed the maximum number of distinct " +
+        "clustering key restrictions per query which can be changed by ScyllaDB configuration option `max-partition-key-restrictions-per-query` " +
+        "(https://enterprise.docs.scylladb.com/branch-2022.2/faq.html#how-can-i-change-the-maximum-number-of-in-restrictions). " +
+        "For AstraDB this limit is set to 20 and usually it's fixed. However, you can ask customer support for a possibility to change " +
+        "the default threshold to your desired configuration via `partition_keys_in_select_failure_threshold` " +
+        "and `in_select_cartesian_product_failure_threshold` threshold configurations (https://docs.datastax.com/en/astra-serverless/docs/plan/planning.html#_cassandra_yaml).<br>" +
+        "Ensure that your storage backend allows more IN selectors than the one set via this configuration.";
+
+    ConfigOption<Boolean> SLICE_GROUPING_ALLOWED = new ConfigOption<>(
+        CQL_GROUPING_NS,
+        "slice-allowed",
+        "If `true` this allows multiple Slice queries which are allowed to be performed as non-range " +
+            "queries (i.e. direct equality operation) to be grouped together into a single CQL query via `IN` operator. " +
+            "Notice, currently only operations to fetch properties with Cardinality.SINGLE are allowed to be performed as non-range queries " +
+            "(edges fetching or properties with Cardinality SET or LIST won't be grouped together).<br>" +
+            "If this option is `false` then each Slice query will be executed in a separate asynchronous CQL query even when " +
+            "grouping is allowed.",
+        ConfigOption.Type.MASKABLE,
+        true);
+
+    ConfigOption<Integer> SLICE_GROUPING_LIMIT = new ConfigOption<>(
+        CQL_GROUPING_NS,
+        "slice-limit",
+        "Maximum amount of grouped together slice queries into a single CQL query.<br>" + MAX_IN_CONFIG_MSG +
+            "<br>This option is used only when `"+SLICE_GROUPING_ALLOWED.toStringWithoutRoot()+"` is `true`.",
+        ConfigOption.Type.MASKABLE,
+        20);
+
+    ConfigOption<Boolean> KEYS_GROUPING_ALLOWED = new ConfigOption<>(
+        CQL_GROUPING_NS,
+        "keys-allowed",
+        "If `true` this allows multiple partition keys to be grouped together into a single CQL query via `IN` operator based on the keys grouping strategy provided " +
+            "(usually grouping is done by same token-ranges or same replica sets, but may also involve shard ids for custom implementations).<br>" +
+            "Notice, that any CQL query grouped with more than 1 key will require to return a row key for any column fetched.<br>" +
+            "This option is useful when less amount of CQL queries is desired to be sent for read requests in expense of fetching more data (partition key per each fetched value).<br>" +
+            "Notice, different storage backends may have different way of executing multi-partition `IN` queries " +
+            "(including, but not limited to how the checksum queries are sent for different consistency levels, processing node CPU usage, disk access pattern, etc.). Thus, a proper " +
+            "benchmarking is needed to determine if keys grouping is useful or not per case by case scenario.<br>" +
+            "This option can be enabled only for storage backends which support `PER PARTITION LIMIT`. As such, this feature can't be used with Amazon Keyspaces because it doesn't support `PER PARTITION LIMIT`.<br>" +
+            "If this option is `false` then each partition key will be executed in a separate asynchronous CQL query even when multiple keys from the same token range are queried.<br>" +
+            "Notice, the default grouping strategy does not take shards into account. Thus, this might be inefficient with ScyllaDB storage backend. " +
+            "ScyllaDB specific keys grouping strategy should be implemented after the resolution of the [ticket #232](https://github.com/scylladb/java-driver/issues/232).",
+        ConfigOption.Type.MASKABLE,
+        false);
+
+    ConfigOption<String> KEYS_GROUPING_CLASS = new ConfigOption<>(
+        CQL_GROUPING_NS,
+        "keys-class",
+        "Full class path of the keys grouping execution strategy. The class should implement " +
+            "`org.janusgraph.diskstorage.cql.strategy.GroupedExecutionStrategy` interface and have a public constructor " +
+            "with two arguments `org.janusgraph.diskstorage.configuration.Configuration` and `org.janusgraph.diskstorage.cql.CQLStoreManager`.<br>" +
+            "Shortcuts available:<br>" +
+            "- `"+GroupedExecutionStrategyBuilder.TOKEN_RANGE_AWARE +"` - groups partition keys which belong to the same token range. Notice, this strategy does not take shards into account. Thus, this might be inefficient with ScyllaDB storage backend.<br>" +
+            "- `"+GroupedExecutionStrategyBuilder.REPLICAS_AWARE +"` - groups partition keys which belong to the same replica sets (same nodes). Notice, this strategy does not take shards into account. Thus, this might be inefficient with ScyllaDB storage backend.<br>" +
+            "<br>Usually `"+GroupedExecutionStrategyBuilder.TOKEN_RANGE_AWARE+"` grouping strategy provides more smaller groups where each group contain keys which are stored close to each other on a disk and may cause less disk seeks in some cases. " +
+            "However `"+GroupedExecutionStrategyBuilder.REPLICAS_AWARE+"` grouping strategy groups keys per replica set which usually means fewer bigger groups to be used (i.e. less CQL requests)." +
+            "<br>This option takes effect only when `"+KEYS_GROUPING_ALLOWED.toStringWithoutRoot()+"` is `true`.",
+        ConfigOption.Type.MASKABLE,
+        GroupedExecutionStrategyBuilder.REPLICAS_AWARE);
+
+    ConfigOption<Integer> KEYS_GROUPING_LIMIT = new ConfigOption<>(
+        CQL_GROUPING_NS,
+        "keys-limit",
+        "Maximum amount of the keys which can be grouped together into a single CQL query. " +
+            "If more keys are queried, they are going to be grouped into separate CQL queries.<br>"
+            + MAX_IN_CONFIG_MSG +
+            "<br>This option takes effect only when `"+KEYS_GROUPING_ALLOWED.toStringWithoutRoot()+"` is `true`.",
+        ConfigOption.Type.MASKABLE,
+        20);
+
+    ConfigOption<Integer> KEYS_GROUPING_MIN = new ConfigOption<>(
+        CQL_GROUPING_NS,
+        "keys-min",
+        "Minimum amount of keys to consider for grouping. Grouping will be skipped for any multi-key query " +
+            "which has less than this amount of keys (i.e. a separate CQL query will be executed for each key in such case).<br>" +
+            "Usually this configuration should always be set to `2`. It is useful to increase the value only in cases when queries " +
+            "with more keys should not be grouped, but be performed separately to increase parallelism in expense of the network overhead." +
+            "<br>This option takes effect only when `"+KEYS_GROUPING_ALLOWED.toStringWithoutRoot()+"` is `true`.",
+        ConfigOption.Type.MASKABLE,
+        2);
 }

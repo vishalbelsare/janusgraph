@@ -57,8 +57,24 @@ public class InMemoryGraphTest extends JanusGraphTest {
     @Override @Test @Disabled
     public void testLocalGraphConfiguration() {}
 
+    // A second in-memory graph does not share the storage of the first
+    @Override @Test @Disabled
+    public void testAutoCreatedConnectionConstraintReachesOtherInstances() {}
+
+    @Override @Test @Disabled
+    public void testLimitBatchSizeForMultiQueryRepeatStep() {}
+
+    @Override @Test @Disabled
+    public void testLimitBatchSizeForMultiQueryMultiCardinalityProperties() {}
+
     @Override @Test @Disabled
     public void testLimitBatchSizeForMultiQuery() {}
+
+    @Override @Test @Disabled
+    public void testMultiQueryPropertiesWithLimit() {}
+
+    @Override @Test @Disabled
+    public void testMultiSliceDBCachedRequests(){}
 
     @Override @Test @Disabled
     public void testMaskableGraphConfig() {}
@@ -91,10 +107,10 @@ public class InMemoryGraphTest extends JanusGraphTest {
     public void testDisableDefaultSchemaMaker () {}
 
     @Override @Test @Disabled
-    public void simpleLogTest() {}
+    public void simpleLogTest(boolean useStringId) {}
 
     @Override @Test @Disabled
-    public void simpleLogTestWithFailure() {}
+    public void simpleLogTestWithFailure(boolean useStringId) {}
 
     @Override @Test @Disabled
     public void testIndexUpdatesWithReindexAndRemove() {}
@@ -122,4 +138,14 @@ public class InMemoryGraphTest extends JanusGraphTest {
 
     @Override @Test @Disabled
     public void testSupportDirectCommitOfSchemaChangesForEdgeProperties() {}
+
+    @Override @Test @Disabled
+    public void testMultiQueryDropsStrategyModes() {}
+
+    @Override @Test @Disabled
+    public void testMetaPropertiesDrop() {}
+
+    @Override @Test @Disabled
+    public void testEdgePropertiesDrop() {}
+
 }

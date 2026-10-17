@@ -21,6 +21,7 @@ on:
     - '.github/workflows/ci-docs.yml'
     - '.github/ISSUE_TEMPLATE/**'
     - 'requirements.txt'
+    - 'mkdocs.yml'
     - 'docs.Dockerfile'
     - '*.md'
   push:
@@ -28,8 +29,11 @@ on:
     - 'docs/**'
     - '.github/workflows/ci-docs.yml'
     - 'requirements.txt'
+    - 'mkdocs.yml'
     - 'docs.Dockerfile'
     - '*.md'
+    branches-ignore:
+      - 'dependabot/**'
 
 env:
   BUILD_MAVEN_OPTS: "-DskipTests=true --batch-mode --also-make"
@@ -37,54 +41,111 @@ env:
 
 jobs:
   build-all:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/cache@v2
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
         with:
           path: ~/.m2/repository
           key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
             ${{ runner.os }}-maven-
-      - uses: actions/setup-java@v1
+      - uses: actions/setup-java@v4
         with:
-          java-version: 1.8
+          java-version: 11
+          distribution: zulu
       - run: mvn clean install --projects janusgraph-all -Pjanusgraph-cache -Dmaven.javadoc.skip=true ${{ env.BUILD_MAVEN_OPTS }}
       - run: mvn verify --projects janusgraph-all -Pjanusgraph-cache ${{ env.VERIFY_MAVEN_OPTS }}
 
   tests:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     needs: build-all
     strategy:
       fail-fast: false
       matrix:
         include:
+          - module: core
+            java: 11
           - module: driver
+            java: 11
           - module: server
+            java: 11
           - module: test
+            java: 11
           - module: inmemory
             args: "-Dtest.skip.tp=false"
+            java: 11
           - module: berkeleyje
+            java: 11
           - module: lucene
+            java: 11
+          - module: core
+            java: 17
+          - module: core
+            java: 21
+          - module: core
+            java: 25
+          - module: driver
+            java: 17
+          - module: driver
+            java: 21
+          - module: driver
+            java: 25
+          - module: server
+            java: 17
+          - module: server
+            java: 21
+          - module: server
+            java: 25
+          - module: test
+            java: 17
+          - module: test
+            java: 21
+          - module: test
+            java: 25
+          - module: inmemory
+            args: "-Dtest.skip.tp=false"
+            java: 17
+          - module: inmemory
+            args: "-Dtest.skip.tp=false"
+            java: 21
+          - module: inmemory
+            args: "-Dtest.skip.tp=false"
+            java: 25
+          - module: berkeleyje
+            java: 17
+          - module: berkeleyje
+            java: 21
+          - module: berkeleyje
+            java: 25
+          - module: lucene
+            java: 17
+          - module: lucene
+            java: 21
+          - module: lucene
+            java: 25
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 2
-      - uses: actions/cache@v2
+      - uses: actions/cache@v4
         with:
           path: ~/.m2/repository
           key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
             ${{ runner.os }}-maven-
-      - uses: actions/setup-java@v1
+      - uses: actions/setup-java@v4
         with:
-          java-version: 1.8
+          java-version: ${{ matrix.java }}
+          distribution: zulu
       - run: mvn clean install --projects janusgraph-${{ matrix.module }} ${{ env.BUILD_MAVEN_OPTS }} ${{ matrix.install-args }}
-      - run: mvn verify --projects janusgraph-${{ matrix.module }} ${{ env.VERIFY_MAVEN_OPTS }} ${{ matrix.args }}
-      - uses: actions/upload-artifact@v2
+      - run: mvn verify --projects janusgraph-${{ matrix.module }} ${{ env.VERIFY_MAVEN_OPTS }} ${{ matrix.install-args }} ${{ matrix.args }}
+      - uses: actions/upload-artifact@v4
         with:
-          name: jacoco-reports
+          name: jacoco-reports-${{ matrix.module }}-java-${{ matrix.java }}
           path: target/jacoco-combined.exec
-      - uses: codecov/codecov-action@v1
+      - uses: codecov/codecov-action@v5
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
         with:
-          name: codecov-core-${{ matrix.module }}
+          name: codecov-core-${{ matrix.module }}-java-${{ matrix.java }}

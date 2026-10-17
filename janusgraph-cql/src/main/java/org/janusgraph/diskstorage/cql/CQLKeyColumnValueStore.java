@@ -14,16 +14,21 @@
 
 package org.janusgraph.diskstorage.cql;
 
+import com.datastax.oss.driver.api.core.AllNodesFailedException;
+import com.datastax.oss.driver.api.core.CqlIdentifier;
 import com.datastax.oss.driver.api.core.CqlSession;
+import com.datastax.oss.driver.api.core.cql.AsyncResultSet;
 import com.datastax.oss.driver.api.core.cql.BatchableStatement;
 import com.datastax.oss.driver.api.core.cql.BoundStatement;
 import com.datastax.oss.driver.api.core.cql.BoundStatementBuilder;
-import com.datastax.oss.driver.api.core.cql.ExecutionInfo;
 import com.datastax.oss.driver.api.core.cql.PreparedStatement;
 import com.datastax.oss.driver.api.core.cql.ResultSet;
 import com.datastax.oss.driver.api.core.cql.Row;
+import com.datastax.oss.driver.api.core.cql.SimpleStatement;
 import com.datastax.oss.driver.api.core.metadata.TokenMap;
+import com.datastax.oss.driver.api.core.metadata.schema.RelationMetadata;
 import com.datastax.oss.driver.api.core.servererrors.QueryValidationException;
+import com.datastax.oss.driver.api.core.servererrors.ServerError;
 import com.datastax.oss.driver.api.core.type.DataTypes;
 import com.datastax.oss.driver.api.querybuilder.delete.DeleteSelection;
 import com.datastax.oss.driver.api.querybuilder.insert.Insert;
@@ -32,11 +37,13 @@ import com.datastax.oss.driver.api.querybuilder.schema.CreateTableWithOptions;
 import com.datastax.oss.driver.api.querybuilder.schema.compaction.CompactionStrategy;
 import com.datastax.oss.driver.api.querybuilder.select.Select;
 import com.datastax.oss.driver.shaded.guava.common.collect.ImmutableMap;
-import io.vavr.Tuple;
-import io.vavr.Tuple3;
+import com.google.common.base.Preconditions;
 import io.vavr.collection.Array;
 import io.vavr.collection.Iterator;
 import io.vavr.control.Try;
+import org.apache.commons.lang3.exception.ExceptionUtils;
+import org.janusgraph.core.JanusGraphException;
+import org.janusgraph.diskstorage.Backend;
 import org.janusgraph.diskstorage.BackendException;
 import org.janusgraph.diskstorage.Entry;
 import org.janusgraph.diskstorage.EntryList;
@@ -44,29 +51,35 @@ import org.janusgraph.diskstorage.EntryMetaData;
 import org.janusgraph.diskstorage.PermanentBackendException;
 import org.janusgraph.diskstorage.StaticBuffer;
 import org.janusgraph.diskstorage.TemporaryBackendException;
+import org.janusgraph.diskstorage.configuration.ConfigElement;
 import org.janusgraph.diskstorage.configuration.Configuration;
-import org.janusgraph.diskstorage.cql.function.slice.CQLExecutorServiceSliceFunction;
-import org.janusgraph.diskstorage.cql.function.slice.CQLSimpleSliceFunction;
-import org.janusgraph.diskstorage.cql.function.slice.CQLSliceFunction;
+import org.janusgraph.diskstorage.cql.service.AsyncQueryExecutionService;
+import org.janusgraph.diskstorage.cql.service.GroupingAsyncQueryExecutionService;
 import org.janusgraph.diskstorage.keycolumnvalue.KCVMutation;
 import org.janusgraph.diskstorage.keycolumnvalue.KeyColumnValueStore;
 import org.janusgraph.diskstorage.keycolumnvalue.KeyIterator;
 import org.janusgraph.diskstorage.keycolumnvalue.KeyRangeQuery;
 import org.janusgraph.diskstorage.keycolumnvalue.KeySliceQuery;
 import org.janusgraph.diskstorage.keycolumnvalue.KeySlicesIterator;
+import org.janusgraph.diskstorage.keycolumnvalue.MultiKeysQueryGroups;
 import org.janusgraph.diskstorage.keycolumnvalue.MultiSlicesQuery;
 import org.janusgraph.diskstorage.keycolumnvalue.SliceQuery;
+import org.janusgraph.diskstorage.keycolumnvalue.SplittableScanStore;
 import org.janusgraph.diskstorage.keycolumnvalue.StoreTransaction;
-import org.janusgraph.diskstorage.util.RecordIterator;
-import org.janusgraph.diskstorage.util.StaticArrayBuffer;
+import org.janusgraph.diskstorage.util.CompletableFutureUtil;
+import org.janusgraph.diskstorage.util.backpressure.QueryBackPressure;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.util.Collections;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
-import java.util.concurrent.ExecutorService;
+import java.util.NoSuchElementException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import static com.datastax.oss.driver.api.querybuilder.QueryBuilder.bindMarker;
 import static com.datastax.oss.driver.api.querybuilder.QueryBuilder.deleteFrom;
@@ -84,9 +97,14 @@ import static io.vavr.Predicates.instanceOf;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.CF_COMPRESSION;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.CF_COMPRESSION_BLOCK_SIZE;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.CF_COMPRESSION_TYPE;
+import static org.janusgraph.diskstorage.cql.CQLConfigOptions.PARALLEL_SCAN_TOKEN_RANGES;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.COMPACTION_OPTIONS;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.COMPACTION_STRATEGY;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.GC_GRACE_SECONDS;
+import static org.janusgraph.diskstorage.cql.CQLConfigOptions.IDEMPOTENT_WRITES;
+import static org.janusgraph.diskstorage.cql.CQLConfigOptions.INIT_WAIT_TIME;
+import static org.janusgraph.diskstorage.cql.CQLConfigOptions.SCAN_PAGE_SIZE;
+import static org.janusgraph.diskstorage.cql.CQLConfigOptions.SCAN_PER_PARTITION_LIMIT_ENABLED;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.SPECULATIVE_RETRY;
 import static org.janusgraph.diskstorage.cql.CQLTransaction.getTransaction;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.STORE_META_TIMESTAMPS;
@@ -95,7 +113,9 @@ import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.ST
 /**
  * An implementation of {@link KeyColumnValueStore} which stores the data in a CQL connected backend.
  */
-public class CQLKeyColumnValueStore implements KeyColumnValueStore {
+public class CQLKeyColumnValueStore implements KeyColumnValueStore, SplittableScanStore {
+
+    private static final Logger log = LoggerFactory.getLogger(CQLKeyColumnValueStore.class);
 
     public static final String TTL_FUNCTION_NAME = "ttl";
     public static final String WRITETIME_FUNCTION_NAME = "writetime";
@@ -116,24 +136,69 @@ public class CQLKeyColumnValueStore implements KeyColumnValueStore {
     public static final String KEY_START_BINDING = "keyStart";
     public static final String KEY_END_BINDING = "keyEnd";
     public static final String LIMIT_BINDING = "maxRows";
+    public static final String PER_PARTITION_LIMIT_BINDING = "perPartitionLimit";
 
-    public static final Function<? super Throwable, BackendException> EXCEPTION_MAPPER = cause -> Match(cause).of(
+    public static final Function<? super Throwable, BackendException> EXCEPTION_MAPPER = cause -> {
+        cause = CompletableFutureUtil.unwrapExecutionException(cause);
+        if (cause instanceof InterruptedException || cause.getCause() instanceof InterruptedException) {
+            Thread.currentThread().interrupt();
+            return new PermanentBackendException(cause instanceof InterruptedException ? cause : cause.getCause());
+        }
+        if (cause instanceof BackendException || cause.getCause() instanceof BackendException) {
+            return (BackendException) (cause instanceof BackendException ? cause : cause.getCause());
+        }
+        return Match(cause).of(
             Case($(instanceOf(QueryValidationException.class)), PermanentBackendException::new),
+            Case($(CQLKeyColumnValueStore::isKeySizeTooLarge), PermanentBackendException::new),
             Case($(), TemporaryBackendException::new));
+    };
+
+    /**
+     * CQL keys are limited to 64k, and a query that attempts to filter on such
+     * a key with a value that exceeds that length will produce a ServerError
+     * on ScyllaDB, perhaps due to a bug, rather than an InvalidQueryException.
+     * This type of ServerError is a permanent failure, since the same query with
+     * the same value will always produce this error. Properly treating this as a
+     * permanent failure avoids excessive retrying of bad CQL queries and allows
+     * upstream code to properly report the exception.
+     */
+    private static boolean isKeySizeTooLarge(Throwable cause) {
+        AllNodesFailedException failed = ExceptionUtils.throwableOfType(cause, AllNodesFailedException.class);
+        return failed != null && failed.getAllErrors().values().stream().anyMatch(errors ->
+            errors.stream().anyMatch(error -> (error instanceof ServerError)
+                && error.getMessage().startsWith("Key size too large:")));
+    }
 
     private final CQLStoreManager storeManager;
     private final CqlSession session;
     private final String tableName;
-    private final CQLColValGetter getter;
+    private final CQLColValGetter singleKeyGetter;
+    private final CQLColValGetter multiKeysGetter;
+
     private final Runnable closer;
 
     private final PreparedStatement getKeysAll;
     private final PreparedStatement getKeysRanged;
+    private final PreparedStatement getKeysRangedToken;
+    private final int parallelScanTokenRanges;
+    private final boolean parallelScanSupported;
+    private final int scanPageSize;
+    /**
+     * Whether the scan statements carry a bindable PER PARTITION LIMIT. Requested via
+     * {@link CQLConfigOptions#SCAN_PER_PARTITION_LIMIT_ENABLED}; flipped off during construction when
+     * the backend rejects the clause (see {@link #prepareScanStatement(Select)}), only written before
+     * the store is published.
+     */
+    private boolean scanPerPartitionLimitEnabled;
+    /** Last token-ring tiling handed out by {@link #tokenRangesFor(int)}; length == its split count. */
+    private volatile long[][] cachedTokenRanges;
     private final PreparedStatement deleteColumn;
+    private final PreparedStatement deleteRow;
     private final PreparedStatement insertColumn;
     private final PreparedStatement insertColumnWithTTL;
 
-    private final CQLSliceFunction cqlSliceFunction;
+    private final QueryBackPressure queryBackPressure;
+    private final AsyncQueryExecutionService asyncQueryExecutionService;
 
     /**
      * Creates an instance of the {@link KeyColumnValueStore} that stores the data in a CQL backed table.
@@ -149,23 +214,36 @@ public class CQLKeyColumnValueStore implements KeyColumnValueStore {
         this.tableName = tableName;
         this.closer = closer;
         this.session = this.storeManager.getSession();
-        this.getter = new CQLColValGetter(storeManager.getMetaDataSchema(this.tableName));
+        EntryMetaData[] defaultEntryMetadata = storeManager.getMetaDataSchema(this.tableName);
+        this.singleKeyGetter = new CQLColValGetter(defaultEntryMetadata);
+        EntryMetaData[] multiKeyEntryMetadata = new EntryMetaData[defaultEntryMetadata.length+1];
+        System.arraycopy(defaultEntryMetadata,0,multiKeyEntryMetadata,0, defaultEntryMetadata.length);
+        multiKeyEntryMetadata[multiKeyEntryMetadata.length-1] = EntryMetaData.ROW_KEY;
+        this.multiKeysGetter = new CQLColValGetter(multiKeyEntryMetadata);
 
         if(shouldInitializeTable()) {
             initializeTable(this.session, this.storeManager.getKeyspaceName(), tableName, configuration);
+            if (configuration.has(INIT_WAIT_TIME) && configuration.get(INIT_WAIT_TIME) > 0) {
+                try {
+                    Thread.sleep(configuration.get(INIT_WAIT_TIME));
+                } catch (InterruptedException e) {
+                    throw new JanusGraphException("Interrupted while waiting for table initialization to complete", e);
+                }
+            }
+        }
+        if (configuration.get(CQLConfigOptions.CDC) && Backend.EDGESTORE_NAME.equals(tableName)) {
+            // storage.cql.cdc only takes effect when JanusGraph CREATES the table; a pre-existing edgestore must be
+            // ALTERed manually (see the CDC documentation). Detect the divergence -- configuration says capture, the
+            // live table says no -- because it is otherwise completely silent: commits succeed, no CDC events are
+            // produced, and cdc-only mixed indexes simply go stale. Deliberately checked after BOTH branches above:
+            // when schema metadata is unavailable (storage.cql.metadata.schema-enabled=false or restricted
+            // permissions), shouldInitializeTable() falls back to true and the CREATE ... IF NOT EXISTS silently
+            // no-ops on a pre-existing table WITHOUT applying cdc=true -- exactly the divergence this check exists
+            // to surface.
+            warnIfCdcTableOptionInactive();
         }
 
-        // @formatter:off
-        final Select getSliceSelect = selectFrom(this.storeManager.getKeyspaceName(), this.tableName)
-            .column(COLUMN_COLUMN_NAME)
-            .column(VALUE_COLUMN_NAME)
-            .where(
-                Relation.column(KEY_COLUMN_NAME).isEqualTo(bindMarker(KEY_BINDING)),
-                Relation.column(COLUMN_COLUMN_NAME).isGreaterThanOrEqualTo(bindMarker(SLICE_START_BINDING)),
-                Relation.column(COLUMN_COLUMN_NAME).isLessThan(bindMarker(SLICE_END_BINDING))
-            )
-            .limit(bindMarker(LIMIT_BINDING));
-        PreparedStatement getSlice = this.session.prepare(addTTLFunction(addTimestampFunction(getSliceSelect)).build());
+        this.scanPerPartitionLimitEnabled = configuration.get(SCAN_PER_PARTITION_LIMIT_ENABLED);
 
         if (this.storeManager.getFeatures().hasOrderedScan()) {
             final Select getKeysRangedSelect = selectFrom(this.storeManager.getKeyspaceName(), this.tableName)
@@ -179,7 +257,7 @@ public class CQLKeyColumnValueStore implements KeyColumnValueStore {
                 )
                 .whereColumn(COLUMN_COLUMN_NAME).isGreaterThanOrEqualTo(bindMarker(SLICE_START_BINDING))
                 .whereColumn(COLUMN_COLUMN_NAME).isLessThanOrEqualTo(bindMarker(SLICE_END_BINDING));
-            this.getKeysRanged = this.session.prepare(addTTLFunction(addTimestampFunction(getKeysRangedSelect)).build());
+            this.getKeysRanged = prepareScanStatement(getKeysRangedSelect);
         } else {
             this.getKeysRanged = null;
         }
@@ -192,38 +270,130 @@ public class CQLKeyColumnValueStore implements KeyColumnValueStore {
                 .allowFiltering()
                 .whereColumn(COLUMN_COLUMN_NAME).isGreaterThanOrEqualTo(bindMarker(SLICE_START_BINDING))
                 .whereColumn(COLUMN_COLUMN_NAME).isLessThanOrEqualTo(bindMarker(SLICE_END_BINDING));
-            this.getKeysAll = this.session.prepare(addTTLFunction(addTimestampFunction(getKeysAllSelect)).build());
+            this.getKeysAll = prepareScanStatement(getKeysAllSelect);
+
+            // Token-bounded variant of the full scan, used to scan disjoint token ranges concurrently
+            // when parallel-scan-token-ranges > 1. Each range is matched with token(key) > start AND
+            // token(key) <= end, which tiles the ring exactly (see CQLTokenRangeSplitter).
+            final Select getKeysRangedTokenSelect = selectFrom(this.storeManager.getKeyspaceName(), this.tableName)
+                .column(KEY_COLUMN_NAME)
+                .column(COLUMN_COLUMN_NAME)
+                .column(VALUE_COLUMN_NAME)
+                .allowFiltering()
+                .where(
+                    Relation.token(KEY_COLUMN_NAME).isGreaterThan(bindMarker(KEY_START_BINDING)),
+                    Relation.token(KEY_COLUMN_NAME).isLessThanOrEqualTo(bindMarker(KEY_END_BINDING))
+                )
+                .whereColumn(COLUMN_COLUMN_NAME).isGreaterThanOrEqualTo(bindMarker(SLICE_START_BINDING))
+                .whereColumn(COLUMN_COLUMN_NAME).isLessThanOrEqualTo(bindMarker(SLICE_END_BINDING));
+            // The token-bounded variant only powers the (optional) token-range scans; a CQL-compatible
+            // service that rejects its shape must not fail store open, it just cannot split scans.
+            PreparedStatement rangedToken;
+            try {
+                rangedToken = prepareScanStatement(getKeysRangedTokenSelect);
+            } catch (QueryValidationException e) {
+                log.warn("Backend rejected the token-range scan statement for table [{}]; " +
+                    "token-range-parallel scans are disabled for this store", this.tableName, e);
+                rangedToken = null;
+            }
+            this.getKeysRangedToken = rangedToken;
         } else {
             this.getKeysAll = null;
+            this.getKeysRangedToken = null;
         }
 
+        final boolean idempotentWrites = storeManager.isAssignTimestamp() && configuration.get(IDEMPOTENT_WRITES);
         final DeleteSelection deleteSelection = addUsingTimestamp(deleteFrom(this.storeManager.getKeyspaceName(), this.tableName));
-        this.deleteColumn = this.session.prepare(deleteSelection
+        this.deleteColumn = this.session.prepare(withWriteIdempotence(deleteSelection
                 .whereColumn(KEY_COLUMN_NAME).isEqualTo(bindMarker(KEY_BINDING))
                 .whereColumn(COLUMN_COLUMN_NAME).isEqualTo(bindMarker(COLUMN_BINDING))
-                .build());
+                .build(), idempotentWrites));
+
+        final DeleteSelection deleteRowSelection = addUsingTimestamp(deleteFrom(this.storeManager.getKeyspaceName(), this.tableName));
+        this.deleteRow = this.session.prepare(withWriteIdempotence(deleteRowSelection
+                .whereColumn(KEY_COLUMN_NAME).isEqualTo(bindMarker(KEY_BINDING))
+                .build(), idempotentWrites));
 
         final Insert insertColumnInsert = addUsingTimestamp(insertInto(this.storeManager.getKeyspaceName(), this.tableName)
                 .value(KEY_COLUMN_NAME, bindMarker(KEY_BINDING))
                 .value(COLUMN_COLUMN_NAME, bindMarker(COLUMN_BINDING))
                 .value(VALUE_COLUMN_NAME, bindMarker(VALUE_BINDING)));
-        this.insertColumn = this.session.prepare(insertColumnInsert.build());
+        this.insertColumn = this.session.prepare(withWriteIdempotence(insertColumnInsert.build(), idempotentWrites));
 
         if (storeManager.getFeatures().hasCellTTL()) {
-            this.insertColumnWithTTL = this.session.prepare(insertColumnInsert.usingTtl(bindMarker(TTL_BINDING)).build());
+            this.insertColumnWithTTL = this.session.prepare(withWriteIdempotence(
+                insertColumnInsert.usingTtl(bindMarker(TTL_BINDING)).build(), idempotentWrites));
         } else {
             this.insertColumnWithTTL = null;
         }
 
-        Optional<ExecutorService> executorService = this.storeManager.getExecutorService();
+        queryBackPressure = storeManager.getQueriesBackPressure();
 
-        if(executorService.isPresent()){
-            cqlSliceFunction = new CQLExecutorServiceSliceFunction(session, getSlice, getter, executorService.get());
-        } else {
-            cqlSliceFunction = new CQLSimpleSliceFunction(session, getSlice, getter);
-        }
+        asyncQueryExecutionService = new GroupingAsyncQueryExecutionService(configuration, storeManager, tableName,
+            this::addTTLFunction, this::addTimestampFunction, singleKeyGetter, multiKeysGetter);
+
+        this.parallelScanTokenRanges = Math.max(1, configuration.get(PARALLEL_SCAN_TOKEN_RANGES));
+        // Token-range parallel scan is only correct for the Murmur3 partitioner, whose tokens are plain
+        // longs that tile [Long.MIN_VALUE, Long.MAX_VALUE]; for any other partitioner we keep the single scan.
+        this.parallelScanSupported = this.getKeysRangedToken != null && isMurmur3Partitioner();
+        final int configuredScanPageSize = configuration.get(SCAN_PAGE_SIZE);
+        this.scanPageSize = configuredScanPageSize > 0 ? configuredScanPageSize : this.storeManager.getPageSize();
 
         // @formatter:on
+    }
+
+    /**
+     * Prepares a scan statement, adding a bindable PER PARTITION LIMIT when enabled so a per-key
+     * entry limit (e.g. the scan framework's limit-1 key-existence query) stops server-side after
+     * the limit instead of streaming the full row slice to the client.
+     * <p>
+     * PER PARTITION LIMIT requires Apache Cassandra 3.6+ / ScyllaDB. When a CQL-compatible service
+     * that lacks the clause (e.g. Amazon Keyspaces) rejects the prepare, the pushdown is disabled
+     * for this store with a warning and the statement is prepared without the clause - a scan-only
+     * optimization must not fail store open (and with it every graph open) on such services.
+     */
+    private PreparedStatement prepareScanStatement(final Select select) {
+        if (scanPerPartitionLimitEnabled) {
+            try {
+                return this.session.prepare(addTTLFunction(addTimestampFunction(
+                    select.perPartitionLimit(bindMarker(PER_PARTITION_LIMIT_BINDING)))).build());
+            } catch (QueryValidationException e) {
+                this.scanPerPartitionLimitEnabled = false;
+                log.warn("Backend rejected PER PARTITION LIMIT in a scan statement for table [{}]; " +
+                    "scan queries will run without the per-partition-limit pushdown. Set {}=false to skip the attempt.",
+                    this.tableName, ConfigElement.getPath(SCAN_PER_PARTITION_LIMIT_ENABLED), e);
+            }
+        }
+        return this.session.prepare(addTTLFunction(addTimestampFunction(select)).build());
+    }
+
+    /**
+     * The value bound to the PER PARTITION LIMIT marker for the given scan query. When the query has
+     * no limit - or a degenerate limit below 1 (PER PARTITION LIMIT must be strictly positive) -
+     * {@link Integer#MAX_VALUE} is bound, which is semantically equivalent to omitting the clause:
+     * the server applies no effective per-key cap and such queries keep their historical client-side
+     * behavior (a limit-0 query still yields keys with zero entries).
+     */
+    private int perPartitionLimit(final SliceQuery query) {
+        return query.hasLimit() && query.getLimit() >= 1 ? query.getLimit() : Integer.MAX_VALUE;
+    }
+
+    private boolean isMurmur3Partitioner() {
+        return this.session.getMetadata().getTokenMap()
+            .map(tokenMap -> tokenMap.getPartitionerName().contains("Murmur3"))
+            .orElse(false);
+    }
+
+    /**
+     * The query builder marks an INSERT or a DELETE without conditions idempotent. A write is idempotent only while it
+     * binds its timestamp, though: sent again, it then writes the same cells with the same timestamp. A write without
+     * one leaves the timestamp to the driver or the server. So the flag is set only while timestamps are assigned and
+     * {@code storage.cql.idempotent-writes} is on; otherwise it is cleared, and the driver's default applies. The
+     * driver reads the flag of a statement executed on its own; of a batch, it reads only the batch's flag, which the
+     * mutate functions set under the same conditions.
+     */
+    private static SimpleStatement withWriteIdempotence(SimpleStatement write, boolean idempotentWrites) {
+        return write.setIdempotent(idempotentWrites ? Boolean.TRUE : null);
     }
 
     private DeleteSelection addUsingTimestamp(DeleteSelection deleteSelection) {
@@ -277,7 +447,61 @@ public class CQLKeyColumnValueStore implements KeyColumnValueStore {
             .orElse(true);
     }
 
+    private void warnIfCdcTableOptionInactive() {
+        try {
+            final java.util.Optional<com.datastax.oss.driver.api.core.metadata.schema.TableMetadata> table =
+                this.session.getMetadata().getKeyspace(this.storeManager.getKeyspaceName())
+                    .flatMap(keyspace -> keyspace.getTable(this.tableName));
+            if (!table.isPresent()) {
+                log.warn("storage.cql.cdc is enabled, but the '{}' table's schema metadata is unavailable "
+                    + "(schema metadata disabled or insufficient permissions), so it cannot be verified that the "
+                    + "table carries the cdc=true option. If the table pre-existed this graph configuration, run "
+                    + "\"ALTER TABLE {}.{} WITH cdc = true;\" once against the cluster -- without it NO change "
+                    + "events are captured.",
+                    this.tableName, this.storeManager.getKeyspaceName(), this.tableName);
+            } else if (!tableHasCdcEnabled(table.get())) {
+                log.warn("storage.cql.cdc is enabled, but the existing table '{}' in keyspace '{}' does NOT "
+                    + "have the cdc=true table option: the option is only applied when JanusGraph creates the "
+                    + "table, so NO change events are captured for this graph. Run \"ALTER TABLE {}.{} WITH "
+                    + "cdc = true;\" once against the cluster to activate CDC.",
+                    this.tableName, this.storeManager.getKeyspaceName(),
+                    this.storeManager.getKeyspaceName(), this.tableName);
+            }
+        } catch (RuntimeException e) {
+            // Metadata inspection is best-effort diagnostics only; never let it interfere with opening the store.
+            log.debug("Could not inspect the cdc table option of '{}'", this.tableName, e);
+        }
+    }
+
+    /** Whether the live table's {@code cdc} option is enabled. Package-private for unit tests. A missing option
+     *  (older Cassandra, or metadata not exposing it) counts as disabled -- events are not being captured either way. */
+    static boolean tableHasCdcEnabled(final RelationMetadata table) {
+        return Boolean.TRUE.equals(table.getOptions().get(CqlIdentifier.fromInternal("cdc")));
+    }
+
+    private static int getCassandraMajorVersion(final CqlSession session) {
+        try {
+            ResultSet rs = session.execute("SELECT release_version FROM system.local");
+            Row row = rs.one();
+            String version = row.getString("release_version");
+            return Integer.parseInt(version.split("\\.")[0]);
+        } catch (final Exception e) {
+            return 0;
+        }
+    }
+
     private static void initializeTable(final CqlSession session, final String keyspaceName, final String tableName, final Configuration configuration) {
+        int cassandraMajorVersion = getCassandraMajorVersion(session);
+        CreateTableWithOptions createTable = buildCreateTable(keyspaceName, tableName, configuration, cassandraMajorVersion);
+        session.execute(createTable.build());
+    }
+
+    /**
+     * Builds the {@code CREATE TABLE} statement for a JanusGraph store. Package-private and side-effect free so the
+     * table options (including Cassandra CDC) can be asserted in unit tests without a live Cassandra cluster.
+     */
+    static CreateTableWithOptions buildCreateTable(final String keyspaceName, final String tableName,
+                                                   final Configuration configuration, final int cassandraMajorVersion) {
         CreateTableWithOptions createTable = createTable(keyspaceName, tableName)
                 .ifNotExists()
                 .withPartitionKey(KEY_COLUMN_NAME, DataTypes.BLOB)
@@ -285,29 +509,43 @@ public class CQLKeyColumnValueStore implements KeyColumnValueStore {
                 .withColumn(VALUE_COLUMN_NAME, DataTypes.BLOB);
 
         createTable = compactionOptions(createTable, configuration);
-        createTable = compressionOptions(createTable, configuration);
+        createTable = compressionOptions(createTable, configuration, cassandraMajorVersion);
         createTable = gcGraceSeconds(createTable, configuration);
         createTable = speculativeRetryOptions(createTable, configuration);
 
-        session.execute(createTable.build());
+        // Cassandra CDC is only meaningful on the edgestore table, whose mutations imply mixed-index changes.
+        // Composite-index data (graphindex) and system stores are not relevant to mixed-index synchronization.
+        if (configuration.get(CQLConfigOptions.CDC) && Backend.EDGESTORE_NAME.equals(tableName)) {
+            createTable = createTable.withCDC(true);
+        }
+
+        return createTable;
     }
 
     private static CreateTableWithOptions compressionOptions(final CreateTableWithOptions createTable,
-                                                             final Configuration configuration) {
+                                                             final Configuration configuration,
+                                                             final int cassandraMajorVersion) {
         if (!configuration.get(CF_COMPRESSION)) {
-            // No compression
+            // Cassandra 5+ rejects {'sstable_compression': ''} — use {'enabled': false} instead.
+            if (cassandraMajorVersion >= 5)
+                return createTable.withOption("compression", ImmutableMap.of("enabled", false));
             return createTable.withNoCompression();
         }
 
         String compressionType = configuration.get(CF_COMPRESSION_TYPE);
         int chunkLengthInKb = configuration.get(CF_COMPRESSION_BLOCK_SIZE);
+        Map<String, Object> options;
 
-        return createTable.withOption("compression",
-            ImmutableMap.of("sstable_compression", compressionType, "chunk_length_kb", chunkLengthInKb));
+        if (cassandraMajorVersion >= 5)
+            options = ImmutableMap.of("class", compressionType, "chunk_length_in_kb", chunkLengthInKb);
+        else
+            options = ImmutableMap.of("sstable_compression", compressionType, "chunk_length_kb", chunkLengthInKb);
+
+        return createTable.withOption("compression", options);
     }
 
-    private static CreateTableWithOptions compactionOptions(final CreateTableWithOptions createTable,
-                                                            final Configuration configuration) {
+    static CreateTableWithOptions compactionOptions(final CreateTableWithOptions createTable,
+                                                    final Configuration configuration) {
         if (!configuration.has(COMPACTION_STRATEGY)) {
             return createTable;
         }
@@ -317,13 +555,14 @@ public class CQLKeyColumnValueStore implements KeyColumnValueStore {
                 Case($("SizeTieredCompactionStrategy"), sizeTieredCompactionStrategy()),
                 Case($("TimeWindowCompactionStrategy"), timeWindowCompactionStrategy()),
                 Case($("LeveledCompactionStrategy"), leveledCompactionStrategy()));
-        Iterator<Array<String>> groupedOptions = Array.of(configuration.get(COMPACTION_OPTIONS))
-            .grouped(2);
 
-        for(Array<String> keyValue: groupedOptions){
-            compactionStrategy = compactionStrategy.withOption(keyValue.get(0), keyValue.get(1));
+        if (configuration.has(COMPACTION_OPTIONS)) {
+            Iterator<Array<String>> groupedOptions = Array.of(configuration.get(COMPACTION_OPTIONS))
+                                                          .grouped(2);
+            for (Array<String> keyValue : groupedOptions) {
+                compactionStrategy = compactionStrategy.withOption(keyValue.get(0), keyValue.get(1));
+            }
         }
-
         return createTable.withCompaction(compactionStrategy);
     }
 
@@ -355,39 +594,33 @@ public class CQLKeyColumnValueStore implements KeyColumnValueStore {
 
     @Override
     public EntryList getSlice(final KeySliceQuery query, final StoreTransaction txh) throws BackendException {
-        return cqlSliceFunction.getSlice(query, txh);
+        try {
+            return asyncQueryExecutionService.executeSingleKeySingleSlice(query, txh).get();
+        } catch (Throwable throwable){
+            throw EXCEPTION_MAPPER.apply(throwable);
+        }
     }
 
     @Override
     public Map<StaticBuffer, EntryList> getSlice(final List<StaticBuffer> keys, final SliceQuery query, final StoreTransaction txh) throws BackendException {
-        throw new UnsupportedOperationException("The CQL backend does not support multi-key queries");
+        try {
+            return CompletableFutureUtil.unwrap(asyncQueryExecutionService.executeMultiKeySingleSlice(keys, query, txh));
+        } catch (Throwable e) {
+            throw EXCEPTION_MAPPER.apply(e);
+        }
     }
 
-    public static class CQLResultSetIterator implements RecordIterator<Tuple3<StaticBuffer, StaticBuffer, Row>> {
-
-        private java.util.Iterator<Row> resultSetIterator;
-
-        public CQLResultSetIterator(ResultSet rs) {
-            resultSetIterator = rs.iterator();
-        }
-
-        @Override
-        public boolean hasNext() {
-            return resultSetIterator.hasNext();
-        }
-
-        @Override
-        public Tuple3<StaticBuffer, StaticBuffer, Row> next() {
-            Row nextRow = resultSetIterator.next();
-            return nextRow == null
-                ? null
-                : Tuple.of(StaticArrayBuffer.of(nextRow.getByteBuffer(COLUMN_COLUMN_NAME)),
-                           StaticArrayBuffer.of(nextRow.getByteBuffer(VALUE_COLUMN_NAME)), nextRow);
-        }
-
-        @Override
-        public void close() throws IOException {
-            // NOP
+    // This implementation is better optimized than `KeyColumnValueStoreUtil.getMultiRangeSliceNonOptimized(this, multiSliceQueriesForKeys, txh);`
+    // because it sends all slice queries in parallel instead of using blocking calls to
+    // `getSlice(final Collection<StaticBuffer> keys, final SliceQuery query, final StoreTransaction txh)`.
+    // Moreover, if `sliceGroupingAllowed` is `true` it may also group some of the Slice queries together and perform
+    // IN operator instead of multiple range queries.
+    @Override
+    public Map<SliceQuery, Map<StaticBuffer, EntryList>> getMultiSlices(final MultiKeysQueryGroups<StaticBuffer, SliceQuery> multiSliceQueriesForKeys, StoreTransaction txh) throws BackendException {
+        try {
+            return CompletableFutureUtil.unwrapMapOfMaps(asyncQueryExecutionService.executeMultiKeyMultiSlice(multiSliceQueriesForKeys, txh));
+        } catch (Throwable e) {
+            throw EXCEPTION_MAPPER.apply(e);
         }
     }
 
@@ -399,6 +632,19 @@ public class CQLKeyColumnValueStore implements KeyColumnValueStore {
         BoundStatementBuilder builder = deleteColumn.boundStatementBuilder()
             .setByteBuffer(KEY_BINDING, key.asByteBuffer())
             .setByteBuffer(COLUMN_BINDING, column.asByteBuffer());
+        if (timestamp != null) {
+            builder = builder.setLong(TIMESTAMP_BINDING, timestamp);
+        }
+        return builder.build();
+    }
+
+    public BatchableStatement<BoundStatement> deleteRow(final StaticBuffer key) {
+        return deleteRow(key, null);
+    }
+
+    public BatchableStatement<BoundStatement> deleteRow(final StaticBuffer key, final Long timestamp) {
+        BoundStatementBuilder builder = deleteRow.boundStatementBuilder()
+            .setByteBuffer(KEY_BINDING, key.asByteBuffer());
         if (timestamp != null) {
             builder = builder.setLong(TIMESTAMP_BINDING, timestamp);
         }
@@ -438,6 +684,17 @@ public class CQLKeyColumnValueStore implements KeyColumnValueStore {
     }
 
     @Override
+    public KeyIterator getKeys(final List<StaticBuffer> keys, final SliceQuery query, final StoreTransaction txh) throws BackendException {
+        return Try.of(() -> new CQLMapKeyIterator(new CQLSubsetIterator<>(keys, this.storeManager.getKeysSize(), (keysList) -> {
+            try {
+                return getSlice(keysList, query, txh).entrySet().iterator();
+            } catch (BackendException e) {
+                throw new RuntimeException(e);
+            }
+        }))).getOrElseThrow(EXCEPTION_MAPPER);
+    }
+
+    @Override
     public KeyIterator getKeys(final KeyRangeQuery query, final StoreTransaction txh) throws BackendException {
         if (!this.storeManager.getFeatures().hasOrderedScan()) {
             throw new PermanentBackendException("This operation is only allowed when the byteorderedpartitioner is used.");
@@ -446,14 +703,14 @@ public class CQLKeyColumnValueStore implements KeyColumnValueStore {
         TokenMap tokenMap = this.session.getMetadata().getTokenMap().get();
         return Try.of(() -> new CQLResultSetKeyIterator(
             query,
-            this.getter,
+            this.singleKeyGetter,
             new CQLPagingIterator(
-                getKeysRanged.boundStatementBuilder()
+                scanStatementBuilder(getKeysRanged, query)
                     .setToken(KEY_START_BINDING, tokenMap.newToken(query.getKeyStart().asByteBuffer()))
                     .setToken(KEY_END_BINDING, tokenMap.newToken(query.getKeyEnd().asByteBuffer()))
                     .setByteBuffer(SLICE_START_BINDING, query.getSliceStart().asByteBuffer())
                     .setByteBuffer(SLICE_END_BINDING, query.getSliceEnd().asByteBuffer())
-                    .setPageSize(this.storeManager.getPageSize())
+                    .setPageSize(this.scanPageSize)
                     .setConsistencyLevel(getTransaction(txh).getReadConsistencyLevel()).build())))
             .getOrElseThrow(EXCEPTION_MAPPER);
     }
@@ -461,19 +718,98 @@ public class CQLKeyColumnValueStore implements KeyColumnValueStore {
     @Override
     public KeyIterator getKeys(final SliceQuery query, final StoreTransaction txh) throws BackendException {
         if (!this.storeManager.getFeatures().hasUnorderedScan()) {
-            throw new PermanentBackendException("This operation is only allowed when a random partitioner (md5 or murmur3) is used.");
+            throw new PermanentBackendException("This operation is only allowed when partitioner supports unordered scan");
         }
 
-        return Try.of(() -> new CQLResultSetKeyIterator(
+        return Try.of(() -> {
+            if (parallelScanSupported && parallelScanTokenRanges > 1) {
+                final long[][] tokenRanges = tokenRangesFor(parallelScanTokenRanges);
+                final List<CQLPagingIterator> rangeScans = new ArrayList<>(tokenRanges.length);
+                for (final long[] tokenRange : tokenRanges) {
+                    rangeScans.add(tokenRangePagingIterator(query, txh, tokenRange));
+                }
+                // Each per-range pager issues only its FIRST page on construction (concurrently across
+                // ranges); io.vavr Iterator.concat then drains the ranges back-to-back on the single scan
+                // thread, so deeper paging is sequential range-by-range rather than fully parallel.
+                // Concatenating in ring order preserves global token order, which the multi-query scan merge
+                // in StandardScannerExecutor relies on. For true end-to-end parallelism the scan-job
+                // framework requests each range separately via getKeysForSplit and drains them on
+                // dedicated threads (see SplittableScanStore).
+                return new CQLResultSetKeyIterator(query, this.singleKeyGetter, Iterator.concat(rangeScans));
+            }
+            return new CQLResultSetKeyIterator(
                 query,
-                this.getter,
+                this.singleKeyGetter,
                 new CQLPagingIterator(
-                    getKeysAll.boundStatementBuilder()
+                    scanStatementBuilder(getKeysAll, query)
                         .setByteBuffer(SLICE_START_BINDING, query.getSliceStart().asByteBuffer())
                         .setByteBuffer(SLICE_END_BINDING, query.getSliceEnd().asByteBuffer())
-                        .setPageSize(this.storeManager.getPageSize())
-                        .setConsistencyLevel(getTransaction(txh).getReadConsistencyLevel()).build())))
-                .getOrElseThrow(EXCEPTION_MAPPER);
+                        .setPageSize(this.scanPageSize)
+                        .setConsistencyLevel(getTransaction(txh).getReadConsistencyLevel()).build()));
+        }).getOrElseThrow(EXCEPTION_MAPPER);
+    }
+
+    @Override
+    public int getUnorderedScanSplitCount() {
+        return parallelScanSupported ? parallelScanTokenRanges : 1;
+    }
+
+    @Override
+    public KeyIterator getKeysForSplit(final SliceQuery query, final StoreTransaction txh,
+                                       final int splitIndex, final int splitCount) throws BackendException {
+        if (!this.storeManager.getFeatures().hasUnorderedScan()) {
+            throw new PermanentBackendException("This operation is only allowed when partitioner supports unordered scan");
+        }
+        if (!parallelScanSupported) {
+            throw new PermanentBackendException("Split scans require the Murmur3 partitioner and a backend " +
+                "that accepts token-range scan statements (see warnings logged at store open)");
+        }
+        Preconditions.checkArgument(splitCount >= 1, "splitCount must be positive: %s", splitCount);
+        Preconditions.checkArgument(splitIndex >= 0 && splitIndex < splitCount,
+            "splitIndex must be in [0,%s): %s", splitCount, splitIndex);
+        final long[] tokenRange = tokenRangesFor(splitCount)[splitIndex];
+        return Try.of(() -> (KeyIterator) new CQLResultSetKeyIterator(query, this.singleKeyGetter,
+            tokenRangePagingIterator(query, txh, tokenRange)))
+            .getOrElseThrow(EXCEPTION_MAPPER);
+    }
+
+    /**
+     * Memoized {@link CQLTokenRangeSplitter#splitMurmur3Ring(int)}: a scan requests the same tiling
+     * once per (split, slice query), so without memoization the total allocation cost would grow
+     * quadratically with the split count. The function is pure, so the benign race of two threads
+     * computing the same tiling concurrently is harmless (the array length encodes the split count).
+     */
+    private long[][] tokenRangesFor(final int splitCount) {
+        long[][] ranges = this.cachedTokenRanges;
+        if (ranges == null || ranges.length != splitCount) {
+            ranges = CQLTokenRangeSplitter.splitMurmur3Ring(splitCount);
+            this.cachedTokenRanges = ranges;
+        }
+        return ranges;
+    }
+
+    private CQLPagingIterator tokenRangePagingIterator(final SliceQuery query, final StoreTransaction txh, final long[] tokenRange) {
+        return new CQLPagingIterator(
+            scanStatementBuilder(getKeysRangedToken, query)
+                .setLong(KEY_START_BINDING, tokenRange[0])
+                .setLong(KEY_END_BINDING, tokenRange[1])
+                .setByteBuffer(SLICE_START_BINDING, query.getSliceStart().asByteBuffer())
+                .setByteBuffer(SLICE_END_BINDING, query.getSliceEnd().asByteBuffer())
+                .setPageSize(this.scanPageSize)
+                .setConsistencyLevel(getTransaction(txh).getReadConsistencyLevel()).build());
+    }
+
+    /**
+     * Bound-statement builder for a scan statement, binding the PER PARTITION LIMIT marker when that
+     * statement carries one (a statement prepared after the fallback in
+     * {@link #prepareScanStatement(Select)} does not).
+     */
+    private BoundStatementBuilder scanStatementBuilder(final PreparedStatement scanStatement, final SliceQuery query) {
+        final BoundStatementBuilder builder = scanStatement.boundStatementBuilder();
+        if (scanStatement.getVariableDefinitions().contains(PER_PARTITION_LIMIT_BINDING)) {
+            return builder.setInt(PER_PARTITION_LIMIT_BINDING, perPartitionLimit(query));
+        }
+        return builder;
     }
 
     @Override
@@ -482,36 +818,56 @@ public class CQLKeyColumnValueStore implements KeyColumnValueStore {
     }
 
     /**
-     * This class provides a paging implementation that sits on top of the DSE Cassandra driver. The driver already
-     * has its own built in paging support but this has limitations when doing a full scan of the key ring due
-     * to how driver paging metadata is stored. The driver stores a full history of a given query's paging metadata
-     * which can lead to OOM issues on non-trivially sized data sets. This class overcomes this by forcing the internal
-     * metadata which isn't needed anymore to be deleted to be free for GC.
+     * This class provides a paging implementation that sits on top of the DSE Cassandra driver.
+     * <p>
+     * Pages are fetched with a one-page lookahead: as soon as page N arrives, the fetch of page N+1 is
+     * started so it downloads while page N is being drained. A page fetch holds one back-pressure permit
+     * only while it is in flight (released on completion), so the lookahead never holds more concurrent
+     * permits than the previous drain-then-fetch implementation - it merely overlaps the network wait
+     * with client-side row processing instead of alternating between them.
      */
     private class CQLPagingIterator implements Iterator<Row> {
 
-        private final List<ExecutionInfo> dseStoredExecutionInfos;
-        private final java.util.Iterator<Row> currentPageIterator;
+        private java.util.Iterator<Row> currentPageIterator = Collections.emptyIterator();
+
+        /** In-flight fetch of the page after the one currently being drained; null when exhausted. */
+        private CompletableFuture<AsyncResultSet> pendingResultSet;
 
         public CQLPagingIterator(BoundStatement boundStatement) {
-            ResultSet currentResultSet = session.execute(boundStatement);
-            currentPageIterator = currentResultSet.iterator();
-            this.dseStoredExecutionInfos = currentResultSet.getExecutionInfos();
+            pendingResultSet = fetchPage(() -> session.executeAsync(boundStatement));
+        }
+
+        private CompletableFuture<AsyncResultSet> fetchPage(Supplier<CompletionStage<AsyncResultSet>> pageFetcher) {
+            queryBackPressure.acquireBeforeQuery();
+            try{
+                return pageFetcher.get()
+                    .whenComplete((asyncResultSet, throwable) -> queryBackPressure.releaseAfterQuery()).toCompletableFuture();
+            } catch (RuntimeException e){
+                queryBackPressure.releaseAfterQuery();
+                throw e;
+            }
         }
 
         @Override
         public boolean hasNext() {
-            return currentPageIterator.hasNext();
+            while (!currentPageIterator.hasNext()) {
+                if (pendingResultSet == null) {
+                    return false;
+                }
+                final AsyncResultSet resultSet = CompletableFutureUtil.get(pendingResultSet);
+                // Start downloading the next page before this one is drained.
+                pendingResultSet = resultSet.hasMorePages() ? fetchPage(resultSet::fetchNextPage) : null;
+                currentPageIterator = resultSet.currentPage().iterator();
+            }
+            return true;
         }
 
         @Override
         public Row next() {
-            if(dseStoredExecutionInfos.size()>1){
-                ExecutionInfo lastExecutionInfo = dseStoredExecutionInfos.get(dseStoredExecutionInfos.size()-1);
-                dseStoredExecutionInfos.clear();
-                dseStoredExecutionInfos.add(lastExecutionInfo);
+            if(hasNext()){
+                return currentPageIterator.next();
             }
-            return currentPageIterator.next();
+            throw new NoSuchElementException();
         }
     }
 }

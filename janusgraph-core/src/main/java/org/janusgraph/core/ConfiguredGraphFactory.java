@@ -18,9 +18,9 @@ import com.google.common.base.Preconditions;
 import org.apache.commons.configuration2.Configuration;
 import org.apache.commons.configuration2.MapConfiguration;
 import org.apache.tinkerpop.gremlin.structure.Graph;
+import org.janusgraph.core.util.GraphFactoryUtils;
 import org.janusgraph.diskstorage.BackendException;
 import org.janusgraph.diskstorage.configuration.backend.CommonsConfiguration;
-import org.janusgraph.graphdb.configuration.builder.GraphDatabaseConfigurationBuilder;
 import org.janusgraph.graphdb.database.StandardJanusGraph;
 import org.janusgraph.graphdb.database.management.ManagementSystem;
 import org.janusgraph.graphdb.management.ConfigurationManagementGraph;
@@ -87,7 +87,7 @@ public class ConfiguredGraphFactory {
         final JanusGraphManager jgm = JanusGraphManagerUtility.getInstance();
         Preconditions.checkNotNull(jgm, JANUS_GRAPH_MANAGER_EXPECTED_STATE_MSG);
         final CommonsConfiguration config = new CommonsConfiguration(ConfigurationUtil.loadMapConfiguration(templateConfigMap));
-        final JanusGraph g = (JanusGraph) jgm.openGraph(graphName, (String gName) -> new StandardJanusGraph(new GraphDatabaseConfigurationBuilder().build(config)));
+        final JanusGraph g = (JanusGraph) jgm.openGraph(graphName, (String gName) -> GraphFactoryUtils.defineSchemaAndStart((config)));
         configManagementGraph.createConfiguration(new MapConfiguration(templateConfigMap));
         return g;
     }
@@ -112,7 +112,7 @@ public class ConfiguredGraphFactory {
         final JanusGraphManager jgm = JanusGraphManagerUtility.getInstance();
         Preconditions.checkNotNull(jgm, JANUS_GRAPH_MANAGER_EXPECTED_STATE_MSG);
         final CommonsConfiguration config = new CommonsConfiguration(ConfigurationUtil.loadMapConfiguration(graphConfigMap));
-        return (JanusGraph) jgm.openGraph(graphName, (String gName) -> new StandardJanusGraph(new GraphDatabaseConfigurationBuilder().build(config)));
+        return (JanusGraph) jgm.openGraph(graphName, (String gName) -> GraphFactoryUtils.defineSchemaAndStart(config));
     }
 
     /**
@@ -156,11 +156,16 @@ public class ConfiguredGraphFactory {
         Preconditions.checkNotNull(jgm, JANUS_GRAPH_MANAGER_EXPECTED_STATE_MSG);
 
         final StandardJanusGraph graph = (StandardJanusGraph) jgm.getGraph(graphName);
-        // Evict the graph from the cache in all nodes in the cluster
-        DropGraphOnEvictionTrigger dropTrigger = new DropGraphOnEvictionTrigger(graphName, graph, getConfigGraphManagementInstance());
-        removeGraphFromCache(graph, dropTrigger);
-        // Block the current thread until the drop operation finish
-        dropTrigger.waitUntilDropFinish();
+        if (graph != null) {
+            // Evict the graph from the cache in all nodes in the cluster
+            DropGraphOnEvictionTrigger dropTrigger = new DropGraphOnEvictionTrigger(graphName, graph, getConfigGraphManagementInstance());
+            removeGraphFromCache(graph, dropTrigger);
+            // Block the current thread until the drop operation finish
+            dropTrigger.waitUntilDropFinish();
+        } else {
+            // cannot open graph, do nothing
+            log.error(String.format("Failed to open graph %s. Thus, it and its traversal will not be bound on this server.", graphName));
+        }
     }
 
     /**
@@ -272,6 +277,18 @@ public class ConfiguredGraphFactory {
         configManagementGraph.removeConfiguration(graphName);
     }
 
+    /**
+     * Remove configuration corresponding to supplied graphName; we remove supplied existing
+     * properties.
+     * NOTE: The updated configuration is only guaranteed to take effect if the {@link Graph} corresponding to
+     * graphName has been closed and reopened on every JanusGraph Node.
+     */
+    public static void removeConfiguration(final String graphName, final Set<String> configKeys) {
+        final ConfigurationManagementGraph configManagementGraph = getConfigGraphManagementInstance();
+        removeGraphFromCache(graphName);
+        configManagementGraph.removeConfiguration(graphName, configKeys);
+    }
+
     private static void removeGraphFromCache(final String graphName) {
 
         try {
@@ -309,9 +326,9 @@ public class ConfiguredGraphFactory {
      *
      * @return Map&lt;String, Object&gt;
      */
-    public static Map<String, Object> getConfiguration(final String configName) {
+    public static Map<String, Object> getConfiguration(final String graphName) {
         final ConfigurationManagementGraph configManagementGraph = getConfigGraphManagementInstance();
-        return configManagementGraph.getConfiguration(configName);
+        return configManagementGraph.getConfiguration(graphName);
     }
 
     /**

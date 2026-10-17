@@ -20,12 +20,16 @@ import org.janusgraph.diskstorage.configuration.ModifiableConfiguration;
 import org.janusgraph.diskstorage.configuration.WriteConfiguration;
 import org.janusgraph.example.GraphOfTheGodsFactory;
 import org.janusgraph.graphdb.JanusGraphIndexTest;
+import org.junit.Assert;
 import org.junit.jupiter.api.Test;
+
+import java.util.concurrent.ExecutionException;
 
 import static org.janusgraph.BerkeleyStorageSetup.getBerkeleyJEConfiguration;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_BACKEND;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_DIRECTORY;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * @author Matthias Broecheler (me@matthiasb.com)
@@ -33,7 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 public class BerkeleyLuceneTest extends JanusGraphIndexTest {
 
     public BerkeleyLuceneTest() {
-        super(true, true, true);
+        super(true, true, true, false);
     }
 
     @Override
@@ -54,6 +58,11 @@ public class BerkeleyLuceneTest extends JanusGraphIndexTest {
     @Override
     public boolean supportsGeoPointExistsQuery() {
         return false;
+    }
+
+    @Override
+    public boolean supportsGeoShapePrefixTreeMapping() {
+        return true;
     }
 
     @Override
@@ -138,4 +147,20 @@ public class BerkeleyLuceneTest extends JanusGraphIndexTest {
         assertEquals(expectedIndexes, mgmt.printIndexes());
     }
 
+    @Test
+    @Override
+    public void testDiscardAndDropRegisteredIndex() {
+        assertThrows(UnsupportedOperationException.class, super::testDiscardAndDropRegisteredIndex);
+    }
+
+    @Test
+    @Override
+    public void testCreateMixedIndexThatPreviouslyExisted() {
+        assertThrows(UnsupportedOperationException.class, super::testCreateMixedIndexThatPreviouslyExisted);
+    }
+
+    @Test
+    public void testSubsetReindex() {
+        Assert.assertThrows("Code is not implemented", ExecutionException.class, super::testSubsetReindex);
+    }
 }

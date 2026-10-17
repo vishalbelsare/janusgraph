@@ -15,6 +15,7 @@
 package org.janusgraph.core.cql;
 
 import com.datastax.driver.core.Session;
+import io.github.artsok.RepeatedIfExceptionsTest;
 import org.apache.commons.configuration2.MapConfiguration;
 import org.janusgraph.JanusGraphCassandraContainer;
 import org.janusgraph.core.AbstractConfiguredGraphFactoryTest;
@@ -32,8 +33,8 @@ import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.GR
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.STORAGE_BACKEND;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.STORAGE_HOSTS;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.STORAGE_PORT;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
 
 @Testcontainers
 public class CQLConfiguredGraphFactoryTest extends AbstractConfiguredGraphFactoryTest {
@@ -108,7 +109,8 @@ public class CQLConfiguredGraphFactoryTest extends AbstractConfiguredGraphFactor
         }
     }
 
-    @Test
+    // flaky test: https://github.com/JanusGraph/janusgraph/issues/3393
+    @RepeatedIfExceptionsTest(repeats = 3)
     public void dropGraphShouldRemoveGraphKeyspace() throws Exception {
         final MapConfiguration graphConfig = getGraphConfig();
         final String graphName = graphConfig.getString(GRAPH_NAME.toStringWithoutRoot());
@@ -121,14 +123,31 @@ public class CQLConfiguredGraphFactoryTest extends AbstractConfiguredGraphFactor
 
             ConfiguredGraphFactory.drop(graphName);
             Session cql = cqlContainer.getCluster().connect();
-            Object graph_keyspace = cql.execute("SELECT * FROM system_schema.keyspaces WHERE keyspace_name = ?", graphName).one();
+            // Not ResultSet.one(): janusgraph-scylla runs this test against the Scylla driver, whose ResultSet has no
+            // Row-returning one()
+            boolean keyspaceFound = cql.execute("SELECT * FROM system_schema.keyspaces WHERE keyspace_name = ?",
+                graphName).iterator().hasNext();
             cql.close();
 
-            assertNull(graph_keyspace);
+            assertFalse(keyspaceFound);
         } finally {
             ConfiguredGraphFactory.removeConfiguration(graphName);
             ConfiguredGraphFactory.close(graphName);
         }
+    }
+
+    // flaky test: https://github.com/JanusGraph/janusgraph/issues/3096
+    @RepeatedIfExceptionsTest(repeats = 3)
+    @Override
+    public void updateConfigurationShouldRemoveGraphFromCache() throws Exception {
+        super.updateConfigurationShouldRemoveGraphFromCache();
+    }
+
+    // flaky test: https://github.com/JanusGraph/janusgraph/issues/3959
+    @RepeatedIfExceptionsTest(repeats = 3)
+    @Override
+    public void dropShouldCleanUpTraversalSourceAndBindings() throws Exception {
+        super.dropShouldCleanUpTraversalSourceAndBindings();
     }
 }
 

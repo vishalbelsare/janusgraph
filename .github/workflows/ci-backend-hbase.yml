@@ -21,6 +21,7 @@ on:
     - '.github/workflows/ci-docs.yml'
     - '.github/ISSUE_TEMPLATE/**'
     - 'requirements.txt'
+    - 'mkdocs.yml'
     - 'docs.Dockerfile'
     - '*.md'
   push:
@@ -29,8 +30,11 @@ on:
     - '.github/workflows/ci-docs.yml'
     - '.github/ISSUE_TEMPLATE/**'
     - 'requirements.txt'
+    - 'mkdocs.yml'
     - 'docs.Dockerfile'
     - '*.md'
+    branches-ignore:
+      - 'dependabot/**'
 
 env:
   BUILD_MAVEN_OPTS: "-DskipTests=true --batch-mode --also-make"
@@ -38,23 +42,24 @@ env:
 
 jobs:
   build-all:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/cache@v2
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
         with:
           path: ~/.m2/repository
           key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
             ${{ runner.os }}-maven-
-      - uses: actions/setup-java@v1
+      - uses: actions/setup-java@v4
         with:
-          java-version: 1.8
+          java-version: 11
+          distribution: zulu
       - run: mvn clean install --projects janusgraph-all -Pjanusgraph-cache -Dmaven.javadoc.skip=true ${{ env.BUILD_MAVEN_OPTS }}
       - run: mvn verify --projects janusgraph-all -Pjanusgraph-cache ${{ env.VERIFY_MAVEN_OPTS }}
 
   tests:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     needs: build-all
     strategy:
       fail-fast: false
@@ -62,44 +67,50 @@ jobs:
         include:
           - module: hbase
             args: "-Dtest=\"**/diskstorage/hbase/*\""
-            name: hbase1-diskstorage
-          - module: hbase
-            args: "-Dtest=\"**/graphdb/hbase/*\""
-            name: hbase1-graphdb
-          - module: hbase
-            args: "-Dtest=\"**/hadoop/*\""
-            name: hbase1-hadoop
-          - module: hbase
-            install-args: "-Dhbase.profile -Phbase2"
-            args: "-Dtest=\"**/diskstorage/hbase/*\""
             name: hbase2-diskstorage
+            java: 11
           - module: hbase
-            install-args: "-Dhbase.profile -Phbase2"
             args: "-Dtest=\"**/graphdb/hbase/*\""
             name: hbase2-graphdb
+            java: 11
           - module: hbase
-            install-args: "-Dhbase.profile -Phbase2"
             args: "-Dtest=\"**/hadoop/*\""
             name: hbase2-hadoop
+            java: 11
+          - module: hbase
+            args: "-Dtest=\"**/diskstorage/hbase/*\""
+            name: hbase2-diskstorage-java25
+            java: 25
+          - module: hbase
+            args: "-Dtest=\"**/graphdb/hbase/*\""
+            name: hbase2-graphdb-java25
+            java: 25
+          - module: hbase
+            args: "-Dtest=\"**/hadoop/*\""
+            name: hbase2-hadoop-java17
+            java: 17
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 2
-      - uses: actions/cache@v2
+      - uses: actions/cache@v4
         with:
           path: ~/.m2/repository
           key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
             ${{ runner.os }}-maven-
-      - uses: actions/setup-java@v1
+      - uses: actions/setup-java@v4
         with:
-          java-version: 1.8
+          java-version: ${{ matrix.java }}
+          distribution: zulu
       - run: mvn clean install --projects janusgraph-${{ matrix.module }} ${{ env.BUILD_MAVEN_OPTS }} ${{ matrix.install-args }}
-      - run: mvn verify --projects janusgraph-${{ matrix.module }} ${{ env.VERIFY_MAVEN_OPTS }} ${{ matrix.args }} -Dhbase.docker.uid=$(id -u) -Dhbase.docker.gid=$(id -g)
-      - uses: actions/upload-artifact@v2
+      - run: mvn verify --projects janusgraph-${{ matrix.module }} ${{ env.VERIFY_MAVEN_OPTS }} ${{ matrix.install-args }} ${{ matrix.args }} -Dhbase.docker.uid=$(id -u) -Dhbase.docker.gid=$(id -g)
+      - uses: actions/upload-artifact@v4
         with:
-          name: jacoco-reports
+          name: jacoco-reports-${{ matrix.module }}-${{ matrix.name }}
           path: target/jacoco-combined.exec
-      - uses: codecov/codecov-action@v1
+      - uses: codecov/codecov-action@v5
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
         with:
-          name: codecov-hbase-${{ matrix.name }}
+          name: codecov-hbase-${{ matrix.name }}-java-${{ matrix.java }}

@@ -18,6 +18,7 @@ import org.apache.tinkerpop.gremlin.structure.Graph;
 import org.apache.tinkerpop.gremlin.util.Gremlin;
 import org.janusgraph.core.schema.JanusGraphManagement;
 import org.janusgraph.graphdb.configuration.JanusGraphConstants;
+import org.janusgraph.graphdb.database.cache.CacheInvalidationService;
 
 /**
  * JanusGraph graph database implementation of the Blueprint's interface.
@@ -51,6 +52,11 @@ import org.janusgraph.graphdb.configuration.JanusGraphConstants;
         reason = "TinkerPop assumes cardinality is SINGLE when not explicitly given, while JanusGraph uses the cardinality " +
             "already defined in the schema.")
 @Graph.OptOut(
+    test = "org.apache.tinkerpop.gremlin.structure.TransactionMultiThreadedTest",
+    method = "*",
+    reason = "TinkerPop assumes certain behaviour of concurrent transactions that JanusGraph does not follow, including " +
+        "1) Check vertex and edge existence before committing; 2) Conflicting transactions should abort and throw TransactionException.")
+@Graph.OptOut(
         test = "org.apache.tinkerpop.gremlin.process.computer.GraphComputerTest",
         method = "shouldOnlyAllowReadingVertexPropertiesInMapReduce",
         reason = "JanusGraph simply throws the wrong exception -- should not be a ReadOnly transaction exception but a specific one for MapReduce. This is too cumbersome to refactor in JanusGraph.")
@@ -77,7 +83,27 @@ import org.janusgraph.graphdb.configuration.JanusGraphConstants;
         method = "shouldResetAfterRollback",
         reason = "JanusGraph assumes lifecycle of transactionListeners in AbstractThreadLocalTransaction ends when the " +
             "transaction ends (commit/rollback/close). TinkerPop, however, asserts transactionListeners are active across transactions.")
+@Graph.OptOut(
+        test = "org.apache.tinkerpop.gremlin.process.traversal.step.map.MergeVertexTest",
+        method = "g_mergeVXlabel_person_name_markoX_optionXonMatch_age_19X_option",
+        reason = "JanusGraph doesn't support MergeVertex yet.")
+@Graph.OptOut(
+        test = "org.apache.tinkerpop.gremlin.process.traversal.step.map.MergeVertexTest",
+        method = "g_withSideEffectXc_label_person_name_markoX_withSideEffectXm_age_19X_mergeVXselectXcXX_optionXonMatch_selectXmXX_option",
+        reason = "JanusGraph doesn't support MergeVertex yet.")
 public interface JanusGraph extends Transaction {
+
+    /**
+     * Evaluate a gremlin query in plain string format and return the result.
+     * With this API, those who use JanusGraph as an embedded library rather
+     * than JanusGraph server could execute gremlin queries in plain string
+     * format.
+     *
+     * @param gremlinScript A gremlin query in string format
+     * @param commit Whether the script shall be committed or rolled back
+     * @return Evaluation result
+     */
+    Object eval(String gremlinScript, boolean commit);
 
    /* ---------------------------------------------------------------
     * Transactions and general admin
@@ -144,6 +170,8 @@ public interface JanusGraph extends Transaction {
      */
     @Override
     void close() throws JanusGraphException;
+
+    CacheInvalidationService getDBCacheInvalidationService();
 
     /**
      * The version of this JanusGraph graph database

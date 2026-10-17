@@ -17,7 +17,6 @@ package org.janusgraph.graphdb;
 
 import com.carrotsearch.hppc.IntHashSet;
 import com.carrotsearch.hppc.IntSet;
-import com.carrotsearch.hppc.LongArrayList;
 import com.google.common.collect.HashMultiset;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
@@ -25,8 +24,11 @@ import com.google.common.collect.Iterators;
 import com.google.common.collect.Multiset;
 import com.google.common.collect.Sets;
 import org.apache.tinkerpop.gremlin.process.computer.ComputerResult;
+import org.apache.tinkerpop.gremlin.process.traversal.Order;
+import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.__;
 import org.apache.tinkerpop.gremlin.structure.Direction;
 import org.apache.tinkerpop.gremlin.structure.Edge;
+import org.apache.tinkerpop.gremlin.structure.Property;
 import org.apache.tinkerpop.gremlin.structure.VertexProperty;
 import org.janusgraph.core.Cardinality;
 import org.janusgraph.core.JanusGraphComputer;
@@ -35,7 +37,9 @@ import org.janusgraph.core.JanusGraphRelation;
 import org.janusgraph.core.JanusGraphTransaction;
 import org.janusgraph.core.JanusGraphVertex;
 import org.janusgraph.core.JanusGraphVertexProperty;
+import org.janusgraph.core.JanusGraphVertexQuery;
 import org.janusgraph.core.Multiplicity;
+import org.janusgraph.core.PropertyKey;
 import org.janusgraph.core.VertexLabel;
 import org.janusgraph.core.VertexList;
 import org.janusgraph.diskstorage.configuration.BasicConfiguration;
@@ -47,18 +51,25 @@ import org.janusgraph.graphdb.database.idassigner.placement.PropertyPlacementStr
 import org.janusgraph.graphdb.database.idassigner.placement.SimpleBulkPlacementStrategy;
 import org.janusgraph.graphdb.idmanagement.IDManager;
 import org.janusgraph.graphdb.olap.computer.FulgoraGraphComputer;
+import org.janusgraph.graphdb.types.StandardEdgeLabelMaker;
 import org.janusgraph.olap.OLAPTest;
-import org.janusgraph.util.datastructures.AbstractLongListUtil;
+import org.janusgraph.util.datastructures.AbstractIdListUtil;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 
+import static org.apache.tinkerpop.gremlin.process.traversal.Order.asc;
+import static org.apache.tinkerpop.gremlin.process.traversal.Order.desc;
 import static org.janusgraph.testutil.JanusGraphAssert.assertCount;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -125,7 +136,7 @@ public abstract class JanusGraphPartitionGraphTest extends JanusGraphBaseTest {
         finishSchema();
         final Set<String> names = ImmutableSet.of("Marko", "Dan", "Stephen", "Daniel", "Josh", "Thad", "Pavel", "Matthias");
         final int numG = 10;
-        final long[] gids = new long[numG];
+        final Object[] gids = new Object[numG];
 
         for (int i = 0; i < numG; i++) {
             JanusGraphVertex g = tx.addVertex("group");
@@ -138,7 +149,7 @@ public abstract class JanusGraphPartitionGraphTest extends JanusGraphBaseTest {
             assertEquals(0, g.<Integer>value("sig").intValue());
             assertEquals("group", g.label());
             assertCount(names.size(), g.properties("name"));
-            assertTrue(getId(g) > 0);
+            assertTrue((long) getId(g) > 0);
             gids[i] = getId(g);
             if (i > 0) {
                 g.addEdge("base", getV(tx, gids[0]));
@@ -164,9 +175,9 @@ public abstract class JanusGraphPartitionGraphTest extends JanusGraphBaseTest {
         newTx();
 
         for (int i = 0; i < numG; i++) {
-            long gId = gids[i];
+            Object gId = gids[i];
             assertTrue(idManager.isPartitionedVertex(gId));
-            assertEquals(idManager.getCanonicalVertexId(gId), gId);
+            assertEquals(idManager.getCanonicalVertexId((long) gId), gId);
             JanusGraphVertex g = getV(tx, gId);
             final int canonicalPartition = getPartitionID(g);
             assertEquals(g, getOnlyElement(tx.query().has("gid", i).vertices()));
@@ -226,7 +237,7 @@ public abstract class JanusGraphPartitionGraphTest extends JanusGraphBaseTest {
                 if (partition < 0) partition = pid;
                 else assertEquals(partition, pid);
                 int numRelations = 0;
-                JanusGraphVertex v = getV(txx, vs[vi].longId());
+                JanusGraphVertex v = getV(txx, vs[vi].id());
                 for (JanusGraphRelation r : v.query().relations()) {
                     numRelations++;
                     assertEquals(partition, getPartitionID(r));
@@ -286,11 +297,11 @@ public abstract class JanusGraphPartitionGraphTest extends JanusGraphBaseTest {
             assertEquals(numV / 2, v2.size());
             v1.sort();
             v2.sort();
-            LongArrayList al1 = v1.getIDs();
-            LongArrayList al2 = v2.getIDs();
-            assertTrue(AbstractLongListUtil.isSorted(al1));
-            assertTrue(AbstractLongListUtil.isSorted(al2));
-            LongArrayList alr = AbstractLongListUtil.mergeJoin(al1, al2, false);
+            List<Object> al1 = v1.getIDs();
+            List<Object> al2 = v2.getIDs();
+            assertTrue(AbstractIdListUtil.isSorted(al1));
+            assertTrue(AbstractIdListUtil.isSorted(al2));
+            List<Object> alr = AbstractIdListUtil.mergeJoin(al1, al2, false);
             assertEquals(numV / 2, alr.size());
 
             tx2.commit();
@@ -333,7 +344,7 @@ public abstract class JanusGraphPartitionGraphTest extends JanusGraphBaseTest {
 
     private static JanusGraphVertex vInTx(JanusGraphVertex v, JanusGraphTransaction tx) {
         if (!v.hasId()) return v;
-        else return tx.getVertex(v.longId());
+        else return tx.getVertex(v.id());
     }
 
     @Test
@@ -377,7 +388,7 @@ public abstract class JanusGraphPartitionGraphTest extends JanusGraphBaseTest {
                 assertEquals(g, getOnlyElement(o.query().direction(Direction.OUT).labels("member").vertices()));
                 VertexList vertexList = o.query().direction(Direction.IN).labels("contain").vertexIds();
                 assertEquals(1,vertexList.size());
-                assertEquals(pid,idManager.getPartitionId(vertexList.getID(0)));
+                assertEquals(pid,idManager.getPartitionId((long) vertexList.getID(0)));
                 assertEquals(g,vertexList.get(0));
             }
         }
@@ -412,9 +423,9 @@ public abstract class JanusGraphPartitionGraphTest extends JanusGraphBaseTest {
 
         int numVertices = setupGroupClusters(groupDegrees,commitMode);
 
-        Map<Long,Integer> degreeMap = new HashMap<>(groupDegrees.length);
+        Map<Object,Integer> degreeMap = new HashMap<>(groupDegrees.length);
         for (int i = 0; i < groupDegrees.length; i++) {
-            degreeMap.put(getOnlyVertex(tx.query().has("groupid","group"+i)).longId(),groupDegrees[i]);
+            degreeMap.put(getOnlyVertex(tx.query().has("groupid","group"+i)).id(),groupDegrees[i]);
         }
 
         clopen(options);
@@ -483,8 +494,114 @@ public abstract class JanusGraphPartitionGraphTest extends JanusGraphBaseTest {
     }
 
 
+    /**
+     * The representatives of a partitioned vertex hold its edges to the vertices of their partitions, each in the order
+     * of a vertex-centric query, which compares strings by UTF-16 unit, as the storage backend holds sort keys, and
+     * puts a missing value first when descending. The vertex merges what they return in that order, so its edges come
+     * as those of a vertex which isn't partitioned, apart from edges which tie on the order keys.
+     */
+    @Test
+    public void testPartitionedVertexOrdersTheStringsOfItsEdgesAsAnUnpartitionedOne() {
+        final Object[] vertices = addEdgesToTwoPartitions(Arrays.asList("\uD83D\uDE00", "\uE000"),
+            Arrays.asList("\uFFFF", "b"));
+        assertEquals(Arrays.asList("b", "\uD83D\uDE00", "\uE000", "\uFFFF"), names(getV(tx, vertices[1]), asc, 0));
+        assertEdgesInTheSameOrder(vertices);
+        assertEquals(Arrays.asList("b", "\uD83D\uDE00"), tx.traversal().V(vertices[0])
+            .local(__.outE("contain").order().by("name", asc).limit(2)).values("name").toList());
+    }
+
+    @Test
+    public void testPartitionedVertexPlacesAMissingValueOfItsEdgesAsAnUnpartitionedOne() {
+        final Object[] vertices = addEdgesToTwoPartitions(Arrays.asList("a", null), Collections.singletonList("b"));
+        assertEquals(Arrays.asList(null, "b", "a"), names(getV(tx, vertices[1]), desc, 0));
+        assertEdgesInTheSameOrder(vertices);
+    }
+
+    /**
+     * As above, with edges which the storage backend holds sorted by name: each representative returns them in that
+     * order, which compares strings by UTF-16 unit and puts a missing value last when ascending, first when descending.
+     */
+    @Test
+    public void testPartitionedVertexOrdersItsEdgesByAnAscendingSortKeyAsAnUnpartitionedOne() {
+        assertEdgesInTheSameOrder(addEdgesToTwoPartitions(Arrays.asList("\uD83D\uDE00", "\uE000", null),
+            Arrays.asList("\uFFFF", "b"), org.janusgraph.graphdb.internal.Order.ASC));
+    }
+
+    @Test
+    public void testPartitionedVertexOrdersItsEdgesByADescendingSortKeyAsAnUnpartitionedOne() {
+        assertEdgesInTheSameOrder(addEdgesToTwoPartitions(Arrays.asList("\uD83D\uDE00", "\uE000", null),
+            Arrays.asList("\uFFFF", "b"), org.janusgraph.graphdb.internal.Order.DESC));
+    }
+
+    private Object[] addEdgesToTwoPartitions(List<String> namesInFirst, List<String> namesInSecond) {
+        return addEdgesToTwoPartitions(namesInFirst, namesInSecond, null);
+    }
+
+    //A partitioned group and an unpartitioned person, each with edges of the given names, null for none, to a vertex
+    //of one partition and to a vertex of another, with a sort key of name in the given order unless null; their ids
+    private Object[] addEdgesToTwoPartitions(List<String> namesInFirst, List<String> namesInSecond,
+                                             org.janusgraph.graphdb.internal.Order sortOrder) {
+        //Ids, and so partitions, given at commit, which spreads the vertices of different transactions
+        clopen(option(GraphDatabaseConfiguration.IDS_FLUSH), false);
+        final PropertyKey nameKey = makeKey("name", String.class);
+        if (sortOrder == null) {
+            mgmt.makeEdgeLabel("contain").multiplicity(Multiplicity.MULTI).make();
+        } else {
+            ((StandardEdgeLabelMaker) mgmt.makeEdgeLabel("contain").multiplicity(Multiplicity.MULTI)).sortKey(nameKey)
+                .sortOrder(sortOrder).make();
+        }
+        mgmt.makeVertexLabel("group").partition().make();
+        mgmt.makeVertexLabel("person").make();
+        finishSchema();
+        final JanusGraphVertex first = tx.addVertex("person");
+        newTx();
+        final Object firstId = first.id();
+        final int firstPartition = getPartitionID(first);
+        Object secondId = null;
+        for (int i = 0; secondId == null; i++) {
+            assertTrue(i < 100, "no vertex outside the first one's partition");
+            final JanusGraphVertex v = tx.addVertex("person");
+            newTx();
+            if (getPartitionID(v) != firstPartition) secondId = v.id();
+        }
+        final JanusGraphVertex group = tx.addVertex("group"), person = tx.addVertex("person");
+        for (final JanusGraphVertex from : Arrays.asList(group, person)) {
+            for (final String name : namesInFirst) addEdge(from, getV(tx, firstId), name);
+            for (final String name : namesInSecond) addEdge(from, getV(tx, secondId), name);
+        }
+        newTx();
+        return new Object[]{group.id(), person.id()};
+    }
+
+    private static void addEdge(JanusGraphVertex from, JanusGraphVertex to, String name) {
+        if (name == null) from.addEdge("contain", to);
+        else from.addEdge("contain", to, "name", name);
+    }
+
+    private void assertEdgesInTheSameOrder(Object[] vertices) {
+        for (final Order order : Arrays.asList(asc, desc)) {
+            for (final int limit : new int[]{0, 1, 2}) {
+                assertEquals(names(getV(tx, vertices[1]), order, limit), names(getV(tx, vertices[0]), order, limit),
+                    order + " limit " + limit);
+            }
+        }
+    }
+
+    //The names of the vertex's edges in the order of a vertex-centric query by name, with a limit unless 0
+    private static List<String> names(JanusGraphVertex vertex, Order order, int limit) {
+        final JanusGraphVertexQuery<?> query = vertex.query().direction(Direction.OUT).labels("contain")
+            .orderBy("name", order);
+        if (limit > 0) query.limit(limit);
+        final List<String> names = new ArrayList<>();
+        for (final JanusGraphEdge edge : query.edges()) {
+            final Property<String> name = edge.property("name");
+            names.add(name.isPresent() ? name.value() : null);
+        }
+        return names;
+    }
+
     public int getPartitionID(JanusGraphVertex vertex) {
-        long p = idManager.getPartitionId(vertex.longId());
+        long p = idManager.getPartitionId((long) vertex.id());
         assertTrue(p>=0 && p<idManager.getPartitionBound() && p<Integer.MAX_VALUE);
         return (int)p;
     }

@@ -16,6 +16,7 @@ package org.janusgraph.graphdb.database.idassigner;
 
 
 import com.google.common.base.Preconditions;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.janusgraph.core.EdgeLabel;
 import org.janusgraph.core.JanusGraphRelation;
 import org.janusgraph.core.JanusGraphVertex;
@@ -52,11 +53,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.CLUSTER_MAX_PARTITIONS;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.IDS_BLOCK_SIZE;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.IDS_NS;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.IDS_RENEW_BUFFER_PERCENTAGE;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.IDS_RENEW_KEEP_ALIVE_TIME;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.IDS_RENEW_POOL_SIZE;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.IDS_RENEW_TIMEOUT;
 
 @PreInitializeConfigOptions
@@ -75,6 +82,8 @@ public class VertexIDAssigner implements AutoCloseable {
     final ConcurrentMap<Integer,PartitionIDPool> idPools;
     final StandardIDPool schemaIdPool;
     final StandardIDPool partitionVertexIdPool;
+    //Runs the renewals of all ID pools of the graph, those of each pool one at a time
+    private final ThreadPoolExecutor renewalExecutor;
 
     private final IDAuthority idAuthority;
     private final IDManager idManager;
@@ -109,11 +118,19 @@ public class VertexIDAssigner implements AutoCloseable {
         renewTimeoutMS = config.get(IDS_RENEW_TIMEOUT);
         renewBufferPercentage = config.get(IDS_RENEW_BUFFER_PERCENTAGE);
 
+        //ids.renew-pool-size threads, or a thread for every pool the instance can have: three kinds of ids per
+        //partition, the schema ids and the partitioned vertices
+        final int renewalThreads = config.has(IDS_RENEW_POOL_SIZE) ? config.get(IDS_RENEW_POOL_SIZE) : 3 * partitionIdBound + 2;
+        renewalExecutor = new ThreadPoolExecutor(renewalThreads, renewalThreads,
+                config.get(IDS_RENEW_KEEP_ALIVE_TIME).toMillis(), TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(),
+                new ThreadFactoryBuilder().setDaemon(false).setNameFormat("JanusGraphID-renewal-%d").build());
+        renewalExecutor.allowCoreThreadTimeOut(true);
+
         idPools = new ConcurrentHashMap<>(partitionIdBound);
         schemaIdPool = new StandardIDPool(idAuthority, IDManager.SCHEMA_PARTITION, PoolType.SCHEMA.getIDNamespace(),
-                IDManager.getSchemaCountBound(), renewTimeoutMS, renewBufferPercentage);
+                IDManager.getSchemaCountBound(), renewTimeoutMS, renewBufferPercentage, renewalExecutor);
         partitionVertexIdPool = new StandardIDPool(idAuthority, IDManager.PARTITIONED_VERTEX_PARTITION, PoolType.PARTITIONED_VERTEX.getIDNamespace(),
-                PoolType.PARTITIONED_VERTEX.getCountBound(idManager), renewTimeoutMS, renewBufferPercentage);
+                PoolType.PARTITIONED_VERTEX.getCountBound(idManager), renewTimeoutMS, renewBufferPercentage, renewalExecutor);
         setLocalPartitions(partitionBits);
     }
 
@@ -146,12 +163,21 @@ public class VertexIDAssigner implements AutoCloseable {
     }
 
     public synchronized void close() {
-        schemaIdPool.close();
-        partitionVertexIdPool.close();
-        for (PartitionIDPool pool : idPools.values()) {
-            pool.close();
+        try {
+            schemaIdPool.close();
+            partitionVertexIdPool.close();
+            for (PartitionIDPool pool : idPools.values()) {
+                pool.close();
+            }
+            idPools.clear();
+        } finally {
+            //A closed pool has waited for its renewals, but for one it gave up on and cancelled with an interrupt,
+            //as it does where the ID authority supports interruption. Idle threads end now. A thread whose renewal
+            //still runs, such a cancelled one or one a failed close gave up on, ends once it has finished: it isn't
+            //interrupted, since an interrupt can break the I/O of a storage backend, BerkeleyJE's whole environment
+            //among them
+            renewalExecutor.shutdown();
         }
-        idPools.clear();
     }
 
     public void assignID(InternalRelation relation) {
@@ -176,13 +202,20 @@ public class VertexIDAssigner implements AutoCloseable {
                     partitionID = placementStrategy.getPartition(element);
             } else if (element instanceof InternalRelation) {
                 InternalRelation relation = (InternalRelation)element;
-                if (attempt < relation.getLen()) { //On the first attempts, try to use partition of incident vertices
+                // On the first attempts, try to use partition of incident vertices
+                if (attempt < relation.getLen()) {
                     InternalVertex incident = relation.getVertex(attempt);
                     Preconditions.checkArgument(incident.hasId());
-                    if (!IDManager.VertexIDType.PartitionedVertex.is(incident.longId()) || relation.isProperty()) {
-                        partitionID = getPartitionID(incident);
+                    if (incident.id() instanceof Number) {
+                        if (!IDManager.VertexIDType.PartitionedVertex.is(incident.id()) || relation.isProperty()) {
+                            partitionID = getPartitionID(incident);
+                        } else {
+                            continue;
+                        }
                     } else {
-                        continue;
+                        // for custom string vertex ids, we find a consistent partitionId
+                        assert incident.id() instanceof String;
+                        partitionID = Math.abs(incident.id().hashCode() % partitionIdBound);
                     }
                 } else {
                     partitionID = placementStrategy.getPartition(element);
@@ -209,7 +242,7 @@ public class VertexIDAssigner implements AutoCloseable {
                 if (relation.isProperty() && isPartitionedAt(relation,0)) {
                     //Always assign properties to the canonical representative of a partitioned vertex
                     InternalVertex vertex = relation.getVertex(0);
-                    ((ReassignableRelation)relation).setVertexAt(0,vertex.tx().getInternalVertex(idManager.getCanonicalVertexId(vertex.longId())));
+                    ((ReassignableRelation)relation).setVertexAt(0,vertex.tx().getInternalVertex(idManager.getCanonicalVertexId(((Number) vertex.id()).longValue())));
                 } else if (relation.isEdge()) {
                     for (int pos = 0; pos < relation.getArity(); pos++) {
                         if (isPartitionedAt(relation, pos)) {
@@ -218,7 +251,7 @@ public class VertexIDAssigner implements AutoCloseable {
                             int otherPosition = (pos+1)%2;
                             if (((InternalRelationType)relation.getType()).multiplicity().isUnique(EdgeDirection.fromPosition(pos))) {
                                 //If the relation is unique in the direction, we assign it to the canonical vertex...
-                                newPartition = idManager.getPartitionId(idManager.getCanonicalVertexId(incident.longId()));
+                                newPartition = idManager.getPartitionId(idManager.getCanonicalVertexId(((Number) incident.id()).longValue()));
                             } else if (!isPartitionedAt(relation,otherPosition)) {
                                 //...else, we assign it to the partition of the non-partitioned vertex...
                                 newPartition = getPartitionID(relation.getVertex(otherPosition));
@@ -226,7 +259,7 @@ public class VertexIDAssigner implements AutoCloseable {
                                 //...and if such does not exists (i.e. both end vertices are partitioned) we use the hash of the relation id
                                 newPartition = idManager.getPartitionHashForId(relation.longId());
                             }
-                            if (idManager.getPartitionId(incident.longId())!=newPartition) {
+                            if (idManager.getPartitionId((long) incident.id())!=newPartition) {
                                 ((ReassignableRelation)relation).setVertexAt(pos,incident.tx().getOtherPartitionVertex(incident, newPartition));
                             }
                         }
@@ -239,7 +272,7 @@ public class VertexIDAssigner implements AutoCloseable {
     }
 
     private boolean isPartitionedAt(InternalRelation relation, int position) {
-        return idManager.isPartitionedVertex(relation.getVertex(position).longId());
+        return idManager.isPartitionedVertex(relation.getVertex(position).id());
     }
 
     public void assignIDs(Iterable<InternalRelation> addedRelations) {
@@ -300,7 +333,7 @@ public class VertexIDAssigner implements AutoCloseable {
     }
 
     private long getPartitionID(final InternalVertex v) {
-        long vid = v.longId();
+        long vid = ((Number) v.id()).longValue();
         if (IDManager.VertexIDType.Schema.is(vid)) return IDManager.SCHEMA_PARTITION;
         else return idManager.getPartitionId(vid);
     }
@@ -323,7 +356,8 @@ public class VertexIDAssigner implements AutoCloseable {
         } else {
             PartitionIDPool partitionPool = idPools.get(partitionID);
             if (partitionPool == null) {
-                partitionPool = new PartitionIDPool(partitionID, idAuthority, idManager, renewTimeoutMS, renewBufferPercentage);
+                partitionPool = new PartitionIDPool(partitionID, idAuthority, idManager, renewTimeoutMS, renewBufferPercentage,
+                    renewalExecutor);
                 idPools.putIfAbsent(partitionID,partitionPool);
                 partitionPool = idPools.get(partitionID);
             }
@@ -467,11 +501,13 @@ public class VertexIDAssigner implements AutoCloseable {
         private volatile long lastAccess;
         private volatile boolean exhausted;
 
-        PartitionIDPool(int partitionID, IDAuthority idAuthority, IDManager idManager, Duration renewTimeoutMS, double renewBufferPercentage) {
+        PartitionIDPool(int partitionID, IDAuthority idAuthority, IDManager idManager, Duration renewTimeoutMS, double renewBufferPercentage,
+                        Executor renewalExecutor) {
             super(PoolType.class);
             for (PoolType type : PoolType.values()) {
                 if (!type.hasOnePerPartition()) continue;
-                put(type,new StandardIDPool(idAuthority, partitionID, type.getIDNamespace(), type.getCountBound(idManager), renewTimeoutMS, renewBufferPercentage));
+                put(type,new StandardIDPool(idAuthority, partitionID, type.getIDNamespace(), type.getCountBound(idManager), renewTimeoutMS, renewBufferPercentage,
+                    renewalExecutor));
             }
         }
 

@@ -21,6 +21,7 @@ import org.janusgraph.diskstorage.StaticBuffer;
 import org.janusgraph.diskstorage.keycolumnvalue.KCVSProxy;
 import org.janusgraph.diskstorage.keycolumnvalue.KeyColumnValueStore;
 import org.janusgraph.diskstorage.keycolumnvalue.KeySliceQuery;
+import org.janusgraph.diskstorage.keycolumnvalue.MultiKeysQueryGroups;
 import org.janusgraph.diskstorage.keycolumnvalue.SliceQuery;
 import org.janusgraph.diskstorage.keycolumnvalue.StoreTransaction;
 import org.janusgraph.diskstorage.util.CacheMetricsAction;
@@ -57,7 +58,9 @@ public abstract class KCVSCache extends KCVSProxy {
 
     public abstract void clearCache();
 
-    protected abstract void invalidate(StaticBuffer key, List<CachableStaticBuffer> entries);
+    public abstract void invalidate(StaticBuffer key, List<CachableStaticBuffer> entries);
+
+    public abstract void forceClearExpiredCache();
 
     @Override
     public void mutate(StaticBuffer key, List<Entry> additions, List<StaticBuffer> deletions, StoreTransaction txh) throws BackendException {
@@ -65,8 +68,12 @@ public abstract class KCVSCache extends KCVSProxy {
     }
 
     public void mutateEntries(StaticBuffer key, List<Entry> additions, List<Entry> deletions, StoreTransaction txh) throws BackendException {
+        mutateEntries(key, additions, deletions, false, txh);
+    }
+
+    public void mutateEntries(StaticBuffer key, List<Entry> additions, List<Entry> deletions, boolean wholeRowDeletion, StoreTransaction txh) throws BackendException {
         assert txh instanceof CacheTransaction;
-        ((CacheTransaction) txh).mutate(this, key, additions, deletions);
+        ((CacheTransaction) txh).mutate(this, key, additions, deletions, wholeRowDeletion);
     }
 
     @Override
@@ -83,4 +90,7 @@ public abstract class KCVSCache extends KCVSProxy {
         return store.getSlice(keys,query,unwrapTx(txh));
     }
 
+    public Map<SliceQuery, Map<StaticBuffer, EntryList>> getMultiSlicesNoCache(MultiKeysQueryGroups<StaticBuffer, SliceQuery> multiSliceQueriesWithKeys, StoreTransaction txh) throws BackendException {
+        return store.getMultiSlices(multiSliceQueriesWithKeys, unwrapTx(txh));
+    }
 }

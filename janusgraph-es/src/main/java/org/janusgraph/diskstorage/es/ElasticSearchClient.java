@@ -26,6 +26,14 @@ public interface ElasticSearchClient extends Closeable {
 
     ElasticMajorVersion getMajorVersion();
 
+    /**
+     * Returns whether requests use mapping types: those of Elasticsearch 6, and of Elasticsearch 7 with
+     * {@code use-mapping-for-es7}. The default only knows the major version, so it only covers Elasticsearch 6.
+     */
+    default boolean usesMappingTypes() {
+        return getMajorVersion().getValue() < 7;
+    }
+
     void clusterHealthRequest(String timeout) throws IOException;
 
     boolean indexExists(String indexName) throws IOException;
@@ -52,14 +60,81 @@ public interface ElasticSearchClient extends Closeable {
 
     void deleteIndex(String indexName) throws IOException;
 
+    /**
+     * Deletes the Elasticsearch index which backs a store, if it exists.
+     *
+     * @param indexStoreName the Elasticsearch index name of the store, already derived by the caller from the
+     *                       JanusGraph store name, so that the mapping between the two exists in exactly one place.
+     *                       It is used verbatim; in particular it is not lowercased here.
+     */
+    void clearStore(String indexStoreName) throws IOException;
+
     void bulkRequest(List<ElasticSearchMutation> requests, String ingestPipeline) throws IOException;
 
     long countTotal(String indexName, Map<String,Object> requestData) throws IOException;
+
+    /**
+     * Counts the documents which match the query, with a bound when {@code atMost} is positive: the count is then
+     * exact below the bound and at least the bound above it, which suits a caller that wants no more than the bound,
+     * as it clamps the count to its limit anyway. This default counts everything, which satisfies that.
+     */
+    default long countTotal(String indexName, Map<String,Object> requestData, int atMost) throws IOException {
+        return countTotal(indexName, requestData);
+    }
+
+    Number min(String indexName, Map<String,Object> requestData, String fieldName, Class<? extends Number> expectedType) throws IOException;
+
+    Number max(String indexName, Map<String,Object> requestData, String fieldName, Class<? extends Number> expectedType) throws IOException;
+
+    // null when no matching document holds a value of the field, as min, max and sum are
+    Double avg(String indexName, Map<String,Object> requestData, String fieldName) throws IOException;
+
+    Number sum(String indexName, Map<String,Object> requestData, String fieldName, Class<? extends Number> expectedType) throws IOException;
 
     ElasticSearchResponse search(String indexName, Map<String,Object> request, boolean useScroll) throws IOException;
 
     ElasticSearchResponse search(String scrollId) throws IOException;
 
+    /**
+     * Whether the cluster can page a result with a point in time and {@code search_after}, as Elasticsearch 7.12 and
+     * later can, where an older cluster, and OpenSearch, can only scroll; {@link ElasticSearchIndex#PAGING_MODE} decides
+     * whether a result is read that way. The default knows no such cluster.
+     */
+    default boolean supportsPointInTime() {
+        return false;
+    }
+
+    /**
+     * Opens a point in time on an index, kept alive for as long as a scroll context would be.
+     *
+     * @return the id of the point in time
+     */
+    default String openPointInTime(String indexName) throws IOException {
+        throw new UnsupportedOperationException("This client doesn't page with a point in time");
+    }
+
+    /**
+     * Searches a point in time: the request names no index, the point in time does. The request body may carry a
+     * {@code search_after} position, and the response carries the id the next search of the point in time has to use.
+     * The point in time is set in the given body, which changes: a caller sends the same body for each page, with the
+     * position of the page.
+     */
+    default ElasticSearchResponse searchPointInTime(String pitId, Map<String, Object> request) throws IOException {
+        throw new UnsupportedOperationException("This client doesn't page with a point in time");
+    }
+
+    /**
+     * Closes a point in time, as {@link #deleteScroll(String)} releases a scroll context.
+     */
+    default void closePointInTime(String pitId) throws IOException {
+        throw new UnsupportedOperationException("This client doesn't page with a point in time");
+    }
+
+    /**
+     * Releases a scroll context which is no longer read. It is a courtesy to the cluster rather than part of the
+     * search: the context expires after the scroll keep-alive on its own, so an implementation may return before
+     * the cluster has released it, and the caller doesn't fail its search over a release which failed.
+     */
     void deleteScroll(String scrollId) throws IOException;
 
     void addAlias(String alias, String index) throws IOException;

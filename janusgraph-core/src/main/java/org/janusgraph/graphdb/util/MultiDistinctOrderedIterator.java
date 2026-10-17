@@ -14,41 +14,49 @@
 
 package org.janusgraph.graphdb.util;
 
-import org.apache.tinkerpop.gremlin.process.traversal.step.util.ElementValueComparator;
+import com.google.common.base.Preconditions;
 import org.apache.tinkerpop.gremlin.structure.Element;
 import org.apache.tinkerpop.gremlin.structure.util.CloseableIterator;
-import org.apache.tinkerpop.gremlin.util.function.MultiComparator;
-import org.janusgraph.graphdb.tinkerpop.optimize.step.HasStepFolder.OrderEntry;
+import org.janusgraph.graphdb.query.Query;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Set;
-import java.util.TreeMap;
 
+public class MultiDistinctOrderedIterator<E extends Element> extends CloseableAbstractIterator<E> {
 
-public class MultiDistinctOrderedIterator<E extends Element> implements CloseableIterator<E> {
-
-    private final Map<Integer, Iterator<E>> iterators = new LinkedHashMap<>();
-    private final Map<Integer, E> values = new LinkedHashMap<>();
-    private final TreeMap<E, Integer> currentElements;
+    private final Map<Integer, Iterator<E>> iterators;
+    private final PriorityQueue<E> queue;
     private final Set<Object> allElements = new HashSet<>();
+    private final List<E> iteratorValues;
+    private final Map<E, Integer> iteratorIdx;
     private final Integer limit;
+    private final boolean singleIterator;
     private long count = 0;
 
-    public MultiDistinctOrderedIterator(final Integer lowLimit, final Integer highLimit, final List<Iterator<E>> iterators, final List<OrderEntry> orders) {
+    /**
+     * @param order the order in which each of the iterators returns its elements, which they are merged in
+     */
+    public MultiDistinctOrderedIterator(final Integer lowLimit, final Integer highLimit,
+                                        final List<Iterator<E>> iterators, final Comparator<? super E> order) {
         this.limit = highLimit;
-        final List<Comparator<E>> comp = new ArrayList<>();
-        orders.forEach(o -> comp.add(new ElementValueComparator(o.key, o.order)));
-        Comparator<E> comparator = new MultiComparator<>(comp);
+        this.singleIterator = iterators.size() == 1;
+        this.iterators = new LinkedHashMap<>(iterators.size());
+        this.iteratorValues = new ArrayList<>(iterators.size());
+        this.iteratorIdx = new HashMap<>(iterators.size());
         for (int i = 0; i < iterators.size(); i++) {
             this.iterators.put(i, iterators.get(i));
+            this.iteratorValues.add(null);
         }
-        currentElements = new TreeMap<>(comparator);
+        this.queue = new PriorityQueue<>(iterators.size(),
+            Preconditions.checkNotNull(order, "The order which merges the iterators must not be null"));
         long i = 0;
         while (i < lowLimit && this.hasNext()) {
             this.next();
@@ -57,12 +65,12 @@ public class MultiDistinctOrderedIterator<E extends Element> implements Closeabl
     }
 
     @Override
-    public boolean hasNext() {
-        if (limit != null && count >= limit) {
-            return false;
+    protected E computeNext() {
+        if (limit != null && limit != Query.NO_LIMIT && count >= limit) {
+            return endOfData();
         }
         for (int i = 0; i < iterators.size(); i++) {
-            if (!values.containsKey(i) && iterators.get(i).hasNext()){
+            if (iteratorValues.get(i) == null && iterators.get(i).hasNext()) {
                 E element = null;
                 do {
                     element = iterators.get(i).next();
@@ -71,24 +79,27 @@ public class MultiDistinctOrderedIterator<E extends Element> implements Closeabl
                     }
                 } while (element == null && iterators.get(i).hasNext());
                 if (element != null) {
-                    values.put(i, element);
-                    currentElements.put(element, i);
-                    allElements.add(element.id());
+                    iteratorValues.set(i, element);
+                    iteratorIdx.put(element, i);
+                    queue.add(element);
+                    if (!singleIterator) {
+                        allElements.add(element.id());
+                    }
                 }
             }
         }
-        return !values.isEmpty();
-    }
-
-    @Override
-    public E next() {
-        count++;
-        return values.remove(currentElements.remove(currentElements.firstKey()));
+        if (queue.isEmpty()) {
+            return endOfData();
+        } else {
+            count++;
+            E result = queue.remove();
+            iteratorValues.set(iteratorIdx.remove(result), null);
+            return result;
+        }
     }
 
     @Override
     public void close() {
         iterators.values().forEach(CloseableIterator::closeIterator);
     }
-
 }

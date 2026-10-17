@@ -16,28 +16,39 @@ package org.janusgraph.graphdb;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
+import io.github.artsok.RepeatedIfExceptionsTest;
+import org.apache.commons.configuration2.MapConfiguration;
+import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang.NotImplementedException;
 import org.apache.tinkerpop.gremlin.process.traversal.P;
 import org.apache.tinkerpop.gremlin.process.traversal.TextP;
 import org.apache.tinkerpop.gremlin.process.traversal.Traversal;
+import org.apache.tinkerpop.gremlin.process.traversal.Traverser;
 import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversal;
 import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.GraphTraversalSource;
 import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.__;
+import org.apache.tinkerpop.gremlin.process.traversal.step.filter.DropStep;
+import org.apache.tinkerpop.gremlin.process.traversal.step.filter.HasStep;
+import org.apache.tinkerpop.gremlin.process.traversal.step.util.WithOptions;
+import org.apache.tinkerpop.gremlin.process.traversal.strategy.decoration.SubgraphStrategy;
 import org.apache.tinkerpop.gremlin.process.traversal.util.Metrics;
 import org.apache.tinkerpop.gremlin.process.traversal.util.TraversalMetrics;
+import org.apache.tinkerpop.gremlin.structure.Column;
 import org.apache.tinkerpop.gremlin.structure.Direction;
 import org.apache.tinkerpop.gremlin.structure.Edge;
+import org.apache.tinkerpop.gremlin.structure.Element;
 import org.apache.tinkerpop.gremlin.structure.Property;
 import org.apache.tinkerpop.gremlin.structure.T;
 import org.apache.tinkerpop.gremlin.structure.Vertex;
 import org.apache.tinkerpop.gremlin.structure.VertexProperty;
 import org.janusgraph.TestCategory;
 import org.janusgraph.core.Cardinality;
+import org.janusgraph.core.Connection;
 import org.janusgraph.core.EdgeLabel;
 import org.janusgraph.core.JanusGraph;
 import org.janusgraph.core.JanusGraphConfigurationException;
@@ -45,15 +56,15 @@ import org.janusgraph.core.JanusGraphEdge;
 import org.janusgraph.core.JanusGraphElement;
 import org.janusgraph.core.JanusGraphException;
 import org.janusgraph.core.JanusGraphFactory;
-import org.janusgraph.core.JanusGraphQuery;
 import org.janusgraph.core.JanusGraphTransaction;
 import org.janusgraph.core.JanusGraphVertex;
 import org.janusgraph.core.JanusGraphVertexProperty;
-import org.janusgraph.core.JanusGraphVertexQuery;
 import org.janusgraph.core.Multiplicity;
 import org.janusgraph.core.PropertyKey;
+import org.janusgraph.core.ReadOnlyTransactionException;
 import org.janusgraph.core.RelationType;
 import org.janusgraph.core.SchemaViolationException;
+import org.janusgraph.core.Transaction;
 import org.janusgraph.core.VertexLabel;
 import org.janusgraph.core.VertexList;
 import org.janusgraph.core.attribute.Cmp;
@@ -65,6 +76,7 @@ import org.janusgraph.core.log.TransactionRecovery;
 import org.janusgraph.core.schema.ConsistencyModifier;
 import org.janusgraph.core.schema.DisableDefaultSchemaMaker;
 import org.janusgraph.core.schema.IgnorePropertySchemaMaker;
+import org.janusgraph.core.schema.IndicesActivationType;
 import org.janusgraph.core.schema.JanusGraphDefaultSchemaMaker;
 import org.janusgraph.core.schema.JanusGraphIndex;
 import org.janusgraph.core.schema.JanusGraphManagement;
@@ -72,14 +84,18 @@ import org.janusgraph.core.schema.JanusGraphSchemaType;
 import org.janusgraph.core.schema.Mapping;
 import org.janusgraph.core.schema.RelationTypeIndex;
 import org.janusgraph.core.schema.SchemaAction;
+import org.janusgraph.core.schema.SchemaInitType;
 import org.janusgraph.core.schema.SchemaStatus;
 import org.janusgraph.core.util.ManagementUtil;
 import org.janusgraph.diskstorage.Backend;
 import org.janusgraph.diskstorage.BackendException;
+import org.janusgraph.diskstorage.BackendTransaction;
+import org.janusgraph.diskstorage.Entry;
 import org.janusgraph.diskstorage.StaticBuffer;
 import org.janusgraph.diskstorage.configuration.ConfigElement;
 import org.janusgraph.diskstorage.configuration.ConfigOption;
 import org.janusgraph.diskstorage.configuration.WriteConfiguration;
+import org.janusgraph.diskstorage.keycolumnvalue.scan.ScanJobFuture;
 import org.janusgraph.diskstorage.keycolumnvalue.scan.ScanMetrics;
 import org.janusgraph.diskstorage.locking.PermanentLockingException;
 import org.janusgraph.diskstorage.log.Log;
@@ -87,53 +103,74 @@ import org.janusgraph.diskstorage.log.Message;
 import org.janusgraph.diskstorage.log.MessageReader;
 import org.janusgraph.diskstorage.log.ReadMarker;
 import org.janusgraph.diskstorage.log.kcvs.KCVSLog;
+import org.janusgraph.diskstorage.util.CacheMetricsAction;
+import org.janusgraph.diskstorage.util.HashingUtil;
 import org.janusgraph.diskstorage.util.time.TimestampProvider;
 import org.janusgraph.example.GraphOfTheGodsFactory;
 import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
 import org.janusgraph.graphdb.database.EdgeSerializer;
+import org.janusgraph.graphdb.database.IndexRecordEntry;
+import org.janusgraph.graphdb.database.IndexSerializer;
 import org.janusgraph.graphdb.database.StandardJanusGraph;
+import org.janusgraph.graphdb.database.cache.CacheInvalidationService;
+import org.janusgraph.graphdb.database.index.IndexMutationType;
+import org.janusgraph.graphdb.database.index.IndexUpdate;
 import org.janusgraph.graphdb.database.log.LogTxMeta;
 import org.janusgraph.graphdb.database.log.LogTxStatus;
 import org.janusgraph.graphdb.database.log.TransactionLogHeader;
 import org.janusgraph.graphdb.database.management.ManagementSystem;
 import org.janusgraph.graphdb.database.serialize.Serializer;
+import org.janusgraph.graphdb.database.util.IndexRecordUtil;
+import org.janusgraph.graphdb.database.util.StaleIndexRecordUtil;
+import org.janusgraph.graphdb.idmanagement.IDManager;
 import org.janusgraph.graphdb.internal.ElementCategory;
 import org.janusgraph.graphdb.internal.ElementLifeCycle;
+import org.janusgraph.graphdb.internal.InternalElement;
 import org.janusgraph.graphdb.internal.InternalRelationType;
+import org.janusgraph.graphdb.internal.InternalVertex;
 import org.janusgraph.graphdb.internal.Order;
-import org.janusgraph.graphdb.internal.OrderList;
-import org.janusgraph.graphdb.internal.RelationCategory;
 import org.janusgraph.graphdb.log.StandardTransactionLogProcessor;
+import org.janusgraph.graphdb.olap.job.GhostVertexRemover;
 import org.janusgraph.graphdb.olap.job.IndexRemoveJob;
 import org.janusgraph.graphdb.olap.job.IndexRepairJob;
+import org.janusgraph.graphdb.olap.job.StaleIndexEntryRemoveJob;
+import org.janusgraph.graphdb.predicate.AndJanusPredicate;
 import org.janusgraph.graphdb.query.JanusGraphPredicateUtils;
 import org.janusgraph.graphdb.query.QueryUtil;
 import org.janusgraph.graphdb.query.condition.MultiCondition;
 import org.janusgraph.graphdb.query.condition.PredicateCondition;
-import org.janusgraph.graphdb.query.graph.GraphCentricQueryBuilder;
 import org.janusgraph.graphdb.query.index.IndexSelectionUtil;
 import org.janusgraph.graphdb.query.profile.QueryProfiler;
-import org.janusgraph.graphdb.query.profile.SimpleQueryProfiler;
-import org.janusgraph.graphdb.query.vertex.BasicVertexCentricQueryBuilder;
-import org.janusgraph.graphdb.relations.AbstractEdge;
 import org.janusgraph.graphdb.relations.RelationIdentifier;
-import org.janusgraph.graphdb.schema.EdgeLabelDefinition;
-import org.janusgraph.graphdb.schema.PropertyKeyDefinition;
-import org.janusgraph.graphdb.schema.SchemaContainer;
-import org.janusgraph.graphdb.schema.VertexLabelDefinition;
+import org.janusgraph.graphdb.relations.StandardEdge;
+import org.janusgraph.graphdb.relations.StandardVertexProperty;
 import org.janusgraph.graphdb.serializer.SpecialInt;
 import org.janusgraph.graphdb.serializer.SpecialIntSerializer;
-import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphEdgeVertexStep;
-import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphVertexStep;
+import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphDropStep;
+import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphElementMapStep;
+import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphHasStep;
+import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphPropertiesStep;
+import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphPropertyMapStep;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryDropStepStrategyMode;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryHasStepStrategyMode;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryLabelStepStrategyMode;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryPropertiesStrategyMode;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryStrategyRepeatStepMode;
 import org.janusgraph.graphdb.transaction.StandardJanusGraphTx;
+import org.janusgraph.graphdb.types.CompositeIndexType;
 import org.janusgraph.graphdb.types.StandardEdgeLabelMaker;
 import org.janusgraph.graphdb.types.StandardPropertyKeyMaker;
+import org.janusgraph.graphdb.types.TypeDefinitionCategory;
 import org.janusgraph.graphdb.types.system.BaseVertexLabel;
 import org.janusgraph.graphdb.types.system.ImplicitKey;
+import org.janusgraph.graphdb.types.vertices.JanusGraphSchemaVertex;
 import org.janusgraph.graphdb.vertices.CacheVertex;
 import org.janusgraph.testutil.FeatureFlag;
 import org.janusgraph.testutil.JanusGraphFeature;
 import org.janusgraph.testutil.TestGraphConfigs;
+import org.janusgraph.util.IDUtils;
+import org.janusgraph.util.stats.MetricManager;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -141,10 +178,14 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.opentest4j.AssertionFailedError;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
@@ -164,44 +205,67 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-import java.util.stream.StreamSupport;
 
 import static org.apache.tinkerpop.gremlin.process.traversal.Order.asc;
 import static org.apache.tinkerpop.gremlin.process.traversal.Order.desc;
+import static org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.__.hasNot;
 import static org.apache.tinkerpop.gremlin.structure.Direction.BOTH;
 import static org.apache.tinkerpop.gremlin.structure.Direction.IN;
 import static org.apache.tinkerpop.gremlin.structure.Direction.OUT;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.ADJUST_LIMIT;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.ALLOW_CUSTOM_VERTEX_ID_TYPES;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.ALLOW_SETTING_VERTEX_ID;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.ALLOW_STALE_CONFIG;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.AUTO_TYPE;
-import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.BATCH_PROPERTY_PREFETCHING;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.BASIC_METRICS;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.CUSTOM_ATTRIBUTE_CLASS;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.CUSTOM_SERIALIZER_CLASS;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.DB_CACHE;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.DB_CACHE_CLEAN_WAIT;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.DB_CACHE_TIME;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.DROP_STEP_BATCH_MODE;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.FORCE_INDEX_USAGE;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.HARD_MAX_LIMIT;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.HAS_STEP_BATCH_MODE;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.IDS_STORE_NAME;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INITIAL_JANUSGRAPH_VERSION;
-import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.LIMIT_BATCH_SIZE;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.LABEL_STEP_BATCH_MODE;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.LIMITED_BATCH;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.LIMITED_BATCH_SIZE;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.LOG_BACKEND;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.LOG_READ_INTERVAL;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.LOG_SEND_DELAY;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.MANAGEMENT_LOG;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.MAX_COMMIT_TIME;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.METRICS_MERGE_STORES;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.PARALLEL_BACKEND_OPS;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.PROPERTIES_BATCH_MODE;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.PROPERTY_PREFETCHING;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.REPEAT_STEP_BATCH_MODE;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.REPLACE_INSTANCE_IF_EXISTS;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.SCHEMA_CONSTRAINTS;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.SCHEMA_DROP_BEFORE_INIT;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.SCHEMA_INIT_JSON_INDICES_ACTIVATION_TYPE;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.SCHEMA_INIT_JSON_STR;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.SCHEMA_INIT_STRATEGY;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.SCRIPT_EVAL_ENABLED;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.SCRIPT_EVAL_ENGINE;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.STORAGE_BACKEND;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.STORAGE_BATCH;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.STORAGE_READONLY;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.SYSTEM_LOG_TRANSACTIONS;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.TRANSACTION_LOG;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.TX_CACHE_SIZE;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.UNIQUE_INSTANCE_ID;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.USER_LOG;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.USE_MULTIQUERY;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.VERBOSE_TX_RECOVERY;
@@ -211,8 +275,8 @@ import static org.janusgraph.graphdb.internal.RelationCategory.RELATION;
 import static org.janusgraph.testutil.JanusGraphAssert.assertContains;
 import static org.janusgraph.testutil.JanusGraphAssert.assertCount;
 import static org.janusgraph.testutil.JanusGraphAssert.assertEmpty;
-import static org.janusgraph.testutil.JanusGraphAssert.assertNotContains;
 import static org.janusgraph.testutil.JanusGraphAssert.assertNotEmpty;
+import static org.janusgraph.testutil.JanusGraphAssert.getLastStepMetrics;
 import static org.janusgraph.testutil.JanusGraphAssert.getStepMetrics;
 import static org.janusgraph.testutil.JanusGraphAssert.queryProfilerAnnotationIsPresent;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -384,7 +448,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
     public void testUpdateEdgePropertyThenRemoveEdge() {
         initializeGraphWithVerticesAndEdges();
         // normal edge
-        AbstractEdge edge = (AbstractEdge) graph.traversal().E().has("_e", 1).next();
+        InternalElement edge = (InternalElement) graph.traversal().E().has("_e", 1).next();
         assertTrue(ElementLifeCycle.isLoaded(edge.getLifeCycle()));
         Object id = edge.id();
 
@@ -411,7 +475,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
     public void testUpdateForkEdgePropertyThenRemoveEdge() {
         initializeGraphWithVerticesAndEdges();
         // fork edge
-        AbstractEdge edge = (AbstractEdge) graph.traversal().E().has("_e", 2).next();
+        InternalElement edge = (InternalElement) graph.traversal().E().has("_e", 2).next();
         assertTrue(ElementLifeCycle.isLoaded(edge.getLifeCycle()));
         Object id = edge.id();
 
@@ -442,7 +506,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
     @Test
     public void testUpdateForkEdgePropertyThenFindEdgeById() {
         initializeGraphWithVerticesAndEdges();
-        AbstractEdge edge = (AbstractEdge) graph.traversal().E().has("_e", 2).next();
+        InternalElement edge = (InternalElement) graph.traversal().E().has("_e", 2).next();
         Object id = edge.id();
 
         edge.property("_e", -2);
@@ -488,10 +552,12 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         uid = tx.getPropertyKey("name");
         n1.property(uid.name(), "abcd");
         clopen();
-        long nid = n1.longId();
+        long nid = (long) n1.id();
         uid = tx.getPropertyKey("name");
         assertNotNull(getV(tx, nid));
-        assertNotNull(getV(tx, uid.longId()));
+        assertNotNull(getV(tx, uid.id()));
+        // even though id is long-type, we can use string-type to query and JanusGraph will cast it to long
+        assertNotNull(getV(tx, uid.id().toString()));
         assertMissing(tx, nid + 64);
         uid = tx.getPropertyKey(uid.name());
         n1 = getV(tx, nid);
@@ -503,6 +569,17 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         JanusGraphFactory.drop(graph);
         open(config);
         assertEmpty(tx.query().vertices());
+    }
+
+    @Test
+    public void testVariables() {
+        assertTrue(graph.variables().asMap().isEmpty());
+        graph.variables().set("systemAdmins", "stephen, peter, pavel");
+        graph.variables().set("systemUsers", "matthias, marko, josh");
+        assertEquals(new HashSet<>(Arrays.asList("systemAdmins", "systemUsers")), graph.variables().keys());
+        assertEquals("matthias, marko, josh", graph.variables().get("systemUsers").get());
+        graph.variables().remove("systemAdmins");
+        assertEquals(new HashSet<>(Arrays.asList("systemUsers")), graph.variables().keys());
     }
 
     /**
@@ -602,7 +679,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         String[] names = new String[noVertices];
         int[] ids = new int[noVertices];
         JanusGraphVertex[] nodes = new JanusGraphVertex[noVertices];
-        long[] nodeIds = new long[noVertices];
+        Object[] nodeIds = new Object[noVertices];
         List<Edge>[] nodeEdges = new List[noVertices];
         for (int i = 0; i < noVertices; i++) {
             names[i] = "vertex" + i;
@@ -638,7 +715,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             nodeIds[i] = (Long) nodes[i].id();
             nodeEdgeIds[i] = new HashSet(10);
             for (Object r : nodeEdges[i]) {
-                nodeEdgeIds[i].add(((JanusGraphEdge) r).longId());
+                nodeEdgeIds[i].add(((JanusGraphEdge) r).id());
             }
         }
         clopen();
@@ -649,7 +726,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             assertEquals(n, getVertex("name", names[i]));
             assertEquals(names[i], n.value("name"));
             nodes[i] = n;
-            assertEquals(nodeIds[i], n.longId());
+            assertEquals(nodeIds[i], n.id());
         }
         for (int i = 0; i < noVertices; i++) {
             JanusGraphVertex n = nodes[i];
@@ -672,13 +749,13 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
 
             Set edgeIds = new HashSet(10);
             for (JanusGraphEdge r : n.query().direction(Direction.OUT).edges()) {
-                edgeIds.add(r.longId());
+                edgeIds.add(r.id());
             }
             assertEquals(edgeIds, nodeEdgeIds[i], edgeIds + " vs " + nodeEdgeIds[i]);
         }
         newTx();
         //Bulk vertex retrieval
-        long[] vertexIdsOne = new long[noVertices / 10];
+        Object[] vertexIdsOne = new Object[noVertices / 10];
         System.arraycopy(nodeIds, 0, vertexIdsOne, 0, vertexIdsOne.length);
         //All non-cached
         verifyVerticesRetrieval(vertexIdsOne, Lists.newArrayList(tx.getVertices(vertexIdsOne)));
@@ -686,17 +763,17 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         //All cached
         verifyVerticesRetrieval(vertexIdsOne, Lists.newArrayList(tx.getVertices(vertexIdsOne)));
 
-        long[] vertexIdsTwo = new long[noVertices / 10 * 2];
+        Object[] vertexIdsTwo = new Object[noVertices / 10 * 2];
         System.arraycopy(nodeIds, 0, vertexIdsTwo, 0, vertexIdsTwo.length);
         //Partially cached
         verifyVerticesRetrieval(vertexIdsTwo, Lists.newArrayList(tx.getVertices(vertexIdsTwo)));
     }
 
-    private void verifyVerticesRetrieval(long[] vertexIds, List<JanusGraphVertex> vs) {
+    private void verifyVerticesRetrieval(Object[] vertexIds, List<JanusGraphVertex> vs) {
         assertEquals(vertexIds.length, vs.size());
-        final Set<Long> vertexIdSet = new HashSet<>(vs.size());
+        final Set<Object> vertexIdSet = new HashSet<>(vs.size());
         vs.forEach(v -> vertexIdSet.add((Long) v.id()));
-        for (final long vertexId : vertexIds) {
+        for (final Object vertexId : vertexIds) {
             assertTrue(vertexIdSet.contains(vertexId));
         }
     }
@@ -769,7 +846,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertEquals(Float.class, weight.dataType());
         sig = ((InternalRelationType) value).getSignature();
         assertEquals(1, sig.length);
-        assertEquals(weight.longId(), sig[0]);
+        assertEquals(weight.id(), sig[0]);
         assertTrue(mgmt.getGraphIndex(uid.name()).isUnique());
         assertFalse(mgmt.getGraphIndex(someId.name()).isUnique());
 
@@ -790,7 +867,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertEquals(0, ((InternalRelationType) friend).getSignature().length);
         sig = ((InternalRelationType) connect).getSignature();
         assertEquals(1, sig.length);
-        assertEquals(uid.longId(), sig[0]);
+        assertEquals(uid.id(), sig[0]);
         assertEquals(0, ((InternalRelationType) friend).getSortKey().length);
         assertEquals(Order.DEFAULT, ((InternalRelationType) friend).getSortOrder());
         assertEquals(SchemaStatus.ENABLED, ((InternalRelationType) friend).getStatus());
@@ -884,7 +961,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertEquals(Float.class, weight2.dataType());
         sig = ((InternalRelationType) value).getSignature();
         assertEquals(1, sig.length);
-        assertEquals(weight2.longId(), sig[0]);
+        assertEquals(weight2.id(), sig[0]);
         assertTrue(mgmt.getGraphIndex(uid.name()).isUnique());
         assertFalse(mgmt.getGraphIndex(someId2.name()).isUnique());
 
@@ -905,7 +982,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertEquals(0, ((InternalRelationType) friend).getSignature().length);
         sig = ((InternalRelationType) connect).getSignature();
         assertEquals(1, sig.length);
-        assertEquals(uid.longId(), sig[0]);
+        assertEquals(uid.id(), sig[0]);
         assertEquals(0, ((InternalRelationType) friend).getSortKey().length);
         assertEquals(Order.DEFAULT, ((InternalRelationType) friend).getSortOrder());
         assertEquals(SchemaStatus.ENABLED, ((InternalRelationType) friend).getStatus());
@@ -1205,23 +1282,6 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         //Ensure that unidirected edges keep pointing to deleted vertices
         getV(tx, v13).remove();
         assertCount(1, v.query().direction(Direction.BOTH).labels("link").edges());
-
-        //Finally, test the schema container
-        SchemaContainer schemaContainer = new SchemaContainer(graph);
-        assertTrue(schemaContainer.containsRelationType("weight"));
-        assertTrue(schemaContainer.containsRelationType("friend"));
-        assertTrue(schemaContainer.containsVertexLabel("person"));
-        VertexLabelDefinition vld = schemaContainer.getVertexLabel("tag");
-        assertFalse(vld.isPartitioned());
-        assertFalse(vld.isStatic());
-        PropertyKeyDefinition pkd = schemaContainer.getPropertyKey("name");
-        assertEquals(Cardinality.SET, pkd.getCardinality());
-        assertEquals(String.class, pkd.getDataType());
-        EdgeLabelDefinition eld = schemaContainer.getEdgeLabel("child");
-        assertEquals("child", eld.getName());
-        assertEquals(child.longId(), eld.getLongId());
-        assertEquals(Multiplicity.ONE2MANY, eld.getMultiplicity());
-        assertFalse(eld.isUnidirected());
     }
 
     /**
@@ -1570,6 +1630,131 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
     }
 
     @Test
+    public void testDiscardAndDropRegisteredIndex() throws ExecutionException, InterruptedException {
+        clopen(option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ZERO,
+            option(KCVSLog.LOG_READ_LAG_TIME, MANAGEMENT_LOG), Duration.ofMillis(50),
+            option(LOG_READ_INTERVAL, MANAGEMENT_LOG), Duration.ofMillis(250),
+            option(FORCE_INDEX_USAGE), true
+        );
+
+        String indexName = "composite";
+        String propertyName = "prop";
+
+        makeKey(propertyName, String.class);
+        finishSchema();
+
+        //Never create new indexes while a transaction is active
+        graph.getOpenTransactions().forEach(JanusGraphTransaction::rollback);
+        mgmt = graph.openManagement();
+
+        registerIndex(indexName, Vertex.class, propertyName);
+        discardIndex(indexName);
+        dropIndex(indexName);
+
+        // try to register index again to ensure that it was properly deleted
+        registerIndex(indexName, Vertex.class, propertyName);
+        enableIndex(indexName);
+    }
+
+    @Test
+    public void testReenableDisabledIndex() throws ExecutionException, InterruptedException {
+        clopen(option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ZERO,
+            option(KCVSLog.LOG_READ_LAG_TIME, MANAGEMENT_LOG), Duration.ofMillis(50),
+            option(LOG_READ_INTERVAL, MANAGEMENT_LOG), Duration.ofMillis(250),
+            option(FORCE_INDEX_USAGE), true
+        );
+
+        String indexName = "composite";
+        String propertyName = "prop";
+        String propertyValue = "value";
+
+        makeKey(propertyName, String.class);
+        finishSchema();
+
+        //Never create new indexes while a transaction is active
+        graph.getOpenTransactions().forEach(JanusGraphTransaction::rollback);
+        mgmt = graph.openManagement();
+
+        registerIndex(indexName, Vertex.class, propertyName);
+        enableIndex(indexName);
+
+        graph.addVertex(propertyName, propertyValue);
+        graph.tx().commit();
+
+        disableIndex(indexName);
+
+        graph.addVertex(propertyName, propertyValue);
+        graph.tx().commit();
+
+        enableIndex(indexName);
+
+        // verify that vertices are not picked up by the index when they are inserted while the index was disabled
+        assertEquals(1, graph.traversal().V().has(propertyName, propertyValue).count().next());
+
+        graph.addVertex(propertyName, propertyValue);
+        graph.tx().commit();
+
+        // verify that the index picks up vertices after re-enabling
+        assertEquals(2, graph.traversal().V().has(propertyName, propertyValue).count().next());
+    }
+
+    @Test
+    public void testCreateCompositeIndexThatPreviouslyExisted() throws ExecutionException, InterruptedException {
+        clopen(option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ZERO,
+            option(KCVSLog.LOG_READ_LAG_TIME, MANAGEMENT_LOG), Duration.ofMillis(50),
+            option(LOG_READ_INTERVAL, MANAGEMENT_LOG), Duration.ofMillis(250),
+            option(FORCE_INDEX_USAGE), true
+        );
+
+        String indexName = "composite";
+        String propertyName = "prop";
+        String propertyValue = "value";
+
+        makeKey(propertyName, String.class);
+        finishSchema();
+
+        //Never create new indexes while a transaction is active
+        graph.getOpenTransactions().forEach(JanusGraphTransaction::rollback);
+        mgmt = graph.openManagement();
+
+        registerIndex(indexName, Vertex.class, propertyName);
+        enableIndex(indexName);
+
+        graph.addVertex(propertyName, propertyValue);
+        graph.tx().commit();
+
+        disableIndex(indexName);
+        discardIndex(indexName);
+        dropIndex(indexName);
+        registerIndex(indexName, Vertex.class, propertyName);
+        enableIndex(indexName);
+
+        // verify that old vertex is not found anymore
+        assertFalse(graph.traversal().V().has(propertyName, propertyValue).hasNext());
+
+        // verify that index gets updated for new vertices
+        graph.addVertex(propertyName, propertyValue);
+        graph.tx().commit();
+        assertTrue(graph.traversal().V().has(propertyName, propertyValue).hasNext());
+    }
+
+    private void registerIndex(String indexName, Class<? extends Element> type, String... propertyNames) throws InterruptedException {
+        JanusGraphManagement.IndexBuilder builder = mgmt.buildIndex(indexName, type);
+        for (String prop : propertyNames) {
+            builder.addKey(mgmt.getPropertyKey(prop));
+        }
+        builder.buildCompositeIndex();
+        mgmt.commit();
+        assertTrue(ManagementSystem
+            .awaitGraphIndexStatus(graph, indexName)
+            .status(SchemaStatus.REGISTERED)
+            .call()
+            .getSucceeded()
+        );
+        mgmt = graph.openManagement();
+    }
+
+    @Test
     public void testUpdateSchemaChangeNameForPropertyKey() {
         PropertyKey time = mgmt.makePropertyKey("time").dataType(Integer.class).cardinality(Cardinality.SINGLE).make();
         mgmt.buildIndex("timeIndex", Vertex.class).addKey(time).buildCompositeIndex();
@@ -1665,25 +1850,29 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertEquals(name, graphIndex.getFieldKeys()[0].name());
         assertEquals("internalindex", graphIndex.getBackingIndex());
         assertEquals(SchemaStatus.ENABLED, graphIndex.getIndexStatus(graphIndex.getFieldKeys()[0]));
-        finishSchema();
+        mgmt.commit();
+        graph.getOpenTransactions().forEach(JanusGraphTransaction::rollback); //Never create new indexes while a transaction is active
+        mgmt = graph.openManagement();
 
         // Disable name index
         graphIndex = mgmt.getGraphIndex(name);
         mgmt.updateIndex(graphIndex, SchemaAction.DISABLE_INDEX);
         mgmt.commit();
-        tx.commit();
-
-        ManagementUtil.awaitGraphIndexUpdate(graph, name, 5, ChronoUnit.SECONDS);
-        finishSchema();
+        mgmt = graph.openManagement();
 
         // Remove name index
-        graphIndex = mgmt.getGraphIndex(name);
-        mgmt.updateIndex(graphIndex, SchemaAction.REMOVE_INDEX);
-        JanusGraphManagement.IndexJobFuture graphMetrics = mgmt.getIndexJobStatus(graphIndex);
-        finishSchema();
+        ScanJobFuture future = mgmt.updateIndex(mgmt.getGraphIndex(name), SchemaAction.DISCARD_INDEX);
+        mgmt.commit();
 
+        assertTrue(ManagementSystem
+            .awaitGraphIndexStatus(graph, name)
+            .status(SchemaStatus.DISCARDED)
+            .call()
+            .getSucceeded()
+        );
+        ScanMetrics scanMetrics = future.get();
         // Should have deleted at least one record
-        assertNotEquals(0, graphMetrics.get().getCustom(IndexRemoveJob.DELETED_RECORDS_COUNT));
+        assertNotEquals(0, scanMetrics.getCustom(IndexRemoveJob.DELETED_RECORDS_COUNT));
     }
 
     @Test
@@ -1774,7 +1963,8 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         finishSchema();
     }
 
-    @Test
+    // flaky test: https://github.com/JanusGraph/janusgraph/issues/1498
+    @RepeatedIfExceptionsTest(repeats = 3)
     public void testIndexUpdatesWithReindexAndRemove() throws InterruptedException, ExecutionException {
         clopen(option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ofMillis(0),
                 option(KCVSLog.LOG_READ_LAG_TIME, MANAGEMENT_LOG), Duration.ofMillis(50),
@@ -1859,7 +2049,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         mgmt.updateIndex(eindex2, SchemaAction.ENABLE_INDEX);
         finishSchema();
         assertTrue(ManagementSystem.awaitRelationIndexStatus(graph, "byTime", "friend").status(SchemaStatus.ENABLED)
-                .timeout(10L, ChronoUnit.SECONDS).call().getSucceeded());
+                .call().getSucceeded());
 
         //Reindex the other two
         pindex2 = mgmt.getRelationIndex(mgmt.getRelationType("sensor"), "byTime");
@@ -1973,11 +2163,447 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         finishSchema();
         pindex2 = mgmt.getRelationIndex(mgmt.getRelationType("sensor"), "byTime");
         graphIndex2 = mgmt.getGraphIndex("bySensorReading");
-        ScanMetrics pmetrics = mgmt.updateIndex(pindex2, SchemaAction.REMOVE_INDEX).get();
-        ScanMetrics graphIndexMetrics = mgmt.updateIndex(graphIndex2, SchemaAction.REMOVE_INDEX).get();
+        ScanMetrics pmetrics = mgmt.updateIndex(pindex2, SchemaAction.DISCARD_INDEX).get();
+        ScanMetrics graphIndexMetrics = mgmt.updateIndex(graphIndex2, SchemaAction.DISCARD_INDEX).get();
         finishSchema();
         assertEquals(30, pmetrics.getCustom(IndexRemoveJob.DELETED_RECORDS_COUNT));
         assertEquals(30, graphIndexMetrics.getCustom(IndexRemoveJob.DELETED_RECORDS_COUNT));
+    }
+
+    @Test
+    public void testReindexWithoutEnablingIndexThenEnableLater() throws InterruptedException, ExecutionException {
+        clopen(option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ofMillis(0),
+                option(KCVSLog.LOG_READ_LAG_TIME, MANAGEMENT_LOG), Duration.ofMillis(50),
+                option(LOG_READ_INTERVAL, MANAGEMENT_LOG), Duration.ofMillis(250)
+        );
+        //Types without index
+        PropertyKey time = mgmt.makePropertyKey("time").dataType(Integer.class).make();
+        PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).cardinality(Cardinality.SET).make();
+        PropertyKey sensor = mgmt.makePropertyKey("sensor").dataType(Double.class).cardinality(Cardinality.LIST).make();
+        finishSchema();
+
+        //Add data before the indexes exist
+        JanusGraphVertex v = tx.addVertex();
+        for (int i = 0; i < 10; i++) {
+            v.property("sensor", i, "time", i);
+            v.property("name", "v" + i);
+        }
+        newTx();
+
+        //Create the indexes after the fact and wait until they are registered everywhere
+        finishSchema();
+        sensor = mgmt.getPropertyKey("sensor");
+        time = mgmt.getPropertyKey("time");
+        name = mgmt.getPropertyKey("name");
+        mgmt.buildPropertyIndex(sensor, "byTime", desc, time);
+        mgmt.buildIndex("byName", Vertex.class).addKey(name).buildCompositeIndex();
+        mgmt.commit();
+        tx.commit();
+        ManagementUtil.awaitVertexIndexUpdate(graph, "byTime", "sensor", 10, ChronoUnit.SECONDS);
+        ManagementUtil.awaitGraphIndexUpdate(graph, "byName", 10, ChronoUnit.SECONDS);
+
+        //Enable the indexes for writes only
+        finishSchema();
+        mgmt.updateIndex(mgmt.getRelationIndex(mgmt.getRelationType("sensor"), "byTime"), SchemaAction.ENABLE_WRITE_ONLY).get();
+        mgmt.updateIndex(mgmt.getGraphIndex("byName"), SchemaAction.ENABLE_WRITE_ONLY).get();
+        finishSchema();
+        assertEquals(SchemaStatus.WRITE_ONLY_ENABLED, mgmt.getRelationIndex(mgmt.getRelationType("sensor"), "byTime").getIndexStatus());
+        JanusGraphIndex byName = mgmt.getGraphIndex("byName");
+        assertEquals(SchemaStatus.WRITE_ONLY_ENABLED, byName.getIndexStatus(byName.getFieldKeys()[0]));
+        finishSchema();
+
+        //Add data while the indexes are write-only
+        newTx();
+        v = getV(tx, v);
+        for (int i = 100; i < 110; i++) {
+            v.property("sensor", i, "time", i);
+            v.property("name", "v" + i);
+        }
+        newTx();
+
+        //Write-only indexes must not be used to answer queries
+        v = getV(tx, v);
+        evaluateQuery(v.query().keys("sensor").interval("time", 101, 105).orderBy("time", desc),
+                PROPERTY, 4, 1, new boolean[]{false, false}, tx.getPropertyKey("time"), Order.DESC);
+        evaluateQuery(tx.query().has("name", "v105"),
+                ElementCategory.VERTEX, 1, new boolean[]{false, true});
+        newTx();
+
+        //Reindex without enabling: the indexes must keep their WRITE_ONLY_ENABLED status
+        finishSchema();
+        ScanMetrics reindexByTime = mgmt.updateIndex(mgmt.getRelationIndex(mgmt.getRelationType("sensor"), "byTime"), SchemaAction.REINDEX).get();
+        finishSchema();
+        ScanMetrics reindexByName = mgmt.updateIndex(mgmt.getGraphIndex("byName"), SchemaAction.REINDEX).get();
+        finishSchema();
+        assertNotEquals(0, reindexByTime.getCustom(IndexRepairJob.ADDED_RECORDS_COUNT));
+        assertNotEquals(0, reindexByName.getCustom(IndexRepairJob.ADDED_RECORDS_COUNT));
+        assertEquals(SchemaStatus.WRITE_ONLY_ENABLED, mgmt.getRelationIndex(mgmt.getRelationType("sensor"), "byTime").getIndexStatus());
+        byName = mgmt.getGraphIndex("byName");
+        assertEquals(SchemaStatus.WRITE_ONLY_ENABLED, byName.getIndexStatus(byName.getFieldKeys()[0]));
+        finishSchema();
+
+        //Still not used to answer queries after reindexing
+        newTx();
+        v = getV(tx, v);
+        evaluateQuery(v.query().keys("sensor").interval("time", 1, 5).orderBy("time", desc),
+                PROPERTY, 4, 1, new boolean[]{false, false}, tx.getPropertyKey("time"), Order.DESC);
+        evaluateQuery(tx.query().has("name", "v5"),
+                ElementCategory.VERTEX, 1, new boolean[]{false, true});
+
+        //Add more data while the indexes remain write-only
+        v = getV(tx, v);
+        for (int i = 200; i < 210; i++) {
+            v.property("sensor", i, "time", i);
+            v.property("name", "v" + i);
+        }
+        newTx();
+
+        //Enable the indexes fully; no additional reindex must be necessary
+        finishSchema();
+        mgmt.updateIndex(mgmt.getRelationIndex(mgmt.getRelationType("sensor"), "byTime"), SchemaAction.ENABLE_INDEX).get();
+        mgmt.updateIndex(mgmt.getGraphIndex("byName"), SchemaAction.ENABLE_INDEX).get();
+        finishSchema();
+        assertEquals(SchemaStatus.ENABLED, mgmt.getRelationIndex(mgmt.getRelationType("sensor"), "byTime").getIndexStatus());
+        byName = mgmt.getGraphIndex("byName");
+        assertEquals(SchemaStatus.ENABLED, byName.getIndexStatus(byName.getFieldKeys()[0]));
+        finishSchema();
+
+        //All data must now be answered from the indexes: reindexed data as well as data written while write-only
+        newTx();
+        v = getV(tx, v);
+        evaluateQuery(v.query().keys("sensor").interval("time", 1, 5).orderBy("time", desc),
+                PROPERTY, 4, 1, new boolean[]{true, true}, tx.getPropertyKey("time"), Order.DESC);
+        evaluateQuery(v.query().keys("sensor").interval("time", 101, 105).orderBy("time", desc),
+                PROPERTY, 4, 1, new boolean[]{true, true}, tx.getPropertyKey("time"), Order.DESC);
+        evaluateQuery(v.query().keys("sensor").interval("time", 201, 205).orderBy("time", desc),
+                PROPERTY, 4, 1, new boolean[]{true, true}, tx.getPropertyKey("time"), Order.DESC);
+        evaluateQuery(tx.query().has("name", "v5"),
+                ElementCategory.VERTEX, 1, new boolean[]{true, true}, "byName");
+        evaluateQuery(tx.query().has("name", "v105"),
+                ElementCategory.VERTEX, 1, new boolean[]{true, true}, "byName");
+        evaluateQuery(tx.query().has("name", "v205"),
+                ElementCategory.VERTEX, 1, new boolean[]{true, true}, "byName");
+    }
+
+    @Test
+    public void testWriteOnlyIndexDemotionAndPromotionWithoutReindex() throws InterruptedException, ExecutionException {
+        PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).make();
+        mgmt.buildIndex("byName", Vertex.class).addKey(name).buildCompositeIndex();
+        finishSchema();
+
+        tx.addVertex("name", "a1");
+        newTx();
+        evaluateQuery(tx.query().has("name", "a1"),
+                ElementCategory.VERTEX, 1, new boolean[]{true, true}, "byName");
+        newTx();
+
+        //Demote the enabled index to writes-only
+        finishSchema();
+        JanusGraphIndex byName = mgmt.getGraphIndex("byName");
+        assertEquals(SchemaStatus.ENABLED, byName.getIndexStatus(byName.getFieldKeys()[0]));
+        mgmt.updateIndex(byName, SchemaAction.ENABLE_WRITE_ONLY).get();
+        finishSchema();
+        byName = mgmt.getGraphIndex("byName");
+        assertEquals(SchemaStatus.WRITE_ONLY_ENABLED, byName.getIndexStatus(byName.getFieldKeys()[0]));
+        finishSchema();
+
+        //While write-only the index must not be used to answer queries...
+        tx.addVertex("name", "a2");
+        newTx();
+        evaluateQuery(tx.query().has("name", "a1"),
+                ElementCategory.VERTEX, 1, new boolean[]{false, true});
+        evaluateQuery(tx.query().has("name", "a2"),
+                ElementCategory.VERTEX, 1, new boolean[]{false, true});
+        newTx();
+
+        //...but it keeps receiving writes, so it can be fully enabled again without reindexing
+        finishSchema();
+        mgmt.updateIndex(mgmt.getGraphIndex("byName"), SchemaAction.ENABLE_INDEX).get();
+        finishSchema();
+        byName = mgmt.getGraphIndex("byName");
+        assertEquals(SchemaStatus.ENABLED, byName.getIndexStatus(byName.getFieldKeys()[0]));
+        newTx();
+        evaluateQuery(tx.query().has("name", "a1"),
+                ElementCategory.VERTEX, 1, new boolean[]{true, true}, "byName");
+        evaluateQuery(tx.query().has("name", "a2"),
+                ElementCategory.VERTEX, 1, new boolean[]{true, true}, "byName");
+    }
+
+    @Test
+    public void testCreateDisabledIndexAndActivateLater() throws InterruptedException, ExecutionException {
+        clopen(option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ofMillis(0),
+                option(KCVSLog.LOG_READ_LAG_TIME, MANAGEMENT_LOG), Duration.ofMillis(50),
+                option(LOG_READ_INTERVAL, MANAGEMENT_LOG), Duration.ofMillis(250)
+        );
+        mgmt.makePropertyKey("name").dataType(String.class).make();
+        finishSchema();
+
+        //Create an index over an existing key and disable it within the same management transaction:
+        //the index must not receive any writes until it is explicitly activated
+        PropertyKey name = mgmt.getPropertyKey("name");
+        JanusGraphIndex byName = mgmt.buildIndex("byName", Vertex.class).addKey(name).buildCompositeIndex();
+        mgmt.updateIndex(byName, SchemaAction.DISABLE_INDEX);
+        mgmt.commit();
+        tx.commit();
+
+        //The pending registration from the index creation must not resurrect the disabled index
+        assertFalse(ManagementSystem.awaitGraphIndexStatus(graph, "byName").status(SchemaStatus.REGISTERED)
+                .timeout(2, ChronoUnit.SECONDS).call().getSucceeded());
+        finishSchema();
+        byName = mgmt.getGraphIndex("byName");
+        assertEquals(SchemaStatus.DISABLED, byName.getIndexStatus(byName.getFieldKeys()[0]));
+        finishSchema();
+
+        //Data written while the index is disabled must not be indexed
+        tx.addVertex("name", "while-disabled");
+        newTx();
+
+        //Activate the index for writes through re-registration (required for the registration barrier)
+        finishSchema();
+        mgmt.updateIndex(mgmt.getGraphIndex("byName"), SchemaAction.REGISTER_INDEX).get();
+        mgmt.commit();
+        tx.commit();
+        assertTrue(ManagementSystem.awaitGraphIndexStatus(graph, "byName").status(SchemaStatus.REGISTERED)
+                .call().getSucceeded());
+        finishSchema();
+
+        tx.addVertex("name", "while-registered");
+        newTx();
+
+        //Enable reads without reindexing: only data written after the re-registration is visible through the index
+        finishSchema();
+        mgmt.updateIndex(mgmt.getGraphIndex("byName"), SchemaAction.ENABLE_INDEX).get();
+        finishSchema();
+        newTx();
+        evaluateQuery(tx.query().has("name", "while-registered"),
+                ElementCategory.VERTEX, 1, new boolean[]{true, true}, "byName");
+        evaluateQuery(tx.query().has("name", "while-disabled"),
+                ElementCategory.VERTEX, 0, new boolean[]{true, true}, "byName");
+        newTx();
+
+        //Reindex to pick up the data written while the index was disabled
+        finishSchema();
+        mgmt.updateIndex(mgmt.getGraphIndex("byName"), SchemaAction.REINDEX).get();
+        finishSchema();
+        newTx();
+        evaluateQuery(tx.query().has("name", "while-disabled"),
+                ElementCategory.VERTEX, 1, new boolean[]{true, true}, "byName");
+    }
+
+    @Test
+    public void testEnableWriteOnlyIndexActionApplicability() {
+        mgmt.makePropertyKey("name").dataType(String.class).make();
+        finishSchema();
+
+        //INSTALLED (within the creating transaction): rejected because the registration barrier has not been passed yet
+        PropertyKey name = mgmt.getPropertyKey("name");
+        final JanusGraphIndex installedIndex = mgmt.buildIndex("byNameInstalled", Vertex.class).addKey(name).buildCompositeIndex();
+        assertEquals(SchemaStatus.INSTALLED, installedIndex.getIndexStatus(installedIndex.getFieldKeys()[0]));
+        assertThrows(IllegalArgumentException.class, () -> mgmt.updateIndex(installedIndex, SchemaAction.ENABLE_WRITE_ONLY));
+        mgmt.rollback();
+        mgmt = graph.openManagement();
+
+        //DISABLED: rejected because the index must pass the registration barrier (REGISTER_INDEX) first,
+        //otherwise a subsequent reindex could miss writes from instances that do not yet write to the index
+        PropertyKey rating = mgmt.makePropertyKey("rating").dataType(Integer.class).make();
+        JanusGraphIndex byRating = mgmt.buildIndex("byRating", Vertex.class).addKey(rating).buildCompositeIndex();
+        mgmt.updateIndex(byRating, SchemaAction.DISABLE_INDEX);
+        finishSchema();
+        JanusGraphIndex byRating2 = mgmt.getGraphIndex("byRating");
+        assertEquals(SchemaStatus.DISABLED, byRating2.getIndexStatus(byRating2.getFieldKeys()[0]));
+        assertThrows(IllegalArgumentException.class, () -> mgmt.updateIndex(mgmt.getGraphIndex("byRating"), SchemaAction.ENABLE_WRITE_ONLY));
+        mgmt.rollback();
+        mgmt = graph.openManagement();
+    }
+
+    @Test
+    public void testRemoveStaleCompositeIndexEntries() throws InterruptedException, ExecutionException {
+        clopen(option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ofMillis(0),
+                option(KCVSLog.LOG_READ_LAG_TIME, MANAGEMENT_LOG), Duration.ofMillis(50),
+                option(LOG_READ_INTERVAL, MANAGEMENT_LOG), Duration.ofMillis(250)
+        );
+        PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).make();
+        mgmt.buildIndex("byName", Vertex.class).addKey(name).buildCompositeIndex();
+        finishSchema();
+
+        tx.addVertex("name", "stale");
+        tx.addVertex("name", "alive");
+        newTx();
+
+        //Disable the index and delete a vertex while the index does not receive updates -> stale index entry
+        finishSchema();
+        mgmt.updateIndex(mgmt.getGraphIndex("byName"), SchemaAction.DISABLE_INDEX).get();
+        finishSchema();
+        tx.query().has("name", "stale").vertices().iterator().next().remove();
+        newTx();
+
+        //Re-activate the index without reindexing
+        finishSchema();
+        mgmt.updateIndex(mgmt.getGraphIndex("byName"), SchemaAction.REGISTER_INDEX).get();
+        mgmt.commit();
+        tx.commit();
+        assertTrue(ManagementSystem.awaitGraphIndexStatus(graph, "byName").status(SchemaStatus.REGISTERED)
+                .call().getSucceeded());
+        finishSchema();
+        mgmt.updateIndex(mgmt.getGraphIndex("byName"), SchemaAction.ENABLE_INDEX).get();
+        finishSchema();
+
+        //The stale entry surfaces as a ghost vertex
+        newTx();
+        evaluateQuery(tx.query().has("name", "stale"),
+                ElementCategory.VERTEX, 1, new boolean[]{true, true}, "byName");
+        newTx();
+
+        //Remove the stale entries
+        finishSchema();
+        ScanMetrics metrics = mgmt.updateIndex(mgmt.getGraphIndex("byName"), SchemaAction.REMOVE_STALE_ENTRIES).get();
+        finishSchema();
+        assertEquals(1, metrics.getCustom(StaleIndexEntryRemoveJob.REMOVED_RECORDS_COUNT));
+        assertEquals(2, metrics.getCustom(StaleIndexEntryRemoveJob.SCANNED_RECORDS_COUNT));
+
+        //A second run must find nothing to remove: the stale entry is physically gone
+        ScanMetrics secondRun = mgmt.updateIndex(mgmt.getGraphIndex("byName"), SchemaAction.REMOVE_STALE_ENTRIES).get();
+        finishSchema();
+        assertEquals(0, secondRun.getCustom(StaleIndexEntryRemoveJob.REMOVED_RECORDS_COUNT));
+
+        newTx();
+        evaluateQuery(tx.query().has("name", "stale"),
+                ElementCategory.VERTEX, 0, new boolean[]{true, true}, "byName");
+        evaluateQuery(tx.query().has("name", "alive"),
+                ElementCategory.VERTEX, 1, new boolean[]{true, true}, "byName");
+    }
+
+    @Test
+    public void testRemoveStaleCompositeEdgeIndexEntries() throws InterruptedException, ExecutionException {
+        clopen(option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ofMillis(0),
+                option(KCVSLog.LOG_READ_LAG_TIME, MANAGEMENT_LOG), Duration.ofMillis(50),
+                option(LOG_READ_INTERVAL, MANAGEMENT_LOG), Duration.ofMillis(250)
+        );
+        PropertyKey time = mgmt.makePropertyKey("time").dataType(Integer.class).make();
+        mgmt.makeEdgeLabel("knows").make();
+        mgmt.buildIndex("edgesByTime", Edge.class).addKey(time).buildCompositeIndex();
+        finishSchema();
+
+        JanusGraphVertex v1 = tx.addVertex();
+        JanusGraphVertex v2 = tx.addVertex();
+        v1.addEdge("knows", v2, "time", 1);
+        v1.addEdge("knows", v2, "time", 2);
+        newTx();
+
+        //Disable the index and delete an edge while the index does not receive updates -> stale index entry
+        finishSchema();
+        mgmt.updateIndex(mgmt.getGraphIndex("edgesByTime"), SchemaAction.DISABLE_INDEX).get();
+        finishSchema();
+        tx.query().has("time", 1).edges().iterator().next().remove();
+        newTx();
+
+        //Re-activate the index without reindexing
+        finishSchema();
+        mgmt.updateIndex(mgmt.getGraphIndex("edgesByTime"), SchemaAction.REGISTER_INDEX).get();
+        mgmt.commit();
+        tx.commit();
+        assertTrue(ManagementSystem.awaitGraphIndexStatus(graph, "edgesByTime").status(SchemaStatus.REGISTERED)
+                .call().getSucceeded());
+        finishSchema();
+        mgmt.updateIndex(mgmt.getGraphIndex("edgesByTime"), SchemaAction.ENABLE_INDEX).get();
+        finishSchema();
+
+        //Remove the stale entries (a stale relation entry does not surface as a ghost because unresolvable
+        //relation identifiers are filtered at query time, so the metrics carry the assertions)
+        finishSchema();
+        ScanMetrics metrics = mgmt.updateIndex(mgmt.getGraphIndex("edgesByTime"), SchemaAction.REMOVE_STALE_ENTRIES).get();
+        finishSchema();
+        assertEquals(1, metrics.getCustom(StaleIndexEntryRemoveJob.REMOVED_RECORDS_COUNT));
+        assertEquals(2, metrics.getCustom(StaleIndexEntryRemoveJob.SCANNED_RECORDS_COUNT));
+
+        ScanMetrics secondRun = mgmt.updateIndex(mgmt.getGraphIndex("edgesByTime"), SchemaAction.REMOVE_STALE_ENTRIES).get();
+        finishSchema();
+        assertEquals(0, secondRun.getCustom(StaleIndexEntryRemoveJob.REMOVED_RECORDS_COUNT));
+        assertEquals(1, secondRun.getCustom(StaleIndexEntryRemoveJob.SCANNED_RECORDS_COUNT));
+
+        //The live edge is still served from the index
+        newTx();
+        evaluateQuery(tx.query().has("time", 2),
+                ElementCategory.EDGE, 1, new boolean[]{true, true}, "edgesByTime");
+        evaluateQuery(tx.query().has("time", 1),
+                ElementCategory.EDGE, 0, new boolean[]{true, true}, "edgesByTime");
+    }
+
+    //A composite index still holds the edges which the transaction removed, and a query leaves them out of what the
+    //index returns: one with a limit reads on past them
+    @Test
+    public void testLimitedQueryOfACompositeIndexReadsPastTheEdgesWhichTheTransactionRemoved() {
+        final PropertyKey kind = makeKey("kind", String.class);
+        makeKey("weight", Long.class);
+        mgmt.makeEdgeLabel("road").multiplicity(Multiplicity.MULTI).make();
+        mgmt.buildIndex("roadsByKind", Edge.class).addKey(kind).buildCompositeIndex();
+        finishSchema();
+        final Vertex from = tx.addVertex();
+        final Vertex to = tx.addVertex();
+        for (long w = 1; w <= 30; w++) {
+            from.addEdge("road", to, "kind", "paved", "weight", w);
+        }
+        newTx();
+        tx.traversal().V(from).outE("road").has("weight", P.lte(25L)).toList().forEach(Edge::remove);
+
+        final List<Edge> anyThree = tx.traversal().E().has("kind", "paved").limit(3).toList();
+        assertEquals(3, anyThree.stream().distinct().count());
+        for (final Edge edge : anyThree) {
+            assertTrue(edge.<Long>value("weight") > 25);
+        }
+        assertEquals(5, tx.traversal().E().has("kind", "paved").toList().size());
+        tx.rollback();
+        newTx();
+
+        //A query which drops the edges it reads, as it reads them, before it reads on drops each of its edges once
+        tx.traversal().V(from).outE("road").has("weight", P.inside(8L, 26L)).toList().forEach(Edge::remove);
+        tx.traversal().V(from).outE("road").has("weight", P.lte(5L)).toList().forEach(Edge::remove);
+        tx.traversal().E().has("kind", "paved").limit(5).drop().iterate();
+        assertEquals(3, tx.traversal().E().has("kind", "paved").toList().size());
+    }
+
+    //A query without a limit which the index answers under one all the same, as under query.hard-max-limit, and which
+    //drops the edges it reads, as it reads them, drops each of them once it reads on past that limit
+    @Test
+    public void testQueryUnderTheHardMaxLimitDropsEveryEdgeItReads() {
+        clopen(option(HARD_MAX_LIMIT), 10);
+        final PropertyKey kind = makeKey("kind", String.class);
+        mgmt.makeEdgeLabel("road").multiplicity(Multiplicity.MULTI).make();
+        mgmt.buildIndex("roadsByKind", Edge.class).addKey(kind).buildCompositeIndex();
+        finishSchema();
+        final Vertex from = tx.addVertex();
+        final Vertex to = tx.addVertex();
+        for (int i = 0; i < 30; i++) {
+            from.addEdge("road", to, "kind", "paved");
+        }
+        newTx();
+        tx.traversal().E().has("kind", "paved").drop().iterate();
+        assertEquals(0L, tx.traversal().V(from).outE("road").count().next());
+    }
+
+    @Test
+    public void testRemoveStaleEntriesActionApplicability() {
+        mgmt.makePropertyKey("name").dataType(String.class).make();
+        finishSchema();
+
+        //INSTALLED (within the creating transaction): rejected, the index is not applicable yet
+        PropertyKey name = mgmt.getPropertyKey("name");
+        final JanusGraphIndex installedIndex = mgmt.buildIndex("byNameInstalled", Vertex.class).addKey(name).buildCompositeIndex();
+        assertEquals(SchemaStatus.INSTALLED, installedIndex.getIndexStatus(installedIndex.getFieldKeys()[0]));
+        assertThrows(IllegalArgumentException.class, () -> mgmt.updateIndex(installedIndex, SchemaAction.REMOVE_STALE_ENTRIES));
+        mgmt.rollback();
+        mgmt = graph.openManagement();
+
+        //Vertex-centric indexes are not supported
+        PropertyKey rating = mgmt.makePropertyKey("rating").dataType(Integer.class).cardinality(Cardinality.LIST).make();
+        PropertyKey rtime = mgmt.makePropertyKey("rtime").dataType(Integer.class).make();
+        mgmt.buildPropertyIndex(rating, "ratingByTime", desc, rtime);
+        finishSchema();
+        final RelationTypeIndex rindex = mgmt.getRelationIndex(mgmt.getRelationType("rating"), "ratingByTime");
+        assertEquals(SchemaStatus.ENABLED, rindex.getIndexStatus());
+        assertThrows(UnsupportedOperationException.class, () -> mgmt.updateIndex(rindex, SchemaAction.REMOVE_STALE_ENTRIES));
+        mgmt.rollback();
+        mgmt = graph.openManagement();
     }
 
     @Tag(TestCategory.BRITTLE_TESTS)
@@ -2292,9 +2918,9 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
 
         newTx();
 
-        v1 = tx.getVertex(v1.longId());
+        v1 = tx.getVertex(v1.id());
         v1.property("name", "name2"); //Ensure that the old index record gets removed
-        v2 = tx.getVertex(v2.longId());
+        v2 = tx.getVertex(v2.id());
         v2.property("uid", 512); //Ensure that replacement is allowed
 
         newTx();
@@ -2322,7 +2948,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertEquals("knows", e.value(LABEL_NAME));
         assertEquals(BaseVertexLabel.DEFAULT_VERTEXLABEL.name(), v.value(LABEL_NAME));
         assertCount(1, v.query().direction(Direction.BOTH).labels("knows").has(ID_NAME, eid).edges());
-        assertCount(0, v.query().direction(Direction.BOTH).labels("knows").has(ID_NAME, RelationIdentifier.get(new long[]{4, 5, 6, 7})).edges());
+        assertCount(0, v.query().direction(Direction.BOTH).labels("knows").has(ID_NAME, RelationIdentifier.get(new Object[]{4L, 5L, 6L, 7L})).edges());
         assertCount(1, v.query().direction(Direction.BOTH).labels("knows").has("~nid", eid.getRelationId()).edges());
         assertCount(0, v.query().direction(Direction.BOTH).labels("knows").has("~nid", 110111).edges());
         //Test edge retrieval
@@ -2330,7 +2956,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertEquals(eid, getE(graph, eid).id());
         //Test adjacent constraint
         assertEquals(1, v.query().direction(BOTH).has("~adjacent", u.id()).edgeCount());
-        assertCount(1, v.query().direction(BOTH).has("~adjacent", (int) getId(u)).edges());
+        assertCount(1, v.query().direction(BOTH).has("~adjacent", getId(u)).edges());
         try {
             //Not a valid vertex
             assertCount(0, v.query().direction(BOTH).has("~adjacent", 110111).edges());
@@ -2338,6 +2964,242 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         } catch (IllegalArgumentException ignored) {
         }
 
+    }
+
+    @Test
+    public void testEdgesOfAVertexHasIdWithin() {
+        JanusGraphVertex v = graph.addVertex(), u = graph.addVertex(), w = graph.addVertex();
+        Edge e1 = v.addEdge("knows", u);
+        Edge e2 = v.addEdge("knows", u);
+        Edge e3 = v.addEdge("knows", w);
+        Edge e4 = u.addEdge("knows", v);
+        Edge other = u.addEdge("knows", w);
+
+        assertEdgesOfAVertexHasIdWithin(graph.traversal(), v, e1, e2, e3, e4, other);
+        graph.tx().commit();
+        assertEdgesOfAVertexHasIdWithin(graph.traversal(), v, e1, e2, e3, e4, other);
+    }
+
+    private void assertEdgesOfAVertexHasIdWithin(GraphTraversalSource g, Vertex v, Edge e1, Edge e2, Edge e3, Edge e4,
+                                                 Edge other) {
+        RelationIdentifier missing = RelationIdentifier.get(new Object[]{4L, 5L, 6L, 7L});
+
+        assertEquals(ImmutableSet.of(e1.id()), g.V(v).bothE().hasId(e1.id()).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id()), g.V(v).bothE().hasId(P.within(e1.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()), g.V(v).outE().hasId(P.within(e1.id(), e2.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()),
+            g.V(v).outE("knows").hasId(P.within(e1.id(), e2.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id()), g.V(v).outE().hasId(P.within(e1.id(), e4.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e4.id()), g.V(v).inE().hasId(P.within(e1.id(), e4.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e4.id()), g.V(v).bothE().hasId(P.within(e1.id(), e4.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id()), g.V(v).bothE().hasId(P.within(e1.id(), e1.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()),
+            g.V(v).bothE().hasId(P.within(e1.id().toString(), e2.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e3.id()), g.V(v).bothE().hasId(P.within(e3.id(), other.id(), missing)).id().toSet());
+        assertEquals(ImmutableSet.of(), g.V(v).bothE().hasId(P.within(other.id(), missing)).id().toSet());
+        assertEquals(ImmutableSet.of(), g.V(v).bothE().hasId(P.within()).id().toSet());
+
+        assertEquals(ImmutableSet.of(e3.id(), e4.id()), g.V(v).bothE().hasId(P.without(e1.id(), e2.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e2.id(), e3.id()), g.V(v).outE().hasId(P.without(e1.id(), e4.id())).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e2.id(), e3.id(), e4.id()),
+            g.V(v).bothE().hasId(P.without(other.id(), missing)).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e2.id(), e3.id(), e4.id()),
+            g.V(v).bothE().hasId(P.without()).id().toSet());
+
+        //Several ids or a collection of them, which TinkerPop turns into within
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()), g.V(v).bothE().hasId(e1.id(), e2.id()).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()),
+            g.V(v).bothE().hasId(Arrays.asList(e1.id(), e2.id())).id().toSet());
+        //Connective predicates, each of whose predicates compares ids
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()),
+            g.V(v).bothE().hasId(P.eq(e1.id()).or(P.eq(e2.id()))).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e2.id(), e3.id()),
+            g.V(v).bothE().hasId(P.within(e1.id(), e2.id()).or(P.eq(e3.id()))).id().toSet());
+        assertEquals(ImmutableSet.of(e1.id(), e3.id()),
+            g.V(v).bothE().hasId(P.within(e1.id(), e2.id(), e3.id()).and(P.without(e2.id()))).id().toSet());
+    }
+
+    @Test
+    public void testEdgesOfAVertexHasIdWithinOnSortKeyAndConstrainedLabels() {
+        PropertyKey time = mgmt.makePropertyKey("time").dataType(Integer.class).make();
+        ((StandardEdgeLabelMaker) mgmt.makeEdgeLabel("rated")).sortKey(time).make();
+        mgmt.makeEdgeLabel("manager").multiplicity(Multiplicity.MANY2ONE).make();
+        finishSchema();
+
+        JanusGraphVertex v = graph.addVertex(), u = graph.addVertex(), w = graph.addVertex();
+        Edge rated1 = v.addEdge("rated", u, "time", 1);
+        Edge rated2 = v.addEdge("rated", u, "time", 2);
+        Edge rated3 = v.addEdge("rated", w, "time", 2);
+        Edge manager = v.addEdge("manager", w);
+        graph.tx().commit();
+
+        GraphTraversalSource g = graph.traversal();
+        assertEquals(ImmutableSet.of(rated1.id(), rated3.id()),
+            g.V(v).outE("rated").hasId(P.within(rated1.id(), rated3.id())).id().toSet());
+        assertEquals(ImmutableSet.of(rated3.id()),
+            g.V(v).outE("rated").has("time", 2).hasId(P.within(rated1.id(), rated3.id())).id().toSet());
+        assertEquals(ImmutableSet.of(rated2.id()),
+            g.V(v).outE("rated").hasId(P.without(rated1.id(), rated3.id())).id().toSet());
+        assertEquals(ImmutableSet.of(manager.id()),
+            g.V(v).outE("manager").hasId(P.within(manager.id(), rated1.id())).id().toSet());
+        assertEquals(ImmutableSet.of(), g.V(v).outE("manager").hasId(P.without(manager.id())).id().toSet());
+        assertEquals(ImmutableSet.of(rated2.id(), manager.id()),
+            g.V(v).outE("rated", "manager").hasId(P.within(rated2.id(), manager.id())).id().toSet());
+    }
+
+    //With an adjacent vertex, the ids of the edges of a label of several edges between two vertices are part of the
+    //columns which the query reads, so a collection of them narrows the read itself
+    @Test
+    public void testEdgesOfAVertexToAnAdjacentVertexHasIdWithin() {
+        JanusGraphVertex v = graph.addVertex(), u = graph.addVertex(), w = graph.addVertex();
+        JanusGraphEdge e1 = v.addEdge("knows", u);
+        JanusGraphEdge e2 = v.addEdge("knows", u);
+        JanusGraphEdge e3 = v.addEdge("knows", w);
+        graph.tx().commit();
+
+        assertEquals(ImmutableSet.of(e1.id()), edgeIds(v.query().adjacent(u).direction(OUT).labels("knows")
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e1.id(), e3.id())).edges()));
+        assertEquals(ImmutableSet.of(e2.id()), edgeIds(v.query().adjacent(u).direction(OUT).labels("knows")
+            .has(ID_NAME, Contain.NOT_IN, ImmutableList.of(e1.id(), e3.id())).edges()));
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()), edgeIds(v.query().adjacent(u).direction(BOTH).labels("knows")
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e1.id(), e2.id(), e3.id())).edges()));
+    }
+
+    //Conditions on the same key of a vertex-centric query narrow each other, also where they narrow its read
+    @Test
+    public void testConditionsOnTheSameKeyOfAVertexCentricQueryNarrowEachOther() {
+        PropertyKey time = mgmt.makePropertyKey("time").dataType(Integer.class).make();
+        ((StandardEdgeLabelMaker) mgmt.makeEdgeLabel("rated")).sortKey(time).make();
+        mgmt.makePropertyKey("payload").dataType(byte[].class).make();
+        mgmt.makePropertyKey("any").dataType(Object.class).make();
+        finishSchema();
+
+        JanusGraphVertex v = graph.addVertex(), u = graph.addVertex();
+        JanusGraphEdge e1 = v.addEdge("knows", u, "payload", new byte[]{1});
+        JanusGraphEdge e2 = v.addEdge("knows", u, "any", 2L);
+        JanusGraphEdge e3 = v.addEdge("knows", u);
+        for (int i = 1; i <= 3; i++) {
+            v.addEdge("rated", u, "time", i);
+        }
+        graph.tx().commit();
+
+        assertEquals(ImmutableSet.of(e2.id()), edgeIds(v.query().adjacent(u).direction(OUT).labels("knows")
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e1.id(), e2.id()))
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e2.id(), e3.id())).edges()));
+        assertEquals(ImmutableSet.of(e2.id()), edgeIds(v.query().adjacent(u).direction(OUT).labels("knows")
+            .has(ID_NAME, new AndJanusPredicate(Arrays.asList(Contain.IN, Contain.IN)),
+                Arrays.asList(ImmutableList.of(e1.id(), e2.id()), ImmutableList.of(e2.id(), e3.id()))).edges()));
+        assertEquals(ImmutableSet.of(), edgeIds(v.query().adjacent(u).direction(OUT).labels("knows")
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e1.id()))
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e3.id())).edges()));
+
+        GraphTraversalSource g = graph.traversal();
+        assertEquals(ImmutableList.of(2),
+            g.V(v).outE("rated").has("time", P.within(1, 2)).has("time", P.within(2, 3)).values("time").toList());
+        assertEquals(ImmutableList.of(2),
+            g.V(v).outE("rated").has("time", P.gt(1)).has("time", P.within(1, 2)).values("time").toList());
+        assertEquals(ImmutableList.of(2),
+            g.V(v).outE("rated").has("time", P.within(1, 2)).has("time", P.gt(1)).values("time").toList());
+
+        //Arrays are equal by their contents, as the conditions compare them, not by identity
+        assertEquals(ImmutableSet.of(e1.id()), edgeIds(v.query().labels("knows")
+            .has("payload", Contain.IN, Arrays.asList(new byte[]{1}, new byte[]{2}))
+            .has("payload", Contain.IN, Arrays.asList(new byte[]{1}, new byte[]{3})).edges()));
+        assertEquals(ImmutableSet.of(e1.id()), edgeIds(v.query().labels("knows")
+            .has("payload", new byte[]{1}).has("payload", new byte[]{1}).edges()));
+
+        //The values of a key of any type may be numbers of different types, which the conditions compare
+        assertEquals(ImmutableSet.of(e2.id()), edgeIds(v.query().labels("knows")
+            .has("any", Cmp.GREATER_THAN, 1).has("any", Contain.IN, Arrays.asList(2L, 3L)).edges()));
+        assertEquals(ImmutableSet.of(e2.id()), edgeIds(v.query().labels("knows")
+            .has("any", Contain.IN, Arrays.asList(2L, 3L)).has("any", Cmp.GREATER_THAN, 1).edges()));
+        assertEquals(ImmutableSet.of(e2.id()), edgeIds(v.query().labels("knows")
+            .has("any", Cmp.GREATER_THAN, 1).has("any", Cmp.LESS_THAN, 5L).edges()));
+    }
+
+    //A branch of a disjunction which no value satisfies, such as within() of nothing, leaves the other branches, and a
+    //disjunction of such branches alone is satisfied by none
+    @Test
+    public void testDisjunctionsOfConditionsWithBranchesWhichNothingSatisfies() {
+        PropertyKey time = mgmt.makePropertyKey("time").dataType(Integer.class).make();
+        ((StandardEdgeLabelMaker) mgmt.makeEdgeLabel("rated")).sortKey(time).make();
+        mgmt.makePropertyKey("name").dataType(String.class).make();
+        finishSchema();
+
+        JanusGraphVertex v = graph.addVertex("name", "a"), u = graph.addVertex("name", "b");
+        Edge e1 = v.addEdge("knows", u);
+        Edge e2 = v.addEdge("knows", u);
+        v.addEdge("rated", u, "time", 1);
+        v.addEdge("rated", u, "time", 2);
+        graph.tx().commit();
+
+        GraphTraversalSource g = graph.traversal();
+        assertEquals(ImmutableSet.of(), g.V(v).outE().hasId(P.within().or(P.within())).id().toSet());
+        assertEquals(ImmutableSet.of(e2.id()),
+            g.V(v).outE().hasId(P.within().and(P.eq(e1.id())).or(P.eq(e2.id()))).id().toSet());
+        assertEquals(ImmutableSet.of(e2.id()),
+            g.V(v).outE().hasId(P.eq(e2.id()).or(P.within().and(P.eq(e1.id())))).id().toSet());
+
+        assertEquals(ImmutableList.of(), g.V(v).outE("rated").has("time", P.within().or(P.within())).toList());
+        assertEquals(ImmutableList.of(2),
+            g.V(v).outE("rated").has("time", P.within().and(P.eq(1)).or(P.eq(2))).values("time").toList());
+
+        assertEquals(ImmutableList.of(), g.V().has("name", P.within().or(P.within())).toList());
+        assertEquals(ImmutableList.of("b"),
+            g.V().has("name", P.within().and(P.eq("a")).or(P.eq("b"))).values("name").toList());
+        assertEquals(ImmutableList.of("b"),
+            g.V().has("name", P.eq("b").or(P.within().and(P.eq("a")))).values("name").toList());
+    }
+
+    @Test
+    public void testPropertiesOfAVertexHasIdWithin() {
+        mgmt.makePropertyKey("nickname").dataType(String.class).cardinality(Cardinality.LIST).make();
+        finishSchema();
+
+        JanusGraphVertex v = graph.addVertex();
+        VertexProperty<?> a = v.property(VertexProperty.Cardinality.list, "nickname", "a");
+        VertexProperty<?> b = v.property(VertexProperty.Cardinality.list, "nickname", "b");
+        VertexProperty<?> c = v.property(VertexProperty.Cardinality.list, "nickname", "c");
+        graph.tx().commit();
+
+        GraphTraversalSource g = graph.traversal();
+        assertEquals(ImmutableSet.of("a", "c"),
+            g.V(v).properties("nickname").hasId(P.within(a.id(), c.id())).value().toSet());
+        assertEquals(ImmutableSet.of("b"),
+            g.V(v).properties("nickname").hasId(P.without(a.id(), c.id())).value().toSet());
+        assertEquals(ImmutableSet.of("a", "b"), g.V(v).properties().hasId(a.id(), b.id()).value().toSet());
+    }
+
+    @Test
+    public void testVertexCentricQueryHasIdCollection() {
+        JanusGraphVertex v = graph.addVertex(), u = graph.addVertex();
+        JanusGraphEdge e1 = v.addEdge("knows", u);
+        JanusGraphEdge e2 = v.addEdge("knows", u);
+        JanusGraphEdge e3 = v.addEdge("knows", u);
+        graph.tx().commit();
+
+        assertEquals(ImmutableSet.of(e1.id(), e2.id()), edgeIds(v.query().direction(OUT)
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e1, e2.id().toString())).edges()));
+        assertEquals(ImmutableSet.of(e3.id()), edgeIds(v.query().direction(OUT)
+            .has(ID_NAME, Contain.NOT_IN, ImmutableList.of(e1.id(), e2.id())).edges()));
+        assertEquals(ImmutableSet.of(e3.id()), edgeIds(u.query().direction(IN).labels("knows")
+            .has(ID_NAME, Contain.IN, ImmutableList.of(e3.id())).edges()));
+        assertEquals(ImmutableSet.of(), edgeIds(v.query().direction(OUT)
+            .has(ID_NAME, Contain.IN, ImmutableList.of()).edges()));
+
+        //An id which isn't one, among several or alone
+        IllegalArgumentException invalid = assertThrows(IllegalArgumentException.class,
+            () -> v.query().has(ID_NAME, Contain.IN, ImmutableList.of(e1.id(), "notAnEdgeId")));
+        assertTrue(invalid.getMessage().contains("notAnEdgeId"), invalid::getMessage);
+        //A predicate other than within and without compares one id, not a collection of them
+        assertThrows(IllegalArgumentException.class,
+            () -> v.query().has(ID_NAME, Cmp.EQUAL, ImmutableList.of(e1.id(), e2.id())));
+    }
+
+    private static Set<Object> edgeIds(Iterable<JanusGraphEdge> edges) {
+        final Set<Object> ids = new HashSet<>();
+        edges.forEach(edge -> ids.add(edge.id()));
+        return ids;
     }
 
     @Test
@@ -2439,9 +3301,9 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         graph.tx().commit();
 
         VertexProperty prop = v1.properties().next();
-        assertTrue(getId(prop) > 0);
+        assertTrue(((JanusGraphVertexProperty<?>) prop).longId() > 0);
         prop = (VertexProperty) ((Iterable) graph.multiQuery(v1).properties().values().iterator().next()).iterator().next();
-        assertTrue(getId(prop) > 0);
+        assertTrue(((JanusGraphVertexProperty<?>) prop).longId() > 0);
 
         assertEquals(45, e3.<Integer>value("time").intValue());
         assertEquals(5, e1.<Integer>value("time").intValue());
@@ -2564,7 +3426,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         graph.tx().commit();
 
         JanusGraphVertexProperty p = (JanusGraphVertexProperty) cartman.properties().next();
-        assertTrue((p.longId()) > 0);
+        assertTrue(p.longId() > 0);
         graph.tx().commit();
     }
 
@@ -2984,8 +3846,8 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         /*
          ==== check fork, no fork behavior
          */
-        long e1id = getId(e1);
-        long e2id = getId(e2);
+        Object e1id = getId(e1);
+        Object e2id = getId(e2);
         e1 = Iterables.getOnlyElement(v1.query().direction(Direction.OUT).labels("connect").edges());
         assertEquals("e1", e1.value("name"));
         assertEquals(e1id, getId(e1));
@@ -3012,7 +3874,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
          === check cross transaction
          */
         final Random random = new Random();
-        final long[] vertexIds = {getId(v1), getId(v2), getId(v3)};
+        final Object[] vertexIds = {getId(v1), getId(v2), getId(v3)};
         //1) Index uniqueness
         executeLockConflictingTransactionJobs(graph, new TransactionJob() {
             private int pos = 0;
@@ -3119,7 +3981,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
 
         JanusGraphVertex baseV = tx.addVertex("name", "base");
         newTx();
-        final long baseVid = getId(baseV);
+        final Object baseVid = getId(baseV);
         final String nameA = "a", nameB = "b";
         final int parallelThreads = 4;
 
@@ -3274,17 +4136,17 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
 
         clopen();
 
-        long[] vertexIdSubset = new long[31 - 3];
-        for (int i = 0; i < vertexIdSubset.length; i++) vertexIdSubset[i] = vs[i + 3].longId();
+        Object[] vertexIdSubset = new Object[31 - 3];
+        for (int i = 0; i < vertexIdSubset.length; i++) vertexIdSubset[i] = vs[i + 3].id();
         Arrays.sort(vertexIdSubset);
 
         //##################################################
         //Queries from Cache
         //##################################################
         clopen();
-        for (int i = 1; i < noVertices; i++) vs[i] = getV(tx, vs[i].longId());
-        v = getV(tx, v.longId());
-        u = getV(tx, u.longId());
+        for (int i = 1; i < noVertices; i++) vs[i] = getV(tx, vs[i].id());
+        v = getV(tx, v.id());
+        u = getV(tx, u.id());
         qvs = new JanusGraphVertex[]{vs[6], vs[9], vs[12], vs[15], vs[60]};
 
         //To trigger queries from cache (don't copy!!!)
@@ -3413,9 +4275,9 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         //Same queries as above but without memory loading (i.e. omitting the first query)
         //##################################################
         clopen();
-        for (int i = 1; i < noVertices; i++) vs[i] = getV(tx, vs[i].longId());
-        v = getV(tx, v.longId());
-        u = getV(tx, u.longId());
+        for (int i = 1; i < noVertices; i++) vs[i] = getV(tx, vs[i].id());
+        v = getV(tx, v.id());
+        u = getV(tx, u.id());
         qvs = new JanusGraphVertex[]{vs[6], vs[9], vs[12], vs[15], vs[60]};
 
         assertEquals(10, Iterables.size(v.query().labels("connect").limit(10).vertices()));
@@ -3555,13 +4417,34 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         //Test partially new vertex queries
         final JanusGraphVertex[] qvs2 = new JanusGraphVertex[qvs.length + 2];
         qvs2[0] = tx.addVertex();
-        for (int i = 0; i < qvs.length; i++) qvs2[i + 1] = getV(tx, qvs[i].longId());
+        for (int i = 0; i < qvs.length; i++) qvs2[i + 1] = getV(tx, qvs[i].id());
         qvs2[qvs2.length - 1] = tx.addVertex();
         qvs2[0].addEdge("connect", qvs2[qvs2.length - 1]);
         qvs2[qvs2.length - 1].addEdge("connect", qvs2[0]);
         results = tx.multiQuery(qvs2).direction(IN).labels("connect").edges();
         for (final Iterable<JanusGraphEdge> result : results.values()) assertEquals(1, Iterables.size(result));
 
+    }
+
+    @Test
+    public void shouldBeAbleToIterateManagementIterablesMultipleTimes() {
+        EdgeLabel child = mgmt.makeEdgeLabel("child").multiplicity(Multiplicity.ONE2MANY).make();
+
+        Iterable<VertexLabel> vertexLabels = mgmt.getVertexLabels();
+        vertexLabels.iterator();
+        vertexLabels.iterator();
+
+        Iterable<JanusGraphIndex> graphIndexes = mgmt.getGraphIndexes(Vertex.class);
+        graphIndexes.iterator();
+        graphIndexes.iterator();
+
+        Iterable<EdgeLabel> relationTypes = mgmt.getRelationTypes(EdgeLabel.class);
+        relationTypes.iterator();
+        relationTypes.iterator();
+
+        Iterable<RelationTypeIndex> relationTypeIndices = mgmt.getRelationIndexes(child);
+        relationTypeIndices.iterator();
+        relationTypeIndices.iterator();
     }
 
     @Test
@@ -3987,6 +4870,209 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertEquals(1, g.V(next).values("name").toList().size());
     }
 
+    /**
+     * An edge-by-id lookup for a label whose schema vertex is not yet visible must not leave that label with a
+     * cached empty definition once it becomes visible. The lookup here races the label's creation: the id is assigned
+     * when the label is made, but its schema row is only written when the creating transaction commits.
+     */
+    @Test
+    public void testEdgeByIdLookupBeforeLabelIsVisibleDoesNotPoisonSchemaCache() {
+        JanusGraphVertex a = graph.addVertex();
+        JanusGraphVertex b = graph.addVertex();
+        graph.tx().commit();
+        Object aId = a.id();
+        Object bId = b.id();
+
+        JanusGraphTransaction creator = graph.newTransaction();
+        EdgeLabel knows = creator.makeEdgeLabel("knows").multiplicity(Multiplicity.SIMPLE).make();
+
+        JanusGraphTransaction reader = graph.newTransaction();
+        RelationIdentifier notYetVisible = new RelationIdentifier(aId, knows.longId(), 1L, bId);
+        assertFalse(reader.getEdges(notYetVisible).iterator().hasNext());
+        reader.rollback();
+
+        creator.getVertex(aId).addEdge("knows", creator.getVertex(bId));
+        creator.commit();
+
+        newTx();
+        assertEquals(Multiplicity.SIMPLE, tx.getEdgeLabel("knows").multiplicity());
+        assertCount(1, tx.getVertex(aId).query().direction(Direction.OUT).labels("knows").edges());
+        assertEquals(1, tx.traversal().V(aId).outE().count().next());
+        RelationIdentifier eid = (RelationIdentifier) Iterables.getOnlyElement(tx.getVertex(aId).query().labels("knows").edges()).id();
+        assertEquals(eid, Iterables.getOnlyElement(tx.getEdges(eid)).id());
+        // malformed type ids resolve to "no edge" as before: a negative one, and one with valid type bits that lies
+        // outside the schema id range
+        assertFalse(tx.getEdges(new RelationIdentifier(aId, -knows.longId(), 1L, bId)).iterator().hasNext());
+        long typeBits = knows.longId() & ((1L << IDManager.MAX_PADDING_BITWIDTH) - 1);
+        long outOfRange = ((Long.MAX_VALUE >>> IDManager.MAX_PADDING_BITWIDTH) << IDManager.MAX_PADDING_BITWIDTH) | typeBits;
+        assertFalse(tx.getEdges(new RelationIdentifier(aId, outOfRange, 1L, bId)).iterator().hasNext());
+    }
+
+    /**
+     * Definition edges written by ordinary transactions (here connection constraints auto-created under
+     * schema.constraints=true) must be visible to later transactions on the same instance: the second edge must
+     * find the constraint the first one created instead of creating another copy.
+     */
+    @Test
+    public void testAutoCreatedConnectionConstraintIsSeenByLaterTransactions() {
+        clopen(option(SCHEMA_CONSTRAINTS), true);
+        mgmt.makeVertexLabel("person").make();
+        mgmt.makeEdgeLabel("knows").make();
+        finishSchema();
+
+        for (int i = 0; i < 3; i++) {
+            JanusGraphTransaction t = graph.newTransaction();
+            JanusGraphVertex p1 = t.addVertex("person");
+            JanusGraphVertex p2 = t.addVertex("person");
+            p1.addEdge("knows", p2);
+            t.commit();
+        }
+
+        assertEquals(1, mgmt.getEdgeLabel("knows").mappedConnections().size());
+        assertEquals(1, mgmt.getVertexLabel("person").mappedConnections().size());
+    }
+
+    /**
+     * A transaction which was already open when another one committed a definition edge (here a connection constraint
+     * auto-created under schema.constraints=true) must not keep acting on the definition edges it had loaded: adding
+     * the same kind of edge, it must find the constraint instead of creating a second copy.
+     */
+    @Test
+    public void testAutoCreatedConnectionConstraintIsSeenByTransactionsOpenAtCommit() {
+        clopen(option(SCHEMA_CONSTRAINTS), true);
+        mgmt.makeVertexLabel("person").make();
+        mgmt.makeEdgeLabel("knows").make();
+        finishSchema();
+
+        final JanusGraphTransaction open = graph.newTransaction();
+        assertTrue(open.getVertexLabel("person").mappedConnections().isEmpty());
+
+        final JanusGraphTransaction creator = graph.newTransaction();
+        creator.addVertex("person").addEdge("knows", creator.addVertex("person"));
+        creator.commit();
+
+        open.addVertex("person").addEdge("knows", open.addVertex("person"));
+        open.commit();
+
+        final JanusGraphManagement check = graph.openManagement();
+        try {
+            assertEquals(1, check.getEdgeLabel("knows").mappedConnections().size());
+            assertEquals(1, check.getVertexLabel("person").mappedConnections().size());
+        } finally {
+            check.rollback();
+        }
+    }
+
+    /**
+     * A transaction which had read a relation type's consistency before a management commit changed it must read the
+     * new consistency afterwards: the commit resets the type in the open transactions, and that has to clear the
+     * consistency the type had cached as well.
+     */
+    @Test
+    public void testConsistencyChangeIsSeenByTransactionsOpenAtCommit() {
+        mgmt.makePropertyKey("uid").dataType(String.class).make();
+        finishSchema();
+
+        final JanusGraphTransaction open = graph.newTransaction();
+        try {
+            assertEquals(ConsistencyModifier.DEFAULT,
+                ((InternalRelationType) open.getPropertyKey("uid")).getConsistencyModifier());
+
+            mgmt.setConsistency(mgmt.getPropertyKey("uid"), ConsistencyModifier.LOCK);
+            mgmt.commit();
+
+            assertEquals(ConsistencyModifier.LOCK,
+                ((InternalRelationType) open.getPropertyKey("uid")).getConsistencyModifier());
+        } finally {
+            open.rollback();
+        }
+    }
+
+    /**
+     * Replacing a consistency modifier removes the old modifier vertex. A transaction which had read the old
+     * consistency holds that vertex, and the commit must leave it alone there: it has no definition left to reload,
+     * and reloading it would fail inside the commit's finally block. The transaction reads the new consistency.
+     */
+    @Test
+    public void testConsistencyChangeReplacingAModifierIsSeenByTransactionsOpenAtCommit() {
+        final EdgeLabel knows = mgmt.makeEdgeLabel("knows").multiplicity(Multiplicity.MULTI).make();
+        mgmt.setConsistency(knows, ConsistencyModifier.LOCK);
+        finishSchema();
+
+        final JanusGraphTransaction open = graph.newTransaction();
+        try {
+            assertEquals(ConsistencyModifier.LOCK,
+                ((InternalRelationType) open.getEdgeLabel("knows")).getConsistencyModifier());
+
+            mgmt.setConsistency(mgmt.getEdgeLabel("knows"), ConsistencyModifier.FORK);
+            mgmt.commit();
+
+            assertEquals(ConsistencyModifier.FORK,
+                ((InternalRelationType) open.getEdgeLabel("knows")).getConsistencyModifier());
+        } finally {
+            open.rollback();
+        }
+    }
+
+    /**
+     * Definition edges which an ordinary transaction commits on one instance (here a connection constraint
+     * auto-created under schema.constraints=true) must reach the schema cache of another instance. Otherwise that
+     * instance keeps serving the definition edges it had cached, and adding the same kind of edge there creates a
+     * second copy of the constraint.
+     */
+    //A message whose write takes longer than the read lag is missed, as for testIndexUpdatesWithReindexAndRemove
+    @RepeatedIfExceptionsTest(repeats = 3)
+    public void testAutoCreatedConnectionConstraintReachesOtherInstances() throws InterruptedException {
+        //The read lag is left at its default of 500 ms: the test waits for the message anyway, and a shorter lag
+        //would miss it more easily
+        clopen(option(SCHEMA_CONSTRAINTS), true,
+            option(LOG_SEND_DELAY, MANAGEMENT_LOG), Duration.ZERO,
+            option(LOG_READ_INTERVAL, MANAGEMENT_LOG), Duration.ofMillis(250));
+        mgmt.makeVertexLabel("person").make();
+        mgmt.makeEdgeLabel("knows").make();
+        finishSchema();
+
+        //Opened from the same configuration, which sets no instance id, so the second instance gets one of its own
+        final StandardJanusGraph graph2 = (StandardJanusGraph) JanusGraphFactory.open(config);
+        try {
+            //The second instance caches the vertex label's connections while there are none
+            JanusGraphTransaction tx2 = graph2.newTransaction();
+            assertTrue(tx2.getVertexLabel("person").mappedConnections().isEmpty());
+            tx2.rollback();
+
+            //An ordinary transaction on this instance auto-creates the connection
+            final JanusGraphTransaction creator = graph.newTransaction();
+            creator.addVertex("person").addEdge("knows", creator.addVertex("person"));
+            creator.commit();
+
+            //The second instance learns about it from the management log
+            final long deadline = System.currentTimeMillis() + 30000;
+            int connections;
+            do {
+                Thread.sleep(100);
+                tx2 = graph2.newTransaction();
+                connections = tx2.getVertexLabel("person").mappedConnections().size();
+                tx2.rollback();
+            } while (connections == 0 && System.currentTimeMillis() < deadline);
+            assertEquals(1, connections);
+
+            //...and adding the same kind of edge there does not create a second copy
+            tx2 = graph2.newTransaction();
+            tx2.addVertex("person").addEdge("knows", tx2.addVertex("person"));
+            tx2.commit();
+        } finally {
+            graph2.close();
+        }
+
+        //Read fresh here as well, since this instance's own commit expired the label
+        final JanusGraphManagement check = graph.openManagement();
+        try {
+            assertEquals(1, check.getVertexLabel("person").mappedConnections().size());
+        } finally {
+            check.rollback();
+        }
+    }
+
     private void createStrictSchemaForVertexProperties() {
         clopen(option(AUTO_TYPE), "none", option(SCHEMA_CONSTRAINTS), true);
         VertexLabel label = mgmt.makeVertexLabel("user").make();
@@ -4201,6 +5287,38 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         }
     }
 
+    @Test
+    public void testEdgeLabelMappedConnectionsSharingOutVertexLabel() {
+        VertexLabel transaction = mgmt.makeVertexLabel("transaction").make();
+        VertexLabel person = mgmt.makeVertexLabel("person").make();
+        VertexLabel entity = mgmt.makeVertexLabel("entity").make();
+        VertexLabel account = mgmt.makeVertexLabel("account").make();
+        EdgeLabel from = mgmt.makeEdgeLabel("from").make();
+        mgmt.addConnection(from, person, transaction);
+        mgmt.addConnection(from, entity, transaction);
+        EdgeLabel to = mgmt.makeEdgeLabel("to").make();
+        mgmt.addConnection(to, transaction, person);
+        mgmt.addConnection(to, transaction, entity);
+        mgmt.addConnection(to, transaction, account);
+        //Each connection once, also before the schema is committed: three connections sharing their outgoing vertex
+        //label came nine times
+        assertEquals(3, to.mappedConnections().size());
+        finishSchema();
+
+        assertEquals(Arrays.asList("entity->transaction", "person->transaction"),
+            connections(mgmt.getEdgeLabel("from")));
+        assertEquals(Arrays.asList("transaction->account", "transaction->entity", "transaction->person"),
+            connections(mgmt.getEdgeLabel("to")));
+    }
+
+    //The connections of the edge label as outgoing->incoming vertex label names, in alphabetical order
+    private static List<String> connections(EdgeLabel label) {
+        return label.mappedConnections().stream()
+            .map(c -> c.getOutgoingVertexLabel().name() + "->" + c.getIncomingVertexLabel().name())
+            .sorted()
+            .collect(Collectors.toList());
+    }
+
     private void createStrictSchemaForConnections() {
         clopen(option(AUTO_TYPE), "none", option(SCHEMA_CONSTRAINTS), true);
         VertexLabel user = mgmt.makeVertexLabel("user").make();
@@ -4325,83 +5443,225 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertThrows(IllegalArgumentException.class, () -> v1.addEdge("E1", v4));
     }
 
+    @Test
+    public void testAddingAConnectionTwiceInATransactionWritesItOnce() {
+        VertexLabel person = mgmt.makeVertexLabel("person").make();
+        VertexLabel company = mgmt.makeVertexLabel("company").make();
+        EdgeLabel worksAt = mgmt.makeEdgeLabel("worksAt").make();
+        mgmt.addConnection(worksAt, person, company);
+        mgmt.addConnection(worksAt, person, company);
+        //The connection is found once, also before the schema is committed
+        assertEquals(1, worksAt.mappedConnections().size());
+        assertEquals(1, person.mappedConnections().size());
+        finishSchema();
+
+        assertEquals(1, mgmt.getEdgeLabel("worksAt").mappedConnections().size());
+        assertEquals(1, mgmt.getVertexLabel("person").mappedConnections().size());
+    }
+
+    @Test
+    public void testAddingACommittedConnectionAgainWritesNothing() {
+        mgmt.addConnection(mgmt.makeEdgeLabel("worksAt").make(), mgmt.makeVertexLabel("person").make(),
+            mgmt.makeVertexLabel("company").make());
+        finishSchema();
+
+        mgmt.addConnection(mgmt.getEdgeLabel("worksAt"), mgmt.getVertexLabel("person"),
+            mgmt.getVertexLabel("company"));
+        finishSchema();
+
+        assertEquals(1, mgmt.getEdgeLabel("worksAt").mappedConnections().size());
+        assertEquals(1, mgmt.getVertexLabel("person").mappedConnections().size());
+        //A connection from a vertex label to itself as well
+        mgmt.addConnection(mgmt.getEdgeLabel("worksAt"), mgmt.getVertexLabel("person"),
+            mgmt.getVertexLabel("person"));
+        finishSchema();
+        mgmt.addConnection(mgmt.getEdgeLabel("worksAt"), mgmt.getVertexLabel("person"),
+            mgmt.getVertexLabel("person"));
+        finishSchema();
+
+        assertEquals(2, mgmt.getEdgeLabel("worksAt").mappedConnections().size());
+        assertEquals(2, mgmt.getVertexLabel("person").mappedConnections().size());
+    }
+
+    /**
+     * An edge label finds its connections through the outgoing vertex labels it links to: the connections of an edge
+     * label which share an outgoing vertex label link to it once.
+     */
+    @Test
+    public void testConnectionsWhichShareTheirOutgoingVertexLabelLinkToItOnce() {
+        VertexLabel transfer = mgmt.makeVertexLabel("transfer").make();
+        EdgeLabel to = mgmt.makeEdgeLabel("to").make();
+        for (String name : new String[]{"person", "company", "account"}) {
+            mgmt.addConnection(to, transfer, mgmt.makeVertexLabel(name).make());
+        }
+        assertEquals(1, Iterables.size(((JanusGraphSchemaVertex) to).getEdges(
+            TypeDefinitionCategory.UPDATE_CONNECTION_EDGE, Direction.OUT)));
+        finishSchema();
+
+        assertEquals(1, Iterables.size(((JanusGraphSchemaVertex) mgmt.getEdgeLabel("to")).getEdges(
+            TypeDefinitionCategory.UPDATE_CONNECTION_EDGE, Direction.OUT)));
+    }
+
+    /**
+     * An ordinary transaction which adds several edges of a connection it creates under schema.constraints=true checks
+     * the connections of the committed schema each time, which don't hold it yet, and creates the connection once.
+     */
+    @Test
+    public void testAutoCreatedConnectionConstraintIsWrittenOnceByATransaction() {
+        clopen(option(SCHEMA_CONSTRAINTS), true);
+        mgmt.makeVertexLabel("person").make();
+        mgmt.makeEdgeLabel("knows").make();
+        finishSchema();
+
+        final JanusGraphTransaction t = graph.newTransaction();
+        for (int i = 0; i < 3; i++) {
+            t.addVertex("person").addEdge("knows", t.addVertex("person"));
+        }
+        t.commit();
+
+        assertEquals(1, mgmt.getEdgeLabel("knows").mappedConnections().size());
+        assertEquals(1, mgmt.getVertexLabel("person").mappedConnections().size());
+    }
+
+    @Test
+    public void testAddingAPropertyWhichALabelHasWritesNothing() {
+        VertexLabel person = mgmt.makeVertexLabel("person").make();
+        EdgeLabel knows = mgmt.makeEdgeLabel("knows").make();
+        PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).make();
+        PropertyKey since = mgmt.makePropertyKey("since").dataType(Integer.class).make();
+        mgmt.addProperties(person, name);
+        mgmt.addProperties(person, name, name);
+        mgmt.addProperties(knows, since);
+        mgmt.addProperties(knows, since);
+        //Each property is found once, also before the schema is committed
+        assertEquals(Collections.singletonList(name), new ArrayList<>(person.mappedProperties()));
+        assertEquals(Collections.singletonList(since), new ArrayList<>(knows.mappedProperties()));
+        finishSchema();
+
+        //A call of one key, and of several keys: one of which the label has, and one which it doesn't have, twice
+        mgmt.addProperties(mgmt.getVertexLabel("person"), mgmt.getPropertyKey("name"));
+        mgmt.addProperties(mgmt.getVertexLabel("person"), mgmt.getPropertyKey("name"),
+            mgmt.makePropertyKey("age").dataType(Integer.class).make());
+        mgmt.addProperties(mgmt.getEdgeLabel("knows"), mgmt.getPropertyKey("since"));
+        final PropertyKey weight = mgmt.makePropertyKey("weight").dataType(Double.class).make();
+        mgmt.addProperties(mgmt.getEdgeLabel("knows"), weight, weight);
+        finishSchema();
+
+        assertEquals(Arrays.asList("age", "name"), mgmt.getVertexLabel("person").mappedProperties().stream()
+            .map(PropertyKey::name).sorted().collect(Collectors.toList()));
+        assertEquals(Arrays.asList("since", "weight"), mgmt.getEdgeLabel("knows").mappedProperties().stream()
+            .map(PropertyKey::name).sorted().collect(Collectors.toList()));
+    }
+
+    /**
+     * An ordinary transaction which adds a property to several vertices and edges under schema.constraints=true checks
+     * the properties of the committed schema each time, which don't hold it yet, and adds the property to the label
+     * once.
+     */
+    @Test
+    public void testAutoCreatedPropertyConstraintsAreWrittenOnceByATransaction() {
+        clopen(option(SCHEMA_CONSTRAINTS), true);
+        mgmt.makeVertexLabel("person").make();
+        mgmt.makeEdgeLabel("knows").make();
+        mgmt.makePropertyKey("name").dataType(String.class).make();
+        mgmt.makePropertyKey("since").dataType(Integer.class).make();
+        finishSchema();
+
+        final JanusGraphTransaction t = graph.newTransaction();
+        for (int i = 0; i < 3; i++) {
+            t.addVertex(T.label, "person", "name", "n" + i).addEdge("knows", t.addVertex("person"), "since", i);
+        }
+        t.commit();
+
+        assertEquals(1, mgmt.getVertexLabel("person").mappedProperties().size());
+        assertEquals(1, mgmt.getEdgeLabel("knows").mappedProperties().size());
+    }
+
+    /**
+     * A read-only transaction can't add a connection or property, also not one which the schema has already: the
+     * write access is checked before the schema is.
+     */
+    @Test
+    public void testAddingAConstraintWhichTheSchemaHasFailsInAReadOnlyTransaction() {
+        VertexLabel person = mgmt.makeVertexLabel("person").make();
+        PropertyKey name = mgmt.makePropertyKey("name").dataType(String.class).make();
+        PropertyKey age = mgmt.makePropertyKey("age").dataType(Integer.class).make();
+        mgmt.addConnection(mgmt.makeEdgeLabel("knows").make(), person, person);
+        mgmt.addProperties(person, name, age);
+        finishSchema();
+
+        final JanusGraphTransaction readOnly = graph.buildTransaction().readOnly().start();
+        try {
+            final VertexLabel readPerson = readOnly.getVertexLabel("person");
+            assertThrows(ReadOnlyTransactionException.class,
+                () -> readOnly.addConnection(readOnly.getEdgeLabel("knows"), readPerson, readPerson));
+            assertThrows(ReadOnlyTransactionException.class,
+                () -> readOnly.addProperties(readPerson, readOnly.getPropertyKey("name")));
+            assertThrows(ReadOnlyTransactionException.class, () -> readOnly.addProperties(readPerson,
+                readOnly.getPropertyKey("name"), readOnly.getPropertyKey("age")));
+        } finally {
+            readOnly.rollback();
+        }
+    }
+
+    /**
+     * Renaming an edge label renames each of its connection edges, also the copies of a connection which an earlier
+     * JanusGraph version wrote when the connection was added more than once.
+     */
+    @Test
+    public void testRenamingAnEdgeLabelRenamesEachCopyOfItsConnections() {
+        clopen(option(AUTO_TYPE), "none", option(SCHEMA_CONSTRAINTS), true);
+        VertexLabel v1 = mgmt.makeVertexLabel("V1").make();
+        VertexLabel v2 = mgmt.makeVertexLabel("V2").make();
+        EdgeLabel e1 = mgmt.makeEdgeLabel("E1").make();
+        //Two copies of the connection and of the edge label's link to V1, as earlier versions wrote them
+        final StandardJanusGraphTx schemaTx = ((ManagementSystem) mgmt).getWrappedTx();
+        for (int i = 0; i < 2; i++) {
+            schemaTx.addSchemaEdge(v1, v2, TypeDefinitionCategory.CONNECTION_EDGE, "E1");
+            schemaTx.addSchemaEdge(e1, v1, TypeDefinitionCategory.UPDATE_CONNECTION_EDGE, null);
+        }
+        finishSchema();
+
+        mgmt.changeName(mgmt.getEdgeLabel("E1"), "E2");
+        finishSchema();
+
+        final Collection<Connection> connections = mgmt.getVertexLabel("V1").mappedConnections();
+        assertEquals(2, connections.size());
+        for (Connection connection : connections) {
+            assertEquals("E2", connection.getEdgeLabel());
+        }
+        tx.addVertex("V1").addEdge("E2", tx.addVertex("V2"));
+    }
+
 
     private boolean isSortedByID(VertexList vl) {
         for (int i = 1; i < vl.size(); i++) {
-            if (vl.getID(i - 1) > vl.getID(i)) return false;
+            if (IDUtils.compare(vl.getID(i - 1), vl.getID(i)) > 0) return false;
         }
         return true;
     }
 
-    public static void evaluateQuery(JanusGraphVertexQuery query, RelationCategory resultType,
-                                     int expectedResults, int numSubQueries, boolean[] subQuerySpecs) {
-        evaluateQuery(query, resultType, expectedResults, numSubQueries, subQuerySpecs, ImmutableMap.of());
-    }
+    @Test
+    public void testSimpleJsonSchemaImportFromProperty() throws IOException, BackendException {
+        ClassLoader loader = Thread.currentThread().getContextClassLoader();
+        InputStream resourceStream = loader.getResourceAsStream("test_simple_schema_example.json");
+        String jsonSchemaExample = IOUtils.toString(resourceStream, StandardCharsets.UTF_8.name());
 
-    public static void evaluateQuery(JanusGraphVertexQuery query, RelationCategory resultType,
-                                     int expectedResults, int numSubQueries, boolean[] subQuerySpecs,
-                                     PropertyKey orderKey, Order order) {
-        evaluateQuery(query, resultType, expectedResults, numSubQueries, subQuerySpecs, ImmutableMap.of(orderKey, order));
-    }
+        Map<String, Object> extraConfig = new HashMap<>();
+        extraConfig.put(SCHEMA_INIT_STRATEGY.toStringWithoutRoot(), SchemaInitType.JSON.getConfigName());
+        extraConfig.put(SCHEMA_DROP_BEFORE_INIT.toStringWithoutRoot(), true);
+        extraConfig.put(SCHEMA_INIT_JSON_STR.toStringWithoutRoot(), jsonSchemaExample);
+        extraConfig.put(SCHEMA_INIT_JSON_INDICES_ACTIVATION_TYPE.toStringWithoutRoot(), IndicesActivationType.REINDEX_AND_ENABLE_UPDATED_ONLY.getConfigName());
+        clopenNoDelimiterUsage(extraConfig, true);
 
-
-    public static void evaluateQuery(JanusGraphVertexQuery query, RelationCategory resultType,
-                                     int expectedResults, int numSubQueries, boolean[] subQuerySpecs,
-                                     Map<PropertyKey, Order> orderMap) {
-        SimpleQueryProfiler profiler = new SimpleQueryProfiler();
-        ((BasicVertexCentricQueryBuilder) query).profiler(profiler);
-
-        Iterable<? extends JanusGraphElement> result;
-        switch (resultType) {
-            case PROPERTY:
-                result = query.properties();
-                break;
-            case EDGE:
-                result = query.edges();
-                break;
-            case RELATION:
-                result = query.relations();
-                break;
-            default:
-                throw new AssertionError();
-        }
-        OrderList orders = profiler.getAnnotation(QueryProfiler.ORDERS_ANNOTATION);
-
-        //Check elements and that they are returned in the correct order
-        int no = 0;
-        JanusGraphElement previous = null;
-        for (JanusGraphElement e : result) {
-            assertNotNull(e);
-            no++;
-            if (previous != null && !orders.isEmpty()) {
-                assertTrue(orders.compare(previous, e) <= 0);
-            }
-            previous = e;
-        }
-        assertEquals(expectedResults, no);
-
-        //Check OrderList of query
-        assertNotNull(orders);
-        assertEquals(orderMap.size(), orders.size());
-        for (int i = 0; i < orders.size(); i++) {
-            assertEquals(orderMap.get(orders.getKey(i)), orders.getOrder(i));
-        }
-        for (PropertyKey key : orderMap.keySet()) assertTrue(orders.containsKey(key));
-
-        //Check subqueries
-        assertEquals(Integer.valueOf(1), profiler.getAnnotation(QueryProfiler.NUMVERTICES_ANNOTATION));
-        int subQueryCounter = 0;
-        for (SimpleQueryProfiler subProfiler : profiler) {
-            assertNotNull(subProfiler);
-            if (subProfiler.getGroupName().equals(QueryProfiler.OPTIMIZATION)) continue;
-            if (subQuerySpecs.length == 2) { //0=>fitted, 1=>ordered
-                assertEquals(subQuerySpecs[0], subProfiler.getAnnotation(QueryProfiler.FITTED_ANNOTATION));
-                assertEquals(subQuerySpecs[1], subProfiler.getAnnotation(QueryProfiler.ORDERED_ANNOTATION));
-            }
-            //assertEquals(1,Iterables.size(subProfiler)); This only applies if a disk call is necessary
-            subQueryCounter++;
-        }
-        assertEquals(numSubQueries, subQueryCounter);
+        assertEquals(Long.class, mgmt.getPropertyKey("time").dataType());
+        assertEquals(Double.class, mgmt.getPropertyKey("doubleProp").dataType());
+        assertEquals(Cardinality.LIST, mgmt.getPropertyKey("longPropCardinalityList").cardinality());
+        assertEquals("organization", mgmt.getVertexLabel("organization").name());
+        assertEquals(Multiplicity.SIMPLE, mgmt.getEdgeLabel("connects").multiplicity());
+        assertTrue(mgmt.getEdgeLabel("connects").isDirected());
+        assertEquals(Multiplicity.MULTI, mgmt.getEdgeLabel("viewed").multiplicity());
+        assertTrue(mgmt.getEdgeLabel("viewed").isUnidirected());
     }
 
     @Test
@@ -4431,14 +5691,14 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
     public void testRemoveCachedVertexVisibility() {
         // add vertices to hit limit of tx-cache-size
         int cacheSize = graph.getConfiguration().getTxVertexCacheSize();
-        List<Long> vertexIds = new ArrayList<>();
+        List<Object> vertexIds = new ArrayList<>();
         for (int i = 0 ; i < cacheSize; i++) {
             JanusGraphVertex vertex = graph.addVertex();
-            vertexIds.add(vertex.longId());
+            vertexIds.add(vertex.id());
         }
 
         // add one more vertex that will be evicted from tx cache on read
-        long vertexIdToBeDeleted = graph.addVertex().longId();
+        Object vertexIdToBeDeleted = graph.addVertex().id();
         graph.tx().commit();
 
         // retrieve the vertex and delete it
@@ -4579,15 +5839,336 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
     }
 
     @Test
+    public void testLimitBatchSizeForMultiQueryRepeatStep() {
+        final int barrierSize = 50;
+        final int limit = 135;
+        final int levelVerticesAmount = 3;
+        final int depth = 6;
+
+        final JanusGraphVertex a = graph.addVertex();
+        a.property("depth", Integer.MAX_VALUE);
+        a.property("localAddedVertexNumber", 1);
+        a.property("levelVertexNumber", 1);
+        a.property("parentNumber", -1);
+        Map<Integer, Integer> levelToNumberOfVertices = new HashMap<>();
+        addTestAdjacentVertices(a,  levelVerticesAmount, depth, levelToNumberOfVertices);
+        graph.tx().commit();
+
+        TraversalMetrics profile;
+
+        // repeat until with outer barrier steps
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).repeat(__.barrier(barrierSize).out("knows").barrier(barrierSize)).until(__.out("knows").has("depth", "3")).count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 2);
+
+        // repeat until with local barrier step
+        profile = testLimitedBatch(() -> graph.traversal().V(a).repeat(__.barrier(barrierSize).out("knows").barrier(barrierSize)).until(__.barrier(barrierSize).out("knows").has("depth", "3")).count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 2);
+
+        // repeat emit. Test early abort with limit
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).repeat(__.out("knows").barrier(barrierSize)).emit(__.out("knows")).limit(limit).count());
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile);
+
+        // repeat emit with unlimited barrier steps (unlimited batches)
+        profile = testLimitedBatch(() -> graph.traversal().V(a).repeat(__.out("knows")).emit(__.out("knows").hasId(P.neq(-100L))).count(),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true, option(LIMITED_BATCH_SIZE), Integer.MAX_VALUE);
+        assertTrue(countBackendQueriesOfSize(s -> s > barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, Integer.MAX_VALUE, profile);
+
+        // until repeat
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).until(__.out("knows").has("depth", "3")).repeat(__.out("knows").barrier(barrierSize)).count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 2);
+
+        // emit repeat
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).emit().repeat(__.out("knows").barrier(barrierSize)).count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile);
+
+        // repeat emit
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).repeat(__.out("knows").barrier(barrierSize)).emit().count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile);
+
+        // repeat emit(predicate)
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).repeat(__.out("knows").barrier(barrierSize)).emit(__.out("knows").has("depth", "3")).count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 2);
+
+        // emit(predicate) repeat
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).emit(__.in("knows").has("depth", "3")).repeat(__.out("knows").barrier(barrierSize)).count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 3);
+
+        // until repeat emit(predicate).
+        // Since TinkerPop 3.8 a repeat traversal which contains a barrier receives all traversers of a loop at once,
+        // so this case is batched per loop as well (before TinkerPop 3.8 it was using batches per iteration).
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).until(__.in("knows").has("depth", "3")).repeat(__.out("knows").barrier(barrierSize)).emit(__.in("knows").has("depth", "3")).count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile);
+
+        // until emit(predicate) repeat
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).until(__.in("knows").has("depth", "3")).emit(__.in("knows").has("depth", "3")).repeat(__.out("knows").barrier(barrierSize)).count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 2);
+
+        // emit(predicate) repeat until
+        // Since TinkerPop 3.8 a repeat traversal which contains a barrier receives all traversers of a loop at once,
+        // so this case is batched per loop as well (before TinkerPop 3.8 it was using batches per iteration).
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).emit(__.in("knows").has("depth", "3")).repeat(__.out("knows").barrier(barrierSize)).until(__.in("knows").has("depth", "3")).count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 3);
+
+        // repeat emit(predicate) until
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).repeat(__.out("knows").barrier(barrierSize)).emit(__.in("knows").has("depth", "3")).until(__.in("knows").has("depth", "3")).count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 3);
+
+        // until repeat emit
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).until(__.in("knows").has("depth", "3")).repeat(__.out("knows").barrier(barrierSize)).emit().count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 3);
+
+        // until emit repeat
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).until(__.in("knows").has("depth", "3")).emit().repeat(__.out("knows").barrier(barrierSize)).count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 3);
+
+        // emit repeat until
+        // Since TinkerPop 3.8 a repeat traversal which contains a barrier receives all traversers of a loop at once,
+        // so this case is batched per loop as well (before TinkerPop 3.8 it was using batches per iteration).
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).emit().repeat(__.out("knows").barrier(barrierSize)).until(__.in("knows").has("depth", "3")).count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 3);
+
+        // repeat emit until
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).repeat(__.out("knows").barrier(barrierSize)).emit().until(__.in("knows").has("depth", "3")).count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 3);
+
+        // MultiQueriable inside multi-query compatible parent which is inside repeat step
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize).repeat(__.union(__.out("knows"), __.<Vertex>where(__.in("knows")).discard()).barrier(barrierSize)).emit().count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertEquals(0, countBackendQueriesOfSize(s -> s > barrierSize * levelVerticesAmount, profile.getMetrics()));
+        assertTrue(countBackendQueriesOfSize(levelVerticesAmount, profile.getMetrics()) <= 2);
+        assertTrue(countBackendQueriesOfSize(levelVerticesAmount * levelVerticesAmount, profile.getMetrics()) <= 2);
+        assertEquals(2, countBackendQueriesOfSize((long) Math.pow(levelVerticesAmount, 3), profile.getMetrics()));
+
+        // repeat start step of union
+        profile = testLimitedBatch(() -> graph.traversal().V(a).out("knows").barrier(barrierSize).union(__.repeat(__.out("knows").barrier(barrierSize)).emit(), __.identity()).count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 2);
+
+        // Multi-nested repeat tests
+
+        // double nested repeat
+        profile = testLimitedBatch(() -> graph.traversal().V(a).repeat(__.repeat(__.barrier(barrierSize).out("knows").barrier(barrierSize))).emit().count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 2);
+
+        // repeat in until
+        profile = testLimitedBatch(() -> graph.traversal().V(a).repeat(__.barrier(barrierSize).out("knows").barrier(barrierSize)).until(__.out("knows").has("depth", "3")).emit().count());
+        assertTrue(countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()) > 0);
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 3);
+
+        clopen(option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true);
+        Vertex[] middleVertices = graph.traversal().V(a).repeat(__.out("knows")).times(depth/2+1).toList().toArray(new Vertex[0]);;
+
+        // Repeat step mode: CLOSEST_REPEAT_PARENT. multi-nested `repeat` start steps. Early drop.
+        // Since TinkerPop 3.8 a repeat traversal which contains a barrier receives all traversers of a loop at once, so the
+        // first iteration of the nested `repeat` prefetches a whole batch of the outer barrier instead of a single vertex.
+        profile = testLimitedBatch(() -> graph.traversal().V((Object[]) middleVertices).barrier(barrierSize).repeat(__.barrier(barrierSize).union(__.repeat(__.out("knows").barrier(barrierSize)).until(__.identity())).barrier(barrierSize)).until(__.identity()).limit(1),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true, option(REPEAT_STEP_BATCH_MODE), MultiQueryStrategyRepeatStepMode.CLOSEST_REPEAT_PARENT.getConfigName());
+        assertEquals(1,countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()));
+        assertEquals(0,countBackendQueriesOfSize(s -> s != barrierSize * levelVerticesAmount, profile.getMetrics()));
+
+        // Repeat step mode: ALL_REPEAT_PARENTS. multi-nested `repeat` start steps. Early drop.
+        profile = testLimitedBatch(() -> graph.traversal().V((Object[]) middleVertices).barrier(barrierSize).repeat(__.barrier(barrierSize).union(__.repeat(__.out("knows").barrier(barrierSize)).until(__.identity())).barrier(barrierSize)).until(__.identity()).limit(1),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true, option(REPEAT_STEP_BATCH_MODE), MultiQueryStrategyRepeatStepMode.ALL_REPEAT_PARENTS.getConfigName());
+        assertEquals(1,countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()));
+        assertEquals(0,countBackendQueriesOfSize(s -> s < barrierSize * levelVerticesAmount, profile.getMetrics()));
+
+        // Repeat step mode: STARTS_ONLY_OF_ALL_REPEAT_PARENTS. multi-nested `repeat` start steps. Early drop.
+        profile = testLimitedBatch(() -> graph.traversal().V((Object[]) middleVertices).barrier(barrierSize).repeat(__.barrier(barrierSize).union(__.repeat(__.out("knows").barrier(barrierSize)).until(__.identity())).barrier(barrierSize)).until(__.identity()).limit(1),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true, option(REPEAT_STEP_BATCH_MODE), MultiQueryStrategyRepeatStepMode.STARTS_ONLY_OF_ALL_REPEAT_PARENTS.getConfigName());
+        assertEquals(1,countBackendQueriesOfSize(barrierSize * levelVerticesAmount, profile.getMetrics()));
+        assertEquals(0,countBackendQueriesOfSize(s -> s < barrierSize * levelVerticesAmount, profile.getMetrics()));
+
+        // Repeat step mode: ALL_REPEAT_PARENTS. multi-nested `repeat` start steps. Most outer repeat step next iteration registering new vertices.
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize)
+                .repeat(__.<Vertex>barrier(1)
+                    .repeat(__.out("knows").barrier(barrierSize)).until(__.identity().loops().is(P.gt(0))).barrier(barrierSize)
+                ).until(__.identity().loops().is(P.gt(1))),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true, option(REPEAT_STEP_BATCH_MODE), MultiQueryStrategyRepeatStepMode.ALL_REPEAT_PARENTS.getConfigName());
+        assertEquals(1,countBackendQueriesOfSize(levelVerticesAmount, profile.getMetrics()));
+        assertEquals(1,countBackendQueriesOfSize(levelVerticesAmount*levelVerticesAmount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(s -> s > levelVerticesAmount*levelVerticesAmount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(s -> s < levelVerticesAmount, profile.getMetrics()));
+
+        // Repeat step mode: STARTS_ONLY_OF_ALL_REPEAT_PARENTS. multi-nested `repeat` start steps. Most outer repeat step next iteration not registering new vertices.
+        // Since TinkerPop 3.8 a repeat traversal which contains a barrier receives all traversers of a loop at once (the
+        // `barrier(1)` no longer feeds them one by one), so all vertices of the second loop are prefetched together by
+        // the nested `repeat` even though the most outer `repeat` does not register them for the next iteration.
+        profile = testLimitedBatch(() -> graph.traversal().V(a).barrier(barrierSize)
+                .repeat(__.<Vertex>barrier(1)
+                    .repeat(__.out("knows").barrier(barrierSize)).until(__.identity().loops().is(P.gt(0))).barrier(barrierSize)
+                ).until(__.identity().loops().is(P.gt(1))),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true, option(REPEAT_STEP_BATCH_MODE), MultiQueryStrategyRepeatStepMode.STARTS_ONLY_OF_ALL_REPEAT_PARENTS.getConfigName());
+        assertEquals(1,countBackendQueriesOfSize(levelVerticesAmount, profile.getMetrics()));
+        assertEquals(1,countBackendQueriesOfSize(levelVerticesAmount*levelVerticesAmount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(s -> s > levelVerticesAmount*levelVerticesAmount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(s -> s < levelVerticesAmount, profile.getMetrics()));
+    }
+
+    private void assertRepeatBatchSizeByLoop(int depth, int levelVerticesAmount, int barrierSize, TraversalMetrics profile){
+        assertRepeatBatchSizeByLoop(depth, levelVerticesAmount, barrierSize, profile, 1);
+    }
+
+    private void assertRepeatBatchSizeByLoop(int depth, int levelVerticesAmount, int barrierSize, TraversalMetrics profile, int uniqueBatchRequestsAmount){
+        int calculatedMaxReturnSize;
+        try{
+            calculatedMaxReturnSize = Math.multiplyExact(levelVerticesAmount, barrierSize);
+        } catch (Exception e){
+            calculatedMaxReturnSize = Integer.MAX_VALUE;
+        }
+        final int maxReturnSize = calculatedMaxReturnSize;
+        int currentReturnSize = 1;
+        int currentLoop = 0;
+        while (currentReturnSize < maxReturnSize && currentLoop <= depth){
+            final long queries = countBackendQueriesOfSize(currentReturnSize, profile.getMetrics());
+            assertTrue(queries <= uniqueBatchRequestsAmount * 2, "Expected at most " + uniqueBatchRequestsAmount * 2 +
+                " backend queries of size " + currentReturnSize + " but found " + queries + ". Backend query sizes: " + backendQuerySizes(profile.getMetrics()));
+            currentReturnSize*=levelVerticesAmount;
+            ++currentLoop;
+        }
+        assertEquals(0, countBackendQueriesOfSize(s -> s > maxReturnSize, profile.getMetrics()),
+            "Expected no backend queries larger than " + maxReturnSize + ". Backend query sizes: " + backendQuerySizes(profile.getMetrics()));
+    }
+
+    /**
+     * Returns the sizes of all backend queries of the given metrics mapped to the number of queries of that size.
+     */
+    private Map<Long, Long> backendQuerySizes(Collection<? extends Metrics> metrics) {
+        final Map<Long, Long> sizes = new TreeMap<>();
+        for (Metrics m : metrics) {
+            if (m.getName().equals("backend-query")) {
+                for (Long count : m.getCounts().values()) {
+                    sizes.merge(count, 1L, Long::sum);
+                }
+            }
+            backendQuerySizes(m.getNested()).forEach((size, count) -> sizes.merge(size, count, Long::sum));
+        }
+        return sizes;
+    }
+
+    private void addTestAdjacentVertices(Vertex vertex, int levelVerticesAmount, int depth, Map<Integer, Integer> levelToNumberOfVertices){
+        if(depth<0){
+            return;
+        }
+        int addedVertices = 0;
+        Integer parentNumber = vertex.value("levelVertexNumber");
+        for (int i = 0; i < levelVerticesAmount; ++i) {
+            Vertex adjacentVertex = graph.addVertex();
+            adjacentVertex.property("foo", "bar");
+            adjacentVertex.property("depth", depth);
+            adjacentVertex.property("localAddedVertexNumber", ++addedVertices);
+            levelToNumberOfVertices.put(depth, levelToNumberOfVertices.getOrDefault(depth, 0) + 1);
+            adjacentVertex.property("levelVertexNumber", levelToNumberOfVertices.get(depth));
+            adjacentVertex.property("parentNumber", parentNumber);
+            vertex.addEdge("knows", adjacentVertex);
+            addTestAdjacentVertices(adjacentVertex, levelVerticesAmount, depth-1, levelToNumberOfVertices);
+        }
+    }
+
+    @Test
+    public void testLimitBatchSizeForMultiQueryMultiCardinalityProperties() {
+        JanusGraphVertex[] cs = setupDataForMultiQueryMultiCardinalityProperties();
+        int barrierSize = 27;
+        // test batching for `values()`
+        TraversalMetrics profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo", "setProperty", "listProperty"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize + barrierSize * 4 + barrierSize * 4, profile.getMetrics()));
+        int lastBatch = cs.length - 3 * barrierSize;
+        assertEquals(1, countBackendQueriesOfSize(lastBatch + lastBatch * 4 + lastBatch * 4, profile.getMetrics()));
+    }
+
+    @Test
+    public void testMultiQueryPropertiesWithLimit() {
+        JanusGraphVertex[] cs = setupDataForMultiQueryMultiCardinalityProperties();
+        clopen(option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true, option(PROPERTY_PREFETCHING), false);
+        verityMultiQueryPropertiesWithLimit(cs);
+    }
+
+    protected void verityMultiQueryPropertiesWithLimit(JanusGraphVertex[] cs){
+        cs = graph.traversal().V(cs).toList().toArray(new JanusGraphVertex[0]);
+
+        for(String[] keys : Arrays.asList(new String[]{"foo", "fooBar", "barFoo"}, new String[]{"foo"}, new String[]{"fooBar"}, new String[]{"barFoo"})){
+
+            Map<JanusGraphVertex, Iterable<JanusGraphVertexProperty>> properties = graph.multiQuery(cs[0], cs[1], cs[3]).limit(1).keys(keys).properties();
+            Map<JanusGraphVertex, Map<String, Object>> deserializedProperties = new HashMap<>();
+
+            Assertions.assertEquals(3, properties.size());
+
+            properties.forEach((janusGraphVertex, janusGraphVertexProperties) -> {
+                Map<String, Object> props = new HashMap<>();
+                janusGraphVertexProperties.forEach(janusGraphVertexProperty -> {
+                    ((ArrayList) props.computeIfAbsent(janusGraphVertexProperty.key(), k -> new ArrayList<>())).add(janusGraphVertexProperty.value());
+                });
+                deserializedProperties.put(janusGraphVertex, props);
+            });
+
+            for(Map<String, Object> vertexProps : deserializedProperties.values()){
+                int numOfValues = 0;
+                for(Object val : vertexProps.values()){
+                    numOfValues+= ((List) val).size();
+                }
+                Assertions.assertEquals(1, numOfValues);
+            }
+        }
+    }
+
+    protected JanusGraphVertex[] setupDataForMultiQueryMultiCardinalityProperties(){
+        mgmt.makeVertexLabel("testVertex").make();
+        mgmt.makePropertyKey("setProperty").cardinality(Cardinality.SET).dataType(String.class).make();
+        mgmt.makePropertyKey("listProperty").cardinality(Cardinality.LIST).dataType(String.class).make();
+        finishSchema();
+        int numV = 100;
+        JanusGraphVertex[] cs = new JanusGraphVertex[numV];
+        for (int i = 0; i < numV; ++i) {
+            cs[i] = graph.addVertex("testVertex");
+            cs[i].property("foo", "bar");
+            cs[i].property("fooBar", "Bar");
+            cs[i].property("barFoo", "Foo");
+            cs[i].property(VertexProperty.Cardinality.set, "setProperty", "setValue1");
+            cs[i].property(VertexProperty.Cardinality.set, "setProperty", "setValue2");
+            cs[i].property(VertexProperty.Cardinality.set, "setProperty", "setValue3");
+            cs[i].property(VertexProperty.Cardinality.set, "setProperty", "setValue4");
+            cs[i].property(VertexProperty.Cardinality.list, "listProperty", "listValue1");
+            cs[i].property(VertexProperty.Cardinality.list, "listProperty", "listValue2");
+            cs[i].property(VertexProperty.Cardinality.list, "listProperty", "listValue3");
+            cs[i].property(VertexProperty.Cardinality.list, "listProperty", "listValue4");
+        }
+        return cs;
+    }
+
+    @Test
     public void testLimitBatchSizeForMultiQuery() {
+        mgmt.makeVertexLabel("testVertex").make();
+        finishSchema();
         int numV = 100;
         JanusGraphVertex a = graph.addVertex();
         JanusGraphVertex[] bs = new JanusGraphVertex[numV];
         JanusGraphVertex[] cs = new JanusGraphVertex[numV];
         for (int i = 0; i < numV; ++i) {
             bs[i] = graph.addVertex();
-            cs[i] = graph.addVertex();
+            cs[i] = graph.addVertex("testVertex");
             cs[i].property("foo", "bar");
+            cs[i].property("fooBar", "Bar");
+            cs[i].property("barFoo", "Foo");
             a.addEdge("knows", bs[i]);
             bs[i].addEdge("knows", cs[i]);
         }
@@ -4595,75 +6176,1287 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         int barrierSize = 27;
         int limit = 40;
 
+        TraversalMetrics profile;
+
+        testLimitBatchSizeForHasStep(numV, barrierSize, limit, bs, cs);
+        testLimitBatchSizeForPropertySteps(numV, barrierSize, limit, cs);
+        testLimitBatchSizeForLabelStep(numV, barrierSize, limit, bs, cs);
+
         // test batching for `out()`
-        Supplier<GraphTraversal<?, ?>> traversal = () -> graph.traversal().V(bs).barrier(barrierSize).out();
-        assertEqualResultWithAndWithoutLimitBatchSize(traversal);
-        clopen(option(USE_MULTIQUERY), true, option(LIMIT_BATCH_SIZE), true);
-        TraversalMetrics profile = traversal.get().profile().next();
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).out());
         assertEquals(3, countBackendQueriesOfSize(barrierSize * 2, profile.getMetrics()));
         assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 2, profile.getMetrics()));
 
         // test early abort with limit for `out()`
-        traversal = () -> graph.traversal().V(bs).barrier(barrierSize).out().limit(limit);
-        assertEqualResultWithAndWithoutLimitBatchSize(traversal);
-        clopen(option(USE_MULTIQUERY), true, option(LIMIT_BATCH_SIZE), true);
-        profile = traversal.get().profile().next();
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).out().limit(limit));
         assertEquals((int) Math.ceil((double) limit / barrierSize), countBackendQueriesOfSize(barrierSize * 2, profile.getMetrics()));
 
-        // test batching for `values()`
-        traversal = () -> graph.traversal().V(cs).barrier(barrierSize).values("foo");
-        assertEqualResultWithAndWithoutLimitBatchSize(traversal);
-        clopen(option(USE_MULTIQUERY), true, option(LIMIT_BATCH_SIZE), true);
-        profile = traversal.get().profile().next();
-        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
-        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
-
-        // test early abort with limit for `values()`
-        traversal = () -> graph.traversal().V(cs).barrier(barrierSize).values("foo").limit(limit);
-        assertEqualResultWithAndWithoutLimitBatchSize(traversal);
-        clopen(option(USE_MULTIQUERY), true, option(LIMIT_BATCH_SIZE), true);
-        profile = traversal.get().profile().next();
-        assertEquals((int) Math.ceil((double) limit / barrierSize), countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
-
         // test batching with unlimited batch size
-        traversal = () -> graph.traversal().V(bs).barrier(barrierSize).out();
-        assertEqualResultWithAndWithoutLimitBatchSize(traversal);
-        clopen(option(USE_MULTIQUERY), true, option(LIMIT_BATCH_SIZE), false);
-        profile = traversal.get().profile().next();
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).out(), option(USE_MULTIQUERY), true, option(LIMITED_BATCH), false);
         assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
         assertEquals(0, countBackendQueriesOfSize(barrierSize * 2, profile.getMetrics()));
         assertEquals(1, countBackendQueriesOfSize(bs.length * 2, profile.getMetrics()));
 
         // test nested VertexStep with unlimited batch size
-        traversal = () -> graph.traversal().V(bs).barrier(barrierSize).where(__.out());
-        assertEqualResultWithAndWithoutLimitBatchSize(traversal);
-        clopen(option(USE_MULTIQUERY), true, option(LIMIT_BATCH_SIZE), false);
-        profile = traversal.get().profile().next();
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).where(__.out()), option(USE_MULTIQUERY), true, option(LIMITED_BATCH), false);
         assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
         assertEquals(0, countBackendQueriesOfSize(barrierSize * 2, profile.getMetrics()));
         assertEquals(1, countBackendQueriesOfSize(bs.length * 2, profile.getMetrics()));
 
         // test nested VertexStep with non-nested barrier
-        traversal = () -> graph.traversal().V(bs).barrier(barrierSize).where(__.out());
-        assertEqualResultWithAndWithoutLimitBatchSize(traversal);
-        clopen(option(USE_MULTIQUERY), true, option(LIMIT_BATCH_SIZE), true);
-        profile = traversal.get().profile().next();
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).where(__.out()));
         assertEquals(3, countBackendQueriesOfSize(barrierSize * 2, profile.getMetrics()));
         assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 2, profile.getMetrics()));
 
+        // multi-query compatible parents usage
+
         // test batching with repeat step
-        traversal = () -> graph.traversal().V(a).repeat(__.barrier(barrierSize).out()).times(2);
-        assertEqualResultWithAndWithoutLimitBatchSize(traversal);
-        clopen(option(USE_MULTIQUERY), true, option(LIMIT_BATCH_SIZE), true);
-        profile = traversal.get().profile().next();
+        profile = testLimitedBatch(() -> graph.traversal().V(a).repeat(__.barrier(barrierSize).out()).times(2));
         assertEquals(3, countBackendQueriesOfSize(barrierSize * 2, profile.getMetrics()));
         assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 2, profile.getMetrics()));
+
+        // test batching for `out` step in `project` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).project("a", "b").by(__.id()).by(__.out("knows")));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `out` step in `choose` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).choose(__.hasId(P.gte(0L)), __.out("knows"), __.identity()));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `out` step in `coalesce` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).coalesce(__.out("knows"), __.identity()));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `out` step in `and` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).and(__.out("knows"), __.hasId(P.gte(0))));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `out` step in `or` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).or(__.out("knows"), __.hasId(P.gte(0))));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `out` step in `sideEffect` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).sideEffect(__.out("knows").sideEffect(Traverser::get)));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `out` step in `map` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).map(__.out("knows")));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `out` step in `where` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).where(__.out("knows")));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `out` step in `filter` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).filter(__.out("knows")));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `out` step in `optional` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).optional(__.out("knows")));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `out` step in `not` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).not(__.out("knows")));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `out` step in `union` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).union(__.identity(), __.out("knows")));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `out` step in `local` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).local(__.out("knows")));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `out` step in `group` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).group().by(__.out("knows").count()));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `out` step in `groupCount` parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).groupCount().by(__.out("knows")));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        testLimitBatchSizeForMultiQueryOfConnectiveSteps(bs, barrierSize, limit);
+    }
+
+    private void testLimitBatchSizeForPropertySteps(int numV, int barrierSize, int limit, JanusGraphVertex[] cs){
+        TraversalMetrics profile;
+
+        // Test required properties prefetching only
+
+        // test batching for `values()`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `values()`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals((int) Math.ceil((double) limit / barrierSize), countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+
+        // test batching for `values()` (enabled prefetching should not influence the query)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `values()` (enabled prefetching should not influence the query)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals((int) Math.ceil((double) limit / barrierSize), countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+
+        // test batching for `properties()` (enabled prefetching should not influence the query)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).properties("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `values()` (enabled prefetching should not influence the query)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).properties("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals((int) Math.ceil((double) limit / barrierSize), countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+
+        // test batching for `valueMap()`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `valueMap()`. Limit is going to be placed before valueMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used.
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(1, countBackendQueriesOfSize(limit, profile.getMetrics()));
+
+        // test batching for `valueMap()` (enabled prefetching should not influence the query)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `valueMap()`. Limit is going to be placed before valueMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used.
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(1, countBackendQueriesOfSize(limit, profile.getMetrics()));
+
+        // test batching for `propertyMap()` (enabled prefetching should not influence the query)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).propertyMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `propertyMap()`. Limit is going to be placed before propertyMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used.
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).propertyMap("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(1, countBackendQueriesOfSize(limit, profile.getMetrics()));
+
+        // test batching for `elementMap()`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).elementMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(6, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(2, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `elementMap()`. Limit is going to be placed before elementMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used.
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).elementMap("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(2, countBackendQueriesOfSize(limit, profile.getMetrics()));
+
+        // test batching for `elementMap()` (enabled prefetching should not influence the query)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).elementMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(6, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(2, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `elementMap()`. Limit is going to be placed before elementMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used.
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).elementMap("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(2, countBackendQueriesOfSize(limit, profile.getMetrics()));
+
+        // Test all properties prefetching
+
+        int propertiesCount = (int) (graph.traversal().V(cs).values().count().next() / numV);
+
+        // test batching for `values()` single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `values()` multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo", "fooBar"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `values()` single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(barrierSize*propertiesCount, profile.getMetrics()));
+        assertEquals((int) Math.ceil((double) limit / barrierSize), countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `values()` multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo", "fooBar").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals((int) Math.ceil((double) limit / barrierSize / 2), countBackendQueriesOfSize(barrierSize*propertiesCount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+
+        // test batching for `values()` (enabled prefetching should not influence the query). Single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `values()` (enabled prefetching should not influence the query). Multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo", "fooBar"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `values()` (enabled prefetching should not influence the query). single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(barrierSize*propertiesCount, profile.getMetrics()));
+        assertEquals((int) Math.ceil((double) limit / barrierSize), countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `values()` (enabled prefetching should not influence the query). multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo", "fooBar").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals((int) Math.ceil((double) limit / barrierSize / 2), countBackendQueriesOfSize(barrierSize*propertiesCount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+
+        // test batching for `properties()` (enabled prefetching should not influence the query). Single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).properties("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `properties()` (enabled prefetching should not influence the query). Multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).properties("foo", "fooBar"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `values()` (enabled prefetching should not influence the query). Single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).properties("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(barrierSize*propertiesCount, profile.getMetrics()));
+        assertEquals((int) Math.ceil((double) limit / barrierSize), countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `values()` (enabled prefetching should not influence the query). Multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).properties("foo", "fooBar").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals((int) Math.ceil((double) limit / barrierSize / 2), countBackendQueriesOfSize(barrierSize*propertiesCount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+
+        // test batching for `valueMap()`. Single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `valueMap()`. Multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap("foo", "fooBar"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+
+        // test early abort with limit for `valueMap()`. Limit is going to be placed before valueMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used. Single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(1, countBackendQueriesOfSize(limit, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(limit*propertiesCount, profile.getMetrics()));
+
+        // test early abort with limit for `valueMap()`. Limit is going to be placed before valueMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used. Multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap("foo", "fooBar").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(limit, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(limit*propertiesCount, profile.getMetrics()));
+
+        // test batching for `valueMap()` (enabled prefetching should not influence the query). Single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+
+        // test batching for `valueMap()` (enabled prefetching should not influence the query). Multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap("foo", "fooBar"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+
+        // test early abort with limit for `valueMap()`. Limit is going to be placed before valueMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used. Single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(1, countBackendQueriesOfSize(limit, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(limit*propertiesCount, profile.getMetrics()));
+
+        // test early abort with limit for `valueMap()`. Limit is going to be placed before valueMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used. Multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap("foo", "fooBar").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(limit, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(limit*propertiesCount, profile.getMetrics()));
+
+        // test batching for `propertyMap()` (enabled prefetching should not influence the query). Single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).propertyMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+
+        // test batching for `propertyMap()` (enabled prefetching should not influence the query). Multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).propertyMap("foo", "fooBar"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+
+        // test early abort with limit for `propertyMap()`. Limit is going to be placed before propertyMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used. Single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).propertyMap("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(1, countBackendQueriesOfSize(limit, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(limit*propertiesCount, profile.getMetrics()));
+
+        // test early abort with limit for `propertyMap()`. Limit is going to be placed before propertyMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used. Multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).propertyMap("foo", "fooBar").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(limit, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(limit*propertiesCount, profile.getMetrics()));
+
+        // test batching for `elementMap()`. Single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).elementMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(6, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(2, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+
+        // test batching for `elementMap()`. Multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).elementMap("foo", "fooBar"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+
+        // test early abort with limit for `elementMap()`. Limit is going to be placed before elementMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used. Single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).elementMap("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(limit*propertiesCount, profile.getMetrics()));
+        assertEquals(2, countBackendQueriesOfSize(limit, profile.getMetrics()));
+
+        // test early abort with limit for `elementMap()`. Limit is going to be placed before elementMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used. Multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).elementMap("foo", "fooBar").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(1, countBackendQueriesOfSize(limit*propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(limit, profile.getMetrics()));
+
+        // test batching for `elementMap()` (enabled prefetching should not influence the query). Single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).elementMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(6, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+        assertEquals(2, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `elementMap()` (enabled prefetching should not influence the query). Multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).elementMap("foo", "fooBar"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test early abort with limit for `elementMap()`. Limit is going to be placed before elementMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used. Single property
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).elementMap("foo").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(limit*propertiesCount, profile.getMetrics()));
+        assertEquals(2, countBackendQueriesOfSize(limit, profile.getMetrics()));
+
+        // test early abort with limit for `elementMap()`. Limit is going to be placed before elementMap.
+        // Thus, `barrier(barrierSize)` is ignored and instead the default barrier(2500) is used. Multiple properties
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).elementMap("foo", "fooBar").limit(limit),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(1, countBackendQueriesOfSize(limit*propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(limit, profile.getMetrics()));
+
+        // Should prefetch all properties with mode REQUIRED_PROPERTIES_ONLY and disabled PROPERTY_PREFETCHING when all properties are needed
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap(),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+
+        // Should prefetch all properties with mode REQUIRED_PROPERTIES_ONLY and enabled PROPERTY_PREFETCHING when all properties are needed
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap(),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+
+        // Test disabled properties preFetching mode
+
+        // test no batching used for `values()`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.NONE.getConfigName());
+        assertEquals(100, countBackendQueriesOfSize(s -> true, profile.getMetrics()));
+        assertNull(getLastStepMetrics(profile, JanusGraphPropertiesStep.class).getAnnotation("multi"));
+
+        // test no batching used for `values()` (enabled prefetching should not influence the query)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).values("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.NONE.getConfigName());
+        assertEquals(100, countOptimizationQueries(profile.getMetrics()));
+        assertNull(getLastStepMetrics(profile, JanusGraphPropertiesStep.class).getAnnotation("multi"));
+
+        // test no batching used for `properties()` (enabled prefetching should not influence the query)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).properties("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.NONE.getConfigName());
+        assertEquals(100, countBackendQueriesOfSize(s -> true, profile.getMetrics()));
+        assertNull(getLastStepMetrics(profile, JanusGraphPropertiesStep.class).getAnnotation("multi"));
+
+        // test no batching used for `properties()` (enabled prefetching should not influence the query)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).properties("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.NONE.getConfigName());
+        assertEquals(100, countOptimizationQueries(profile.getMetrics()));
+        assertNull(getLastStepMetrics(profile, JanusGraphPropertiesStep.class).getAnnotation("multi"));
+
+        // test no batching used for `valueMap()`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.NONE.getConfigName());
+        assertNull(getLastStepMetrics(profile, JanusGraphPropertyMapStep.class).getAnnotation("multi"));
+
+        // test no batching used for `valueMap()` (enabled prefetching should not influence the query)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.NONE.getConfigName());
+        assertNull(getLastStepMetrics(profile, JanusGraphPropertyMapStep.class).getAnnotation("multi"));
+
+        // test no batching used for `propertyMap()` (enabled prefetching should not influence the query)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).propertyMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.NONE.getConfigName());
+        assertNull(getLastStepMetrics(profile, JanusGraphPropertyMapStep.class).getAnnotation("multi"));
+
+        // test no batching used for `propertyMap()` (enabled prefetching should not influence the query)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).propertyMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.NONE.getConfigName());
+        assertNull(getLastStepMetrics(profile, JanusGraphPropertyMapStep.class).getAnnotation("multi"));
+
+        // test no batching used for `elementMap()`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).elementMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.NONE.getConfigName());
+        assertNull(getLastStepMetrics(profile, JanusGraphElementMapStep.class).getAnnotation("multi"));
+
+        // test no batching used for `elementMap()` (enabled prefetching should not influence the query)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).elementMap("foo"),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.NONE.getConfigName());
+        assertNull(getLastStepMetrics(profile, JanusGraphElementMapStep.class).getAnnotation("multi"));
+
+        // Test valueMap labels and ids prefetching
+
+        // Should prefetch ids
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap().with(WithOptions.tokens, WithOptions.ids),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // Should prefetch labels
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap().with(WithOptions.tokens, WithOptions.labels),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // Should prefetch ids and labels
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap().with(WithOptions.tokens, WithOptions.ids | WithOptions.labels),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).valueMap().with(WithOptions.tokens, WithOptions.all),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * propertiesCount, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * propertiesCount, profile.getMetrics()));
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // Should prefetch vertex properties in batches when Subgraph property strategy is used
+        profile = testLimitedBatch(() -> graph.traversal().withStrategies(
+                    SubgraphStrategy.create(new MapConfiguration(Collections.singletonMap(SubgraphStrategy.VERTEX_PROPERTIES, hasNot("fooBar"))))
+                ).V(cs).barrier(barrierSize).propertyMap("foo").select(Column.values).unfold().unfold(),
+            option(USE_MULTIQUERY), true,
+            option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+    }
+
+    private void testLimitBatchSizeForHasStep(int numV, int barrierSize, int limit, JanusGraphVertex[] bs, JanusGraphVertex[] cs){
+
+        TraversalMetrics profile;
+
+        // test batching for `has()`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test batching for `has()` in a parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).union(__.has("foo", "bar")),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test batching for `has()` with `limit`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").limit(limit),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(Math.ceil((double) limit / barrierSize), countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+
+        // test batching for `has()` with `limit(1)`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").limit(1),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(1, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+
+        // test batching for `hasLabel()`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).hasLabel("testVertex"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for `hasId()`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).hasId(P.within(cs[0].id(), cs[1].id(), cs[2].id(), cs[3].id())),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(s -> s > 0, profile.getMetrics()));
+
+        // test batching for `hasId()` and `hasLabel()`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).hasLabel("testVertex").hasId(P.within(cs[0].id(), cs[1].id(), cs[2].id(), cs[3].id())),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(1, countBackendQueriesOfSize(4, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(s -> s!=4, profile.getMetrics()));
+
+        // test batching for multiple `has()` steps
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test batching for multiple `has()` steps with label
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").hasLabel("testVertex"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        // Check property queries
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+        // Check label queries
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for multiple `has()` steps with id
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").hasId(P.within(cs[0].id(), cs[1].id(), cs[2].id(), cs[3].id())),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        // Check property queries only for 4 required vertices (cs[0].id(), cs[1].id(), cs[2].id(), cs[3].id())
+        assertEquals(1, countBackendQueriesOfSize(4 * 3, profile.getMetrics()));
+        // Check properties or labels are not prefetched for other vertices not matching a specific id (cs[0].id(), cs[1].id(), cs[2].id(), cs[3].id())
+        assertEquals(0, countBackendQueriesOfSize(4, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for multiple `has()` steps with label and id
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").hasLabel("testVertex").hasId(P.within(cs[0].id(), cs[1].id(), cs[2].id(), cs[3].id())),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        // Check property queries only for 4 required vertices (cs[0].id(), cs[1].id(), cs[2].id(), cs[3].id())
+        assertEquals(1, countBackendQueriesOfSize(4 * 3, profile.getMetrics()));
+        // Check label queries only for 4 required vertices (cs[0].id(), cs[1].id(), cs[2].id(), cs[3].id())
+        assertEquals(1, countBackendQueriesOfSize(4, profile.getMetrics()));
+        // Check properties or labels are not prefetched for other vertices not matching a specific id (cs[0].id(), cs[1].id(), cs[2].id(), cs[3].id())
+        assertEquals(0, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // test batching for multiple `has()` label only
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).hasLabel("testVertex"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        // Check properties are not preFetched because they are not needed for has step evaluation
+        assertEquals(0, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(0, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+        // Check labels are preFetched because they are needed for has step evaluation
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        ArrayList<JanusGraphVertex> allVertices = new ArrayList<>(cs.length + bs.length);
+        allVertices.addAll(Arrays.asList(cs));
+        allVertices.addAll(Arrays.asList(bs));
+        JanusGraphVertex[] allVerticesArr = allVertices.toArray(new JanusGraphVertex[0]);
+
+        // test batching for `has()` label and properties where some vertices not match label
+        profile = testLimitedBatch(() -> graph.traversal().V(allVerticesArr).barrier(barrierSize).hasLabel("testVertex").has("foo", "bar"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        // Check labels are preFetched for all vertices
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+        assertEquals(4, countBackendQueriesOfSize(0, profile.getMetrics()));
+        // Check properties are preFetched only for those vertices which match `hasLabel`
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test batching for multiple `has()` steps of required properties only
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        // `foo` and `fooBar` properties are prefetched separately
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 2, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 2, profile.getMetrics()));
+
+        // test batching for 3 `has()` steps of required properties only
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").has("barFoo", "Foo"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        // `foo`, `fooBar`, and `barFoo` properties are prefetched separately
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES` mode with not following any properties steps
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        // `foo` and `fooBar` properties are prefetched separately
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 2, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 2, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES` mode with following valueMap step
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").valueMap("barFoo"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        // `foo`, `fooBar`, and `barFoo` properties are prefetched separately
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES` mode with following properties step
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").properties("barFoo"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        // `foo`, `fooBar`, and `barFoo` properties are prefetched separately
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES` mode with following values step
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").values("barFoo"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        // `foo`, `fooBar`, and `barFoo` properties are prefetched separately
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES` mode with following elementMap step
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").elementMap("barFoo"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        // `foo`, `fooBar`, and `barFoo` properties are prefetched separately
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES` mode with following valueMap step (all properties)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").valueMap(),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        // all properties are prefetched together
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES` mode with following properties step (all properties)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").properties(),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        // all properties are prefetched together
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES` mode with following values step (all properties)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").values(),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        // all properties are prefetched together
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES` mode with following propertyMap step (all properties)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").propertyMap(),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        // all properties are prefetched together
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES` mode with following valueMap step (all properties)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").valueMap(),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        // all properties are prefetched together
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES` mode with following ElementMap step (all properties)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").elementMap(),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        // all properties are prefetched together
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES` mode with following values step (all properties) after `identity` step
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").identity().values(),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        // all properties are prefetched together
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES` mode with following elementMap step (all properties)
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").elementMap(),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        // all properties are prefetched together
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES` mode with following `barrier` and `identity` steps before elementMap step
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar")
+            .barrier(5000).identity().barrier(100).identity().elementMap(),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        // all properties are prefetched together
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step optimization with tx-cache size smaller than barrier size
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(TX_CACHE_SIZE), barrierSize/4,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        // all properties are prefetched together
+        assertEquals(15, countBackendQueriesOfSize( (barrierSize /4) * 3, profile.getMetrics()));
+        // In this situation the last vertex is not preFetched because it happens to be the last one in batch prefetching and
+        // preFetching is used for vertices of size 2 or more.
+        assertEquals(3, countBackendQueriesOfSize(9, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES_OR_ALL` mode with following values step
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar").values("barFoo"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES_OR_ALL.getConfigName());
+        // `foo`, `fooBar`, and `barFoo` properties are prefetched separately
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `REQUIRED_AND_NEXT_PROPERTIES_OR_ALL` mode with not following values step
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar")
+            .map(Traverser::get).values("barFoo"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES_OR_ALL.getConfigName());
+        // all properties are prefetched together
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // test `has()` step `NONE` mode
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).has("foo", "bar").has("fooBar", "Bar"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.NONE.getConfigName());
+        // `HasStep` should not be replaced by `JanusGraphHasStep`
+        assertFalse(profile.toString().contains(JanusGraphHasStep.class.getSimpleName()));
+        assertTrue(profile.toString().contains(HasStep.class.getSimpleName()));
+
+        // test batching for `has()` as `repeat` start step
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).repeat(__.has("foo", "bar").in("knows")).emit(),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // property prefetching tests
+
+        // All properties prefetching is used with `PROPERTY_PREFETCHING` == `true`
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).out("knows").barrier(barrierSize).has("foo", "bar"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // when `PROPERTY_PREFETCHING` is `true` then any `HAS_STEP_BATCH_MODE` is treated as `ALL_PROPERTIES` (except `NONE` mode).
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).out("knows").barrier(barrierSize).has("foo", "bar"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // When `HAS_STEP_BATCH_MODE` is `NONE` then the JanusGraphHasStrategy optimization should be skipped even if
+        // `PROPERTY_PREFETCHING` is `true`.
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).out("knows").barrier(barrierSize).has("foo", "bar"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.NONE.getConfigName());
+        // `HasStep` should not be replaced by `JanusGraphHasStep`
+        assertFalse(profile.toString().contains(JanusGraphHasStep.class.getSimpleName()));
+        assertTrue(profile.toString().contains(HasStep.class.getSimpleName()));
+
+        // When `HAS_STEP_BATCH_MODE` is `ALL_PROPERTIES` can be used when `PROPERTY_PREFETCHING` is `false`
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).out("knows").barrier(barrierSize).has("foo", "bar"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize * 3, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize) * 3, profile.getMetrics()));
+
+        // When `HAS_STEP_BATCH_MODE` is `REQUIRED_AND_NEXT_PROPERTIES` can be used when `PROPERTY_PREFETCHING` is `false`
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).out("knows").barrier(barrierSize).has("foo", "bar"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize , profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize(numV - 3 * barrierSize, profile.getMetrics()));
+
+        // When `HAS_STEP_BATCH_MODE` is `NONE` then the JanusGraphHasStrategy optimization should be skipped
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).out("knows").barrier(barrierSize).has("foo", "bar"),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(PROPERTY_PREFETCHING), false,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.NONE.getConfigName());
+        // `HasStep` should not be replaced by `JanusGraphHasStep`
+        assertFalse(profile.toString().contains(JanusGraphHasStep.class.getSimpleName()));
+        assertTrue(profile.toString().contains(HasStep.class.getSimpleName()));
+    }
+
+    private void testLimitBatchSizeForMultiQueryOfConnectiveSteps(JanusGraphVertex[] bs, int barrierSize, int limit){
+        TraversalMetrics profile;
+
+        // test batching for `out()` inside `and()`
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).and(__.out("knows").count().is(P.gte(0)), __.inE("knows").count().is(P.gte(0))));
+        assertEquals((int) Math.ceil((double) bs.length / barrierSize) * 2, countOptimizationQueries(profile.getMetrics()));
+
+        // test batching for `out()` inside `and()` limited
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).and(__.out("knows").count().is(P.gte(0)), __.inE("knows").count().is(P.gte(0))).limit(limit));
+        assertEquals((int) Math.ceil((double) Math.min(bs.length, limit) / barrierSize) * 2, countOptimizationQueries(profile.getMetrics()));
+
+        // test batching for `out()` inside `and()` with second filter not being executed due to first filter is false
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).and(__.out("knows").count().is(P.gte(1000000)), __.inE("knows").count().is(P.gte(0))));
+        assertEquals((int) Math.ceil((double) bs.length / barrierSize), countOptimizationQueries(profile.getMetrics()));
+
+        // test batching for `out()` inside `and()` limited with second filter not being executed due to first filter is false
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).and(__.out("knows").count().is(P.gte(1000000)), __.inE("knows").count().is(P.gte(0))).limit(limit));
+        assertEquals((int) Math.ceil((double) bs.length / barrierSize), countOptimizationQueries(profile.getMetrics()));
+
+        // test batching for `out()` inside `or()`
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).or(__.out("knows").count().is(P.gte(1000000)), __.inE("knows").count().is(P.gte(0))));
+        assertEquals((int) Math.ceil((double) bs.length / barrierSize) * 2, countOptimizationQueries(profile.getMetrics()));
+
+        // test batching for `out()` inside `or()` limited
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).or(__.out("knows").count().is(P.gte(1000000)), __.inE("knows").count().is(P.gte(0))).limit(limit));
+        assertEquals((int) Math.ceil((double) Math.min(bs.length, limit) / barrierSize) * 2, countOptimizationQueries(profile.getMetrics()));
+
+        // test batching for `out()` inside `or()` with second filter not being executed due to first filter is true
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).or(__.out("knows").count().is(P.gte(0)), __.inE("knows").count().is(P.gte(0))));
+        assertEquals((int) Math.ceil((double) bs.length / barrierSize), countOptimizationQueries(profile.getMetrics()));
+
+        // test batching for `out()` inside `or()` limited with second filter not being executed due to first filter is true
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).or(__.out("knows").count().is(P.gte(0)), __.inE("knows").count().is(P.gte(0))).limit(limit));
+        assertEquals((int) Math.ceil((double) Math.min(bs.length, limit) / barrierSize), countOptimizationQueries(profile.getMetrics()));
+    }
+
+    private void testLimitBatchSizeForLabelStep(int numV, int barrierSize, int limit, JanusGraphVertex[] bs, JanusGraphVertex[] cs) {
+
+        TraversalMetrics profile;
+
+        // test batching for `label()`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).label(),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(LABEL_STEP_BATCH_MODE), MultiQueryLabelStepStrategyMode.ALL.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize), profile.getMetrics()));
+
+        // test batching for `label()` with default labels
+        profile = testLimitedBatch(() -> graph.traversal().V(bs).barrier(barrierSize).label(),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(LABEL_STEP_BATCH_MODE), MultiQueryLabelStepStrategyMode.ALL.getConfigName());
+        assertEquals( Math.ceil(bs.length / (double) barrierSize), countOptimizationQueries(profile.getMetrics()));
+
+        // test batching for `label()` in a parent step
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).union(__.label()),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(LABEL_STEP_BATCH_MODE), MultiQueryLabelStepStrategyMode.ALL.getConfigName());
+        assertEquals(3, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(1, countBackendQueriesOfSize((numV - 3 * barrierSize), profile.getMetrics()));
+
+        // test batching for `label()` with `limit`. In this case TinkerPop optimizes the usage by moving limit before
+        // `label` step.
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).label().limit(limit),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(LABEL_STEP_BATCH_MODE), MultiQueryLabelStepStrategyMode.ALL.getConfigName());
+        assertEquals(1, countBackendQueriesOfSize(limit, profile.getMetrics()));
+
+        // test disabled batching for `label()`
+        profile = testLimitedBatch(() -> graph.traversal().V(cs).barrier(barrierSize).label(),
+            option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(LABEL_STEP_BATCH_MODE), MultiQueryLabelStepStrategyMode.NONE.getConfigName());
+        assertEquals(0, countBackendQueriesOfSize(barrierSize, profile.getMetrics()));
+        assertEquals(0, countOptimizationQueries(profile.getMetrics()));
+    }
+
+    @Test
+    public void testMultiSliceDBCachedRequests(){
+        clopen(option(DB_CACHE), false);
+        mgmt.makeVertexLabel("testVertex").make();
+        finishSchema();
+        int numV = 100;
+        JanusGraphVertex a = graph.addVertex();
+        JanusGraphVertex[] bs = new JanusGraphVertex[numV];
+        JanusGraphVertex[] cs = new JanusGraphVertex[numV];
+        for (int i = 0; i < numV; ++i) {
+            bs[i] = graph.addVertex();
+            cs[i] = graph.addVertex("testVertex");
+            cs[i].property("foo", "bar");
+            cs[i].property("fooBar", "Bar");
+            cs[i].property("barFoo", "Foo");
+            a.addEdge("knows", bs[i]);
+            bs[i].addEdge("knows", cs[i]);
+        }
+
+        clopen(option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(DB_CACHE), true, option(DB_CACHE_TIME), 1000000L,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName(),
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(numV, graph.traversal().V(cs).values("foo").toList().size());
+        graph.tx().rollback();
+        assertEquals(numV, graph.traversal().V(cs).values("foo").toList().size());
+        graph.tx().rollback();
+        assertEquals(numV * 2, graph.traversal().V(cs).values("foo", "fooBar").toList().size());
+        graph.tx().rollback();
+        assertEquals(numV * 2, graph.traversal().V(cs).values("foo", "fooBar").toList().size());
+        graph.tx().rollback();
+        assertEquals(numV * 3, graph.traversal().V(cs).values("foo", "barFoo", "fooBar").toList().size());
+        graph.tx().rollback();
+        assertEquals(numV * 3, graph.traversal().V(cs).values("foo", "barFoo", "fooBar").toList().size());
+
+        clopen(option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(DB_CACHE), true, option(DB_CACHE_TIME), 1000000L,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName(),
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(numV, graph.traversal().V(cs).values("foo").toList().size());
+        graph.tx().rollback();
+        assertEquals(numV * 3, graph.traversal().V(cs).values("foo", "barFoo", "fooBar").toList().size());
+        graph.tx().rollback();
+
+        clopen(option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+            option(DB_CACHE), true, option(DB_CACHE_TIME), 1000000L,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName(),
+            option(PROPERTIES_BATCH_MODE), MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+        assertEquals(3, graph.traversal().V(cs[1], cs[5], cs[10]).values("foo").toList().size());
+        graph.tx().rollback();
+        assertEquals(3, graph.traversal().V(cs[1], cs[7], cs[10]).values("foo").toList().size());
+        graph.tx().rollback();
+        assertEquals(6, graph.traversal().V(cs[1], cs[6], cs[8]).values("foo", "fooBar").toList().size());
+        graph.tx().rollback();
+        assertEquals(6, graph.traversal().V(cs[1], cs[7], cs[10]).values("foo", "fooBar").toList().size());
+        graph.tx().rollback();
+        assertEquals(9, graph.traversal().V(cs[1], cs[5], cs[10]).values("foo", "barFoo", "fooBar").toList().size());
+        graph.tx().rollback();
+        assertEquals(numV * 3, graph.traversal().V(cs).values("foo", "barFoo", "fooBar").toList().size());
+        graph.tx().rollback();
+        assertEquals(numV * 2, graph.traversal().V(cs).values("foo", "fooBar").toList().size());
+        assertEquals(numV * 3, graph.traversal().V().values("foo", "barFoo", "fooBar").toList().size());
+    }
+
+    protected TraversalMetrics testLimitedBatch(Supplier<GraphTraversal<?, ?>> traversal, Object... settings){
+        assertEqualResultWithAndWithoutLimitBatchSize(traversal);
+        if(settings.length == 0){
+            clopen(option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true,
+                option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName());
+        } else {
+            clopen(settings);
+        }
+        return traversal.get().profile().next();
     }
 
     private void assertEqualResultWithAndWithoutLimitBatchSize(Supplier<GraphTraversal<?, ?>> traversal) {
-        clopen(option(USE_MULTIQUERY), true, option(LIMIT_BATCH_SIZE), true);
+        clopen(option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true);
         final List<?> resultLimitedBatch = traversal.get().toList();
-        clopen(option(USE_MULTIQUERY), true, option(LIMIT_BATCH_SIZE), false);
+        clopen(option(USE_MULTIQUERY), true, option(LIMITED_BATCH), false);
         final List<?> resultUnimitedBatch = traversal.get().toList();
         clopen(option(USE_MULTIQUERY), false);
         final List<?> resultNoMultiQuery = traversal.get().toList();
@@ -4672,15 +7465,29 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertEquals(resultLimitedBatch, resultNoMultiQuery);
     }
 
-    private long countBackendQueriesOfSize(long size, Collection<? extends Metrics> metrics) {
+    protected long countBackendQueriesOfSize(long size, Collection<? extends Metrics> metrics) {
+        return countBackendQueriesOfSize(querySize -> querySize == size, metrics);
+    }
+
+    private long countBackendQueriesOfSize(Predicate<Long> sizePredicate, Collection<? extends Metrics> metrics) {
         long count = metrics.stream()
             .filter(m -> m.getName().equals("backend-query"))
-            .map(m -> m.getCounts())
+            .map(Metrics::getCounts)
             .flatMap(c -> c.values().stream())
-            .filter(s -> s == size)
+            .filter(sizePredicate)
             .count();
         long nestedCount = metrics.stream()
-            .mapToLong(m -> countBackendQueriesOfSize(size, m.getNested()))
+            .mapToLong(m -> countBackendQueriesOfSize(sizePredicate, m.getNested()))
+            .sum();
+        return count + nestedCount;
+    }
+
+    private long countOptimizationQueries(Collection<? extends Metrics> metrics) {
+        long count = metrics.stream()
+            .filter(m -> m.getName().equals("optimization"))
+            .count();
+        long nestedCount = metrics.stream()
+            .mapToLong(m -> countOptimizationQueries(m.getNested()))
             .sum();
         return count + nestedCount;
     }
@@ -4740,19 +7547,22 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         graph.tx().commit();
 
         if(!inmemoryBackend){
-            clopen(option(BATCH_PROPERTY_PREFETCHING), true, option(TX_CACHE_SIZE), txCacheSize);
+            clopen(option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName(), option(TX_CACHE_SIZE), txCacheSize);
         }
         GraphTraversalSource gts = graph.traversal();
 
         TraversalMetrics traversalMetrics = gts.V().has("id", 0).out("knows").has("id", P.within(4,5,6,7)).values("id").profile().next();
 
-        Metrics janusGraphVertexStepMetrics = getStepMetrics(traversalMetrics, JanusGraphVertexStep.class);
+        Metrics janusGraphVertexStepMetrics = getStepMetrics(traversalMetrics, JanusGraphHasStep.class);
         assertNotNull(janusGraphVertexStepMetrics);
         if(expectedVerticesPrefetch>1 && !inmemoryBackend){
             assertContains(janusGraphVertexStepMetrics, "multiPreFetch", "true");
-            assertContains(janusGraphVertexStepMetrics, "vertices", expectedVerticesPrefetch);
-        } else {
-            assertNotContains(janusGraphVertexStepMetrics, "multiPreFetch", "true");
+            int latestBatchVerticesSize = txCacheSize > 1 && txCacheSize < numV ?
+                numV % txCacheSize : expectedVerticesPrefetch;
+            if(latestBatchVerticesSize == 0){
+                latestBatchVerticesSize = txCacheSize;
+            }
+            assertContains(janusGraphVertexStepMetrics, "vertices", latestBatchVerticesSize);
         }
     }
 
@@ -4770,7 +7580,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         graph.tx().commit();
 
         if(!inmemoryBackend){
-            clopen(option(BATCH_PROPERTY_PREFETCHING), true, option(TX_CACHE_SIZE), txCacheSize);
+            clopen(option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName(), option(TX_CACHE_SIZE), txCacheSize);
         }
         GraphTraversalSource gts = graph.traversal();
 
@@ -4789,19 +7599,18 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             TraversalMetrics traversalMetrics = graphVertexTraversal
                 .has("id", P.within(4,5,6,7)).values("id").profile().next();
 
-            Metrics janusGraphEdgeVertexStepMetrics = getStepMetrics(traversalMetrics, JanusGraphEdgeVertexStep.class);
-            if(inmemoryBackend){
-                assertNull(janusGraphEdgeVertexStepMetrics);
-            } else {
-                assertNotNull(janusGraphEdgeVertexStepMetrics);
-                assertTrue(janusGraphEdgeVertexStepMetrics.getName().endsWith("("+direction.name()+")"));
-                if(expectedVerticesPrefetch>1 && !OUT.equals(direction)){
-                    assertContains(janusGraphEdgeVertexStepMetrics, "multiPreFetch", "true");
-                    boolean withAdditionalOutVertex = BOTH.equals(direction) && txCacheSize > 4; // 4 is the number of retrieved IN vertices
-                    assertContains(janusGraphEdgeVertexStepMetrics, "vertices", expectedVerticesPrefetch + (withAdditionalOutVertex?1:0));
-                } else {
-                    assertNotContains(janusGraphEdgeVertexStepMetrics, "multiPreFetch", "true");
+            Metrics janusGraphEdgeVertexStepMetrics = getLastStepMetrics(traversalMetrics, JanusGraphHasStep.class);
+            assertNotNull(janusGraphEdgeVertexStepMetrics);
+
+            if(!inmemoryBackend && expectedVerticesPrefetch>1 && !OUT.equals(direction)){
+                assertContains(janusGraphEdgeVertexStepMetrics, "multiPreFetch", "true");
+                boolean withAdditionalOutVertex = BOTH.equals(direction); // 4 is the number of retrieved IN vertices
+                int latestBatchVerticesSize = txCacheSize > 1 && txCacheSize < numV ?
+                    (4 + (withAdditionalOutVertex?1:0)) % txCacheSize : expectedVerticesPrefetch + (withAdditionalOutVertex?1:0);
+                if(latestBatchVerticesSize == 0){
+                    latestBatchVerticesSize = txCacheSize;
                 }
+                assertContains(janusGraphEdgeVertexStepMetrics, "vertices", latestBatchVerticesSize);
             }
         }
     }
@@ -4823,17 +7632,21 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
      ==================================================================================*/
 
 
-    @Test
-    public void simpleLogTest() throws InterruptedException {
-        simpleLogTest(false);
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    public void simpleLogTest(boolean useStringId) throws InterruptedException {
+        if(useStringId && getStoreFeatures().isKeyOrdered()) return;
+        simpleLogTest(false, useStringId);
     }
 
-    @Test
-    public void simpleLogTestWithFailure() throws InterruptedException {
-        simpleLogTest(true);
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    public void simpleLogTestWithFailure(boolean useStringId) throws InterruptedException {
+        if(useStringId && getStoreFeatures().isKeyOrdered()) return;
+        simpleLogTest(true, useStringId);
     }
 
-    public void simpleLogTest(final boolean withLogFailure) throws InterruptedException {
+    private void simpleLogTest(final boolean withLogFailure, final boolean useStringId) throws InterruptedException {
         final String userLogName = "test";
         final Serializer serializer = graph.getDataSerializer();
         final EdgeSerializer edgeSerializer = graph.getEdgeSerializer();
@@ -4847,13 +7660,20 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
                 option(LOG_SEND_DELAY, USER_LOG), Duration.ofMillis(100),
                 option(KCVSLog.LOG_READ_LAG_TIME, TRANSACTION_LOG), Duration.ofMillis(50),
                 option(LOG_READ_INTERVAL, TRANSACTION_LOG), Duration.ofMillis(250),
-                option(MAX_COMMIT_TIME), Duration.ofSeconds(1)
+                option(MAX_COMMIT_TIME), Duration.ofSeconds(1),
+                option(ALLOW_CUSTOM_VERTEX_ID_TYPES), useStringId,
+                option(ALLOW_SETTING_VERTEX_ID), useStringId
         );
         final String instanceId = graph.getConfiguration().getUniqueGraphId();
 
         PropertyKey weight = tx.makePropertyKey("weight").dataType(Float.class).cardinality(Cardinality.SINGLE).make();
         EdgeLabel knows = tx.makeEdgeLabel("knows").make();
-        JanusGraphVertex n1 = tx.addVertex("weight", 10.5);
+        JanusGraphVertex n1;
+        if (useStringId) {
+            n1 = tx.addVertex(T.id, "n1", "weight", 10.5);
+        } else {
+            n1 = tx.addVertex("weight", 10.5);
+        }
         tx.addProperties(knows, weight);
         newTx();
 
@@ -4861,16 +7681,26 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         //Transaction with custom user log name
         txTimes[0] = times.getTime();
         JanusGraphTransaction tx2 = graph.buildTransaction().logIdentifier(userLogName).start();
-        JanusGraphVertex v1 = tx2.addVertex("weight", 111.1);
+        JanusGraphVertex v1;
+        if (useStringId) {
+            v1 = tx2.addVertex(T.id, "v1", "weight", 111.1);
+        } else {
+            v1 = tx2.addVertex("weight", 111.1);
+        }
         v1.addEdge("knows", v1);
         tx2.commit();
-        final long v1id = getId(v1);
+        final Object v1id = getId(v1);
         txTimes[1] = times.getTime();
         tx2 = graph.buildTransaction().logIdentifier(userLogName).start();
-        JanusGraphVertex v2 = tx2.addVertex("weight", 222.2);
+        JanusGraphVertex v2;
+        if (useStringId) {
+            v2 = tx2.addVertex(T.id, "v2", "weight", 222.2);
+        } else {
+            v2 = tx2.addVertex("weight", 222.2);
+        }
         v2.addEdge("knows", getV(tx2, v1id));
         tx2.commit();
-        final long v2id = getId(v2);
+        final Object v2id = getId(v2);
         //Only read tx
         tx2 = graph.buildTransaction().logIdentifier(userLogName).start();
         v1 = getV(tx2, v1id);
@@ -4984,7 +7814,9 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             assertEquals(4, userChangeCounter.get(Change.REMOVED).get());
         }
 
-        clopen(option(VERBOSE_TX_RECOVERY), true);
+        clopen(option(VERBOSE_TX_RECOVERY), true,
+                option(KCVSLog.LOG_READ_LAG_TIME, TRANSACTION_LOG), Duration.ofMillis(50),
+                option(LOG_READ_INTERVAL, TRANSACTION_LOG), Duration.ofMillis(250));
         /*
         Transaction Recovery
          */
@@ -5652,97 +8484,6 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
 
     }
 
-    public static void evaluateQuery(JanusGraphQuery query, ElementCategory resultType,
-                                     int expectedResults, boolean[] subQuerySpecs,
-                                     PropertyKey orderKey1, Order order1,
-                                     String... intersectingIndexes) {
-        evaluateQuery(query, resultType, expectedResults, subQuerySpecs,
-                ImmutableMap.of(orderKey1, order1), intersectingIndexes);
-    }
-
-    public static void evaluateQuery(JanusGraphQuery query, ElementCategory resultType,
-                                     int expectedResults, boolean[] subQuerySpecs,
-                                     PropertyKey orderKey1, Order order1, PropertyKey orderKey2, Order order2,
-                                     String... intersectingIndexes) {
-        evaluateQuery(query, resultType, expectedResults, subQuerySpecs,
-                ImmutableMap.of(orderKey1, order1, orderKey2, order2), intersectingIndexes);
-    }
-
-    public static void evaluateQuery(JanusGraphQuery query, ElementCategory resultType,
-                                     int expectedResults, boolean[] subQuerySpecs,
-                                     String... intersectingIndexes) {
-        evaluateQuery(query, resultType, expectedResults, subQuerySpecs, ImmutableMap.of(), intersectingIndexes);
-    }
-
-    public static void evaluateQuery(JanusGraphQuery query, ElementCategory resultType,
-                                     int expectedResults, boolean[] subQuerySpecs,
-                                     Map<PropertyKey, Order> orderMap, String... intersectingIndexes) {
-        if (intersectingIndexes == null) intersectingIndexes = new String[0];
-
-        SimpleQueryProfiler profiler = new SimpleQueryProfiler();
-        ((GraphCentricQueryBuilder) query).profiler(profiler);
-
-        Iterable<? extends JanusGraphElement> result;
-        switch (resultType) {
-            case PROPERTY:
-                result = query.properties();
-                break;
-            case EDGE:
-                result = query.edges();
-                break;
-            case VERTEX:
-                result = query.vertices();
-                break;
-            default:
-                throw new AssertionError();
-        }
-        OrderList orders = profiler.getAnnotation(QueryProfiler.ORDERS_ANNOTATION);
-
-        //Check elements and that they are returned in the correct order
-        int no = 0;
-        JanusGraphElement previous = null;
-        for (JanusGraphElement e : result) {
-            assertNotNull(e);
-            no++;
-            if (previous != null && !orders.isEmpty()) {
-                assertTrue(orders.compare(previous, e) <= 0);
-            }
-            previous = e;
-        }
-        assertEquals(expectedResults, no);
-
-        //Check OrderList of query
-        assertNotNull(orders);
-        assertEquals(orderMap.size(), orders.size());
-        for (int i = 0; i < orders.size(); i++) {
-            assertEquals(orderMap.get(orders.getKey(i)), orders.getOrder(i));
-        }
-        for (PropertyKey key : orderMap.keySet()) assertTrue(orders.containsKey(key));
-
-        //Check subqueries
-        SimpleQueryProfiler simpleQueryProfiler = Iterables.getOnlyElement(StreamSupport.stream(profiler.spliterator(), false)
-            .filter(p -> !p.getGroupName().equals(QueryProfiler.OPTIMIZATION)).collect(Collectors.toList()));
-        if (subQuerySpecs.length == 2) { //0=>fitted, 1=>ordered
-            assertEquals(subQuerySpecs[0], simpleQueryProfiler.getAnnotation(QueryProfiler.FITTED_ANNOTATION));
-            assertEquals(subQuerySpecs[1], simpleQueryProfiler.getAnnotation(QueryProfiler.ORDERED_ANNOTATION));
-        }
-        Set<String> indexNames = new HashSet<>();
-        int indexQueries = 0;
-        boolean fullScan = false;
-        for (SimpleQueryProfiler indexProfiler : simpleQueryProfiler) {
-            if (indexProfiler.getAnnotation(QueryProfiler.FULLSCAN_ANNOTATION) != null) {
-                fullScan = true;
-            } else {
-                indexNames.add(indexProfiler.getAnnotation(QueryProfiler.INDEX_ANNOTATION));
-                indexQueries++;
-            }
-        }
-        if (indexQueries > 0) assertFalse(fullScan);
-        if (fullScan) assertEquals(0, intersectingIndexes.length);
-        assertEquals(intersectingIndexes.length, indexQueries);
-        assertEquals(Sets.newHashSet(intersectingIndexes), indexNames);
-    }
-
     @Test
     public void testForceIndexUsage() {
         PropertyKey age = makeKey("age", Integer.class);
@@ -6044,6 +8785,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
 
     @Test
     public void testGraphCentricQueryProfiling() {
+        if (getStoreFeatures().isDistributed() && getStoreFeatures().isKeyOrdered()) return;
         final PropertyKey name = makeKey("name", String.class);
         final PropertyKey weight = makeKey("weight", Integer.class);
         final JanusGraphIndex compositeNameIndex = mgmt.buildIndex("nameIdx", Vertex.class).addKey(name).buildCompositeIndex();
@@ -6074,7 +8816,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             put("orders", "[]");
             put("isFitted", "true");
             put("isOrdered", "true");
-            put("query", "multiKSQ[1]");
+            put("query", "multiKSQ[1]{KeySliceQuery(0x0689A0626FE2)[0x00,0xFF)}");
             put("index", "nameIdx");
         }};
         assertEquals(nameIdxAnnotations, nested.getAnnotations());
@@ -6114,7 +8856,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             put("orders", "[]");
             put("isFitted", "true");
             put("isOrdered", "true");
-            put("query", "multiKSQ[1]");
+            put("query", "multiKSQ[1]{KeySliceQuery(0x088901C8)[0x00,0xFF)}");
             put("index", "weightIdx");
         }};
         assertEquals(weightIdxAnnotations, nested.getAnnotations());
@@ -6122,10 +8864,36 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         backendQueryMetrics = (Metrics) nested.getNested().toArray()[0];
         assertTrue(backendQueryMetrics.getDuration(TimeUnit.MICROSECONDS) > 0);
 
+        // satisfied by a single graph-centric query which satisfied by union of two composite index queries
+        newTx();
+        assertEquals(3, tx.traversal().V().or(__.has("name", "bob"), __.has("name", "alex")).count().next());
+        TraversalMetrics metrics = tx.traversal().V().or(__.has("name", "bob"), __.has("name", "alex"))
+            .profile().next();
+        mCompMultiOr = metrics.getMetrics(0);
+        assertEquals("JanusGraphStep([],[name.or(=(bob), =(alex))])", mCompMultiOr.getName());
+        assertTrue(mCompMultiOr.getDuration(TimeUnit.MICROSECONDS) > 0);
+        assertEquals(2, mCompMultiOr.getNested().size());
+        nested = (Metrics) mCompMultiOr.getNested().toArray()[0];
+        assertEquals(QueryProfiler.CONSTRUCT_GRAPH_CENTRIC_QUERY, nested.getName());
+        assertTrue(nested.getDuration(TimeUnit.MICROSECONDS) > 0);
+        nested = (Metrics) mCompMultiOr.getNested().toArray()[1];
+        assertEquals(QueryProfiler.GRAPH_CENTRIC_QUERY, nested.getName());
+        assertTrue(nested.getDuration(TimeUnit.MICROSECONDS) > 0);
+        assertEquals("((name = bob OR name = alex))", nested.getAnnotation("condition"));
+        Map<String, String> multiKSQAnnotations = new HashMap() {{
+            put("condition", "((name = bob OR name = alex))");
+            put("orders", "[]");
+            put("isFitted", "true");
+            put("isOrdered", "true");
+            put("query", "multiKSQ[2]{KeySliceQuery(0x0689A0626FE2)[0x00,0xFF),KeySliceQuery(0x0689A0616C65F8)[0x00,0xFF)}");
+            put("index", "nameIdx");
+        }};
+        assertEquals(multiKSQAnnotations, nested.getAnnotations());
+
         // satisfied by a single graph-centric query which satisfied by intersection of two composite index queries
         newTx();
         assertEquals(1, tx.traversal().V().and(__.has("name", "bob"), __.has("weight", 100)).count().next());
-        TraversalMetrics metrics = tx.traversal().V().and(__.has("name", "bob"), __.has("weight", 100))
+        metrics = tx.traversal().V().and(__.has("name", "bob"), __.has("weight", 100))
             .profile().next();
         Metrics mCompMultiAnd = metrics.getMetrics(0);
         assertEquals("JanusGraphStep([],[name.eq(bob), weight.eq(100)])", mCompMultiAnd.getName());
@@ -6139,14 +8907,19 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertTrue(nested.getDuration(TimeUnit.MICROSECONDS) > 0);
         assertEquals("(name = bob AND weight = 100)", nested.getAnnotation("condition"));
         assertEquals(2, nested.getNested().size());
-        Metrics deeplyNested = (Metrics) nested.getNested().toArray()[0];
-        assertEquals("AND-query", deeplyNested.getName());
+        Metrics deeplyNested1 = (Metrics) nested.getNested().toArray()[0];
+        assertEquals("AND-query", deeplyNested1.getName());
         // FIXME: assertTrue(deeplyNested.getDuration(TimeUnit.MICROSECONDS) > 0);
-        assertEquals("multiKSQ[1]", deeplyNested.getAnnotation("query"));
-        deeplyNested = (Metrics) nested.getNested().toArray()[1];
-        assertEquals("AND-query", deeplyNested.getName());
+        Metrics deeplyNested2 = (Metrics) nested.getNested().toArray()[1];
+        assertEquals("AND-query", deeplyNested2.getName());
         // FIXME: assertTrue(deeplyNested.getDuration(TimeUnit.MICROSECONDS) > 0);
-        assertEquals("multiKSQ[1]", deeplyNested.getAnnotation("query"));
+        try {
+            assertEquals("multiKSQ[1]{KeySliceQuery(0x088901C8)[0x00,0xFF)}", deeplyNested1.getAnnotation("query"));
+            assertEquals("multiKSQ[1]{KeySliceQuery(0x0689A0626FE2)[0x00,0xFF)}", deeplyNested2.getAnnotation("query"));
+        } catch (AssertionFailedError error) {
+            assertEquals("multiKSQ[1]{KeySliceQuery(0x088901C8)[0x00,0xFF)}", deeplyNested2.getAnnotation("query"));
+            assertEquals("multiKSQ[1]{KeySliceQuery(0x0689A0626FE2)[0x00,0xFF)}", deeplyNested1.getAnnotation("query"));
+        }
 
         // satisfied by one graph-centric query, which satisfied by in-memory filtering after one composite index query
         newTx();
@@ -6168,7 +8941,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             put("orders", "[]");
             put("isFitted", "false"); // not fitted because prop = 100 requires in-memory filtering
             put("isOrdered", "true");
-            put("query", "multiKSQ[1]");
+            put("query", "multiKSQ[1]{KeySliceQuery(0x0689A0626FE2)[0x00,0xFF)}");
             put("index", "nameIdx");
         }};
         assertEquals(annotations, nested.getAnnotations());
@@ -6217,6 +8990,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
 
     @Test
     public void testGraphCentricQueryProfilingWithLimitAdjusting() throws BackendException {
+        if (getStoreFeatures().isDistributed() && getStoreFeatures().isKeyOrdered()) return;
         Runnable dataLoader = () -> {
             final PropertyKey name = makeKey("name", String.class);
             final JanusGraphIndex compositeNameIndex = mgmt.buildIndex("nameIdx", Vertex.class).addKey(name).buildCompositeIndex();
@@ -6241,14 +9015,14 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             put("orders", "[]");
             put("isFitted", "true");
             put("isOrdered", "true");
-            put("query", "multiKSQ[1]@100000"); // 100000 is HARD_MAX_LIMIT
+            put("query", "multiKSQ[1]@100000{KeySliceQuery(0x0489A0626FE2)[0x00,0xFF)}"); // 100000 is HARD_MAX_LIMIT
             put("index", "nameIdx");
         }};
         assertEquals(nameIdxAnnotations, nested.getAnnotations());
         List<Metrics> backendQueryMetrics = nested.getNested().stream().map(m -> (Metrics) m).collect(Collectors.toList());
         assertEquals(1, backendQueryMetrics.size());
         Map<String, String> backendAnnotations = new HashMap() {{
-            put("query", "nameIdx:multiKSQ[1]@100000");
+            put("query", "nameIdx:multiKSQ[1]@100000{KeySliceQuery(0x0489A0626FE2)[0x00,0xFF)}");
             put("limit", 100000);
         }};
         assertEquals(backendAnnotations, backendQueryMetrics.get(0).getAnnotations());
@@ -6269,14 +9043,14 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             put("orders", "[]");
             put("isFitted", "true");
             put("isOrdered", "true");
-            put("query", "multiKSQ[1]");
+            put("query", "multiKSQ[1]{KeySliceQuery(0x0489A0626FE2)[0x00,0xFF)}");
             put("index", "nameIdx");
         }};
         assertEquals(nameIdxAnnotations, nested.getAnnotations());
         backendQueryMetrics = nested.getNested().stream().map(m -> (Metrics) m).collect(Collectors.toList());
         assertEquals(1, backendQueryMetrics.size());
         backendAnnotations = new HashMap() {{
-            put("query", "nameIdx:multiKSQ[1]");
+            put("query", "nameIdx:multiKSQ[1]{KeySliceQuery(0x0489A0626FE2)[0x00,0xFF)}");
         }};
         assertEquals(backendAnnotations, backendQueryMetrics.get(0).getAnnotations());
         assertTrue(backendQueryMetrics.get(0).getDuration(TimeUnit.MICROSECONDS) > 0);
@@ -6304,7 +9078,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             put("orders", "[]");
             put("isFitted", "true");
             put("isOrdered", "true");
-            put("query", "multiKSQ[1]@4000");
+            put("query", "multiKSQ[1]@4000{KeySliceQuery(0x0489A0626FE2)[0x00,0xFF)}");
             put("index", "nameIdx");
         }};
         assertEquals(nameIdxAnnotations, nested.getAnnotations());
@@ -6315,7 +9089,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         for (Metrics backendQueryMetric : backendQueryMetrics) {
             int queryLimit = limit;
             backendAnnotations = new HashMap() {{
-                put("query", "nameIdx:multiKSQ[1]@" + queryLimit);
+                put("query", "nameIdx:multiKSQ[1]@" + queryLimit + "{KeySliceQuery(0x0489A0626FE2)[0x00,0xFF)}");
                 put("limit", queryLimit);
             }};
             assertEquals(backendAnnotations, backendQueryMetric.getAnnotations());
@@ -6339,7 +9113,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
 
         // satisfied by a single vertex-centric query which is satisfied by one edge query
         newTx();
-        Metrics mSingleLabel = tx.traversal().V(v).outE("friend").has("time", P.lt(10)).profile().next().getMetrics(1);
+        Metrics mSingleLabel = tx.traversal().V(v).outE("friend").has("time", P.lt(10)).profile().next().getMetrics(3);
         assertEquals("JanusGraphVertexStep([time.lt(10)])", mSingleLabel.getName());
         assertTrue(mSingleLabel.getDuration(TimeUnit.MICROSECONDS) > 0);
         Map<String, String> annotations = new HashMap() {{
@@ -6349,6 +9123,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             put("isFitted", "true");
             put("isOrdered", "true");
             put("query", "2069:byTime:SliceQuery[0xB0E0FF7FFFFFF6,0xB0E1)");
+            put("multi", "true");
         }};
         mSingleLabel.getAnnotations().remove("percentDur");
         assertEquals(annotations, mSingleLabel.getAnnotations());
@@ -6356,17 +9131,18 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         // satisfied by a single vertex-centric query which is satisfied by union of two edge queries
         newTx();
         Metrics mMultiLabels = tx.traversal().V(v).outE("friend", "friend-no-index").has("time", 100)
-            .profile().next().getMetrics(1);
+            .profile().next().getMetrics(3);
         assertEquals("JanusGraphVertexStep([time.eq(100)])", mMultiLabels.getName());
         assertTrue(mMultiLabels.getDuration(TimeUnit.MICROSECONDS) > 0);
         annotations = new HashMap() {{
             put("condition", "(time = 100 AND (type[friend] OR type[friend-no-index]))");
             put("orders", "[]");
+            put("multi", "true");
             put("vertices", 1);
         }};
         mMultiLabels.getAnnotations().remove("percentDur");
         assertEquals(annotations, mMultiLabels.getAnnotations());
-        assertEquals(3, mMultiLabels.getNested().size());
+        assertEquals(4, mMultiLabels.getNested().size());
         Metrics friendMetrics = (Metrics) mMultiLabels.getNested().toArray()[1];
         assertEquals("OR-query", friendMetrics.getName());
         // FIXME: assertTrue(friendMetrics.getDuration(TimeUnit.MICROSECONDS) > 0);
@@ -6385,6 +9161,14 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
             put("query", "friend-no-index:SliceQuery[0x7180,0x7181)"); // no vertex-centric index found
         }};
         assertEquals(annotations, friendNoIndexMetrics.getAnnotations());
+        Metrics backendQueryMetrics = (Metrics) mMultiLabels.getNested().toArray()[3];
+        assertEquals("backend-query", backendQueryMetrics.getName());
+        Map<String, Object> annotatnions = backendQueryMetrics.getAnnotations();
+        assertEquals(3, annotatnions.size());
+        assertEquals("true", annotatnions.get("multiSlices"));
+        assertEquals(2, annotatnions.get("queriesAmount"));
+        assertTrue(annotatnions.get("queries").equals("[2069:byTime:SliceQuery[0xB0E0FF7FFFFF9B,0xB0E0FF7FFFFF9C), friend-no-index:SliceQuery[0x7180,0x7181)]") ||
+            annotatnions.get("queries").equals("[friend-no-index:SliceQuery[0x7180,0x7181), 2069:byTime:SliceQuery[0xB0E0FF7FFFFF9B,0xB0E0FF7FFFFF9C)]"));
     }
 
     @Test
@@ -6405,7 +9189,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertVertexCentricIndexWithNull(v1);
 
         newTx();
-        v1 = tx.getVertex(v1.longId());
+        v1 = tx.getVertex(v1.id());
         //Queries copied from above
 
         assertVertexCentricIndexWithNull(v1);
@@ -7098,6 +9882,33 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
     }
 
     @Test
+    public void testHasQueryWithNullKey() {
+        makeKey("time", Long.class);
+        finishSchema();
+        tx.addVertex("time", 0);
+
+        assertCount(0, tx.query().has(null, 0).vertices());
+    }
+
+    @Test
+    public void testQueryWithNullPropertyKey() {
+        makeKey("time", Long.class);
+        finishSchema();
+        tx.addVertex("time", 0);
+
+        assertCount(0, QueryUtil.getVertices((StandardJanusGraphTx) tx, (PropertyKey) null, 0));
+    }
+
+    @Test
+    public void testMultipleHasQueriesWhereOneUsesNullKey() {
+        makeKey("time", Long.class);
+        finishSchema();
+        tx.addVertex("time", 0);
+
+        assertCount(0, tx.query().has("time", 0).has(null, 0).vertices());
+    }
+
+    @Test
     public void testReindexingForEdgeIndex() throws InterruptedException, ExecutionException {
         //Schema creation
         String edgeLabelName = "egLabel";
@@ -7182,7 +9993,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         }
 
         //Reindexing
-        mgmt.updateIndex(relationIndex, SchemaAction.REINDEX).get();
+        mgmt.updateIndex(relationIndex, SchemaAction.REINDEX, 1).get();
         finishSchema();
 
         relationIndex = mgmt.getRelationIndex(t,indexName);
@@ -7343,7 +10154,7 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
     @Test
     public void testVerticesDropAfterWhereWithBatchQueryEnabled() {
         clopen(option(USE_MULTIQUERY),true,
-            option(BATCH_PROPERTY_PREFETCHING),false,
+            option(HAS_STEP_BATCH_MODE),MultiQueryHasStepStrategyMode.NONE.getConfigName(),
             option(STORAGE_BATCH),false
         );
 
@@ -7371,4 +10182,1284 @@ public abstract class JanusGraphTest extends JanusGraphBaseTest {
         assertFalse(tx.traversal().V().has("a", timestamp).has("b", true).has("c", true).bothE().hasNext());
     }
 
+    /**
+     * In this test, we deliberately create ghost vertices and use ManagementSystem to purge them
+     * We use two concurrent transactions and let one transaction removes a vertex and another transaction
+     * updates the same vertex. When the storage backend does not have locking support, both transactions
+     * will succeed, and then the vertex becomes a ghost vertex.
+     *
+     * @throws ExecutionException
+     * @throws InterruptedException
+     */
+    @Test
+    public void testMgmtRemoveGhostVertices() throws ExecutionException, InterruptedException {
+        if (features.hasLocking()) return;
+
+        final int numOfVertices = 100;
+        final int numOfGhostVertices = 80;
+        final int numOfRestVertices = numOfVertices - numOfGhostVertices;
+        List<Vertex> vertices = new ArrayList<>(numOfVertices);
+        for (int i = 0; i < numOfVertices; i++) {
+            vertices.add(tx.traversal().addV("test").next());
+        }
+        tx.commit();
+
+        JanusGraphTransaction tx1 = graph.newTransaction();
+        for (int i = 0; i < numOfVertices; i++) {
+            tx1.traversal().V(vertices.get(i)).property("prop", "val").next();
+        }
+
+        JanusGraphTransaction tx2 = graph.newTransaction();
+        for (int i = 0; i < numOfGhostVertices; i++) {
+            tx2.traversal().V(vertices.get(i)).next().remove();
+        }
+        tx2.commit();
+
+        tx1.commit();
+
+        JanusGraphManagement mgmt = graph.openManagement();
+        ScanJobFuture future = mgmt.removeGhostVertices();
+        assertEquals(numOfGhostVertices, future.get().getCustom(GhostVertexRemover.REMOVED_VERTEX_COUNT));
+        assertEquals(numOfRestVertices, graph.traversal().V().count().next());
+        assertEquals(numOfRestVertices, graph.traversal().V().hasLabel("test").count().next());
+        assertEquals(numOfRestVertices, graph.traversal().V().has("prop", "val").count().next());
+        assertEquals(numOfRestVertices, graph.traversal().V().hasLabel("test").has("prop", "val").count().next());
+
+        // running it again, no vertex is removed
+        assertEquals(0, mgmt.removeGhostVertices().get().getCustom(GhostVertexRemover.REMOVED_VERTEX_COUNT));
+    }
+
+    @Test
+    public void testDirectCompositeIndexEntryModification() throws BackendException {
+        clopenForStaleIndex();
+        String namePropKeyStr = "name";
+        PropertyKey nameProp = mgmt.makePropertyKey(namePropKeyStr).dataType(String.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.buildIndex("nameIndex", Vertex.class).addKey(nameProp).buildCompositeIndex();
+        finishSchema();
+
+        tx.addVertex().property("name", "vertex1");
+        tx.addVertex().property("name", "vertex2");
+
+        tx.commit();
+        newTx();
+
+        Vertex vertex1 = tx.traversal().V().has("name", "vertex1").next();
+
+        ManagementSystem managementSystem = (ManagementSystem) graph.openManagement();
+        JanusGraphIndex janusGraphIndex = managementSystem.getGraphIndex("nameIndex");
+        JanusGraphSchemaVertex indexChangeVertex = managementSystem.getSchemaVertex(janusGraphIndex);
+        CompositeIndexType index = (CompositeIndexType) indexChangeVertex.asIndexType();
+        JanusGraphVertexProperty indexedProperty = (JanusGraphVertexProperty) vertex1.property("name");
+        IndexRecordEntry[] record = new IndexRecordEntry[]{new IndexRecordEntry(indexedProperty)};
+        JanusGraphElement element = (JanusGraphElement) vertex1;
+        Serializer serializer = graph.getDataSerializer();
+        EdgeSerializer edgeSerializer = graph.getEdgeSerializer();
+        boolean hashKeys = graph.getIndexSerializer().isHashKeys();
+        HashingUtil.HashLength hashLength = graph.getIndexSerializer().getHashLength();
+
+        IndexUpdate<StaticBuffer, Entry> update = IndexRecordUtil.getCompositeIndexUpdate(
+            index,
+            IndexMutationType.DELETE,
+            record,
+            element,
+            serializer,
+            (StandardJanusGraphTx)tx,
+            edgeSerializer,
+            hashKeys,
+            hashLength
+        );
+
+        BackendTransaction transaction = ((StandardJanusGraphTx) tx).getTxHandle();
+
+        // Removes index entry even so, vertex exists. I.e. this line corrupts the index.
+        transaction.mutateIndex(update.getKey(), Collections.emptyList(), Collections.singletonList(update.getEntry()));
+
+        transaction.commit();
+        newTx();
+
+        assertTrue(tx.traversal().V(vertex1.id()).hasNext());
+        assertFalse(tx.traversal().V().has("name", "vertex1").hasNext());
+        assertTrue(tx.traversal().V().has("name", "vertex2").hasNext());
+
+        newTx();
+
+        update = IndexRecordUtil.getCompositeIndexUpdate(
+            index,
+            IndexMutationType.ADD,
+            record,
+            element,
+            serializer,
+            (StandardJanusGraphTx)tx,
+            edgeSerializer,
+            hashKeys,
+            hashLength
+        );
+
+        transaction = ((StandardJanusGraphTx) tx).getTxHandle();
+
+        // Adds missing index entry of the non-indexed vertex. I.e. this line fixes the corrupted index.
+        transaction.mutateIndex(update.getKey(), Collections.singletonList(update.getEntry()), Collections.emptyList());
+
+        transaction.commit();
+        newTx();
+
+        assertTrue(tx.traversal().V(vertex1.id()).hasNext());
+        assertTrue(tx.traversal().V().has("name", "vertex1").hasNext());
+        assertTrue(tx.traversal().V().has("name", "vertex2").hasNext());
+
+        Vertex vertex2 = tx.traversal().V().has("name", "vertex2").next();
+        indexedProperty = (JanusGraphVertexProperty) vertex2.property("name");
+        long propertyId = indexedProperty.longId();
+        PropertyKey propertyKey = indexedProperty.propertyKey();
+        record = new IndexRecordEntry[]{new IndexRecordEntry(propertyId, "vertex2", propertyKey)};
+
+        tx.traversal().V().has("name", "vertex2").drop().iterate();
+        tx.commit();
+        newTx();
+
+        element = new CacheVertex((StandardJanusGraphTx) tx, vertex2.id(), ElementLifeCycle.New);
+
+        update = IndexRecordUtil.getCompositeIndexUpdate(
+            index,
+            IndexMutationType.ADD,
+            record,
+            element,
+            serializer,
+            (StandardJanusGraphTx)tx,
+            edgeSerializer,
+            hashKeys,
+            hashLength
+        );
+
+        transaction = ((StandardJanusGraphTx) tx).getTxHandle();
+
+        // Adds index entry of the non-indexed vertex to the index. I.e. this line corrupts index.
+        // This is a possible situation of a stale index being introduced.
+        transaction.mutateIndex(update.getKey(), Collections.singletonList(update.getEntry()), Collections.emptyList());
+
+        transaction.commit();
+        newTx();
+
+        assertTrue(tx.traversal().V(vertex1.id()).hasNext());
+        assertFalse(tx.traversal().V(vertex2.id()).hasNext());
+        assertTrue(tx.traversal().V().has("name", "vertex1").hasNext());
+        assertTrue(tx.traversal().V().has("name", "vertex2").hasNext());
+
+        record = new IndexRecordEntry[]{new IndexRecordEntry(propertyKey.longId(), "vertex2", propertyKey)};
+
+        update = IndexRecordUtil.getCompositeIndexUpdate(
+            index,
+            IndexMutationType.DELETE,
+            record,
+            element,
+            serializer,
+            (StandardJanusGraphTx)tx,
+            edgeSerializer,
+            hashKeys,
+            hashLength
+        );
+
+        transaction = ((StandardJanusGraphTx) tx).getTxHandle();
+
+        // Removes index entry of the non-indexed vertex. I.e. this line fixes corrupted index.
+        // This is a possible solution to deal with stale index separate entries.
+        transaction.mutateIndex(update.getKey(), Collections.emptyList(), Collections.singletonList(update.getEntry()));
+
+        transaction.commit();
+        newTx();
+
+        assertTrue(tx.traversal().V(vertex1.id()).hasNext());
+        assertFalse(tx.traversal().V(vertex2.id()).hasNext());
+        assertTrue(tx.traversal().V().has("name", "vertex1").hasNext());
+        assertFalse(tx.traversal().V().has("name", "vertex2").hasNext());
+
+        managementSystem.rollback();
+    }
+
+    @Test
+    public void testStaleIndexForceRemoveVertexFromGraphIndex() throws BackendException {
+        clopenForStaleIndex();
+        String namePropKeyStr = "name";
+        String indexName = "nameIndex";
+        PropertyKey nameProp = mgmt.makePropertyKey(namePropKeyStr).dataType(String.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.buildIndex(indexName, Vertex.class).addKey(nameProp).buildCompositeIndex();
+        finishSchema();
+
+        tx.addVertex().property("name", "vertex2");
+
+        tx.commit();
+        newTx();
+
+        Vertex vertex2 = tx.traversal().V().has("name", "vertex2").next();
+
+        ManagementSystem managementSystem = (ManagementSystem) graph.openManagement();
+        JanusGraphIndex janusGraphIndex = managementSystem.getGraphIndex(indexName);
+        JanusGraphSchemaVertex indexChangeVertex = managementSystem.getSchemaVertex(janusGraphIndex);
+        CompositeIndexType index = (CompositeIndexType) indexChangeVertex.asIndexType();
+        Serializer serializer = graph.getDataSerializer();
+        EdgeSerializer edgeSerializer = graph.getEdgeSerializer();
+        boolean hashKeys = graph.getIndexSerializer().isHashKeys();
+        HashingUtil.HashLength hashLength = graph.getIndexSerializer().getHashLength();
+
+        JanusGraphVertexProperty indexedProperty = (JanusGraphVertexProperty) vertex2.property("name");
+        long propertyId = indexedProperty.longId();
+        PropertyKey propertyKey = indexedProperty.propertyKey();
+        IndexRecordEntry[] record = new IndexRecordEntry[]{new IndexRecordEntry(propertyId, "vertex2", propertyKey)};
+
+        tx.traversal().V().has("name", "vertex2").drop().iterate();
+        tx.commit();
+        newTx();
+
+        JanusGraphElement element = new CacheVertex((StandardJanusGraphTx) tx, vertex2.id(), ElementLifeCycle.New);
+
+        IndexUpdate<StaticBuffer, Entry> update = IndexRecordUtil.getCompositeIndexUpdate(
+            index,
+            IndexMutationType.ADD,
+            record,
+            element,
+            serializer,
+            (StandardJanusGraphTx)tx,
+            edgeSerializer,
+            hashKeys,
+            hashLength
+        );
+
+        BackendTransaction transaction = ((StandardJanusGraphTx) tx).getTxHandle();
+
+        // Adds index entry of the non-indexed vertex to the index. I.e. this line corrupts index.
+        // This is a possible situation of a stale index being introduced.
+        transaction.mutateIndex(update.getKey(), Collections.singletonList(update.getEntry()), Collections.emptyList());
+
+        transaction.commit();
+        newTx();
+
+        assertFalse(tx.traversal().V(vertex2.id()).hasNext());
+        assertTrue(tx.traversal().V().has("name", "vertex2").hasNext());
+
+        // Check that if we try to remove non-existent vertex we receive an exception
+        assertThrows(Exception.class, () -> tx.traversal().V().has("name", "vertex2").drop().next());
+
+        newTx();
+        assertFalse(tx.traversal().V(vertex2.id()).hasNext());
+        // Check that even when we tried to remove vertex - it wasn't removed.
+        // Thus, we got a stale index which won't be fixed by itself.
+        assertTrue(tx.traversal().V().has("name", "vertex2").hasNext());
+
+        // Force-remove index record. I.e. fix stale index.
+        StaleIndexRecordUtil.forceRemoveElementFromGraphIndex(
+            element,
+            record,
+            graph,
+            indexName
+        );
+
+        newTx();
+
+        assertFalse(tx.traversal().V(vertex2.id()).hasNext());
+        assertFalse(tx.traversal().V().has("name", "vertex2").hasNext());
+    }
+
+    @Test
+    public void testEdgeEntryIndexForceRemoveFromGraphIndex() throws BackendException {
+        clopenForStaleIndex();
+        String namePropKeyStr = "name";
+        String indexName = "nameIndex";
+        String edgeName = "follow";
+        mgmt.makeEdgeLabel(edgeName).make();
+        PropertyKey nameProp = mgmt.makePropertyKey(namePropKeyStr).dataType(String.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.buildIndex(indexName, Edge.class).addKey(nameProp).buildCompositeIndex();
+        finishSchema();
+
+        Vertex vertex1 = tx.addVertex();
+        Vertex vertex2 = tx.addVertex();
+
+        Edge edge = tx.traversal().addE(edgeName).from(vertex1).to(vertex2).property(namePropKeyStr, "edge1").next();
+
+        tx.commit();
+        newTx();
+
+        ManagementSystem managementSystem = (ManagementSystem) graph.openManagement();
+        JanusGraphIndex janusGraphIndex = managementSystem.getGraphIndex(indexName);
+        JanusGraphSchemaVertex indexChangeVertex = managementSystem.getSchemaVertex(janusGraphIndex);
+        CompositeIndexType index = (CompositeIndexType) indexChangeVertex.asIndexType();
+        Serializer serializer = graph.getDataSerializer();
+        EdgeSerializer edgeSerializer = graph.getEdgeSerializer();
+        boolean hashKeys = graph.getIndexSerializer().isHashKeys();
+        HashingUtil.HashLength hashLength = graph.getIndexSerializer().getHashLength();
+        PropertyKey propertyKey = managementSystem.getPropertyKey(namePropKeyStr);
+
+        RelationIdentifier relationIdentifier = (RelationIdentifier) edge.id();
+        long relationId = relationIdentifier.getRelationId();
+        EdgeLabel edgeLabel = managementSystem.getEdgeLabel(edgeName);
+
+        IndexRecordEntry[] record = new IndexRecordEntry[]{new IndexRecordEntry(relationId, "edge1", propertyKey)};
+
+        InternalVertex internalVertex1 = (InternalVertex) edge.outVertex();
+        InternalVertex internalVertex2 = (InternalVertex) edge.inVertex();
+        JanusGraphElement element = new StandardEdge(relationId, edgeLabel, internalVertex1, internalVertex2, ElementLifeCycle.New);
+
+        StaleIndexRecordUtil.forceRemoveElementFromGraphIndex(
+            element,
+            record,
+            graph,
+            indexName
+        );
+
+        tx.commit();
+        newTx();
+
+        assertFalse(tx.traversal().E().has(namePropKeyStr, "edge1").hasNext());
+        assertTrue(tx.traversal().E(edge.id()).hasNext());
+
+        IndexUpdate<StaticBuffer, Entry> update = IndexRecordUtil.getCompositeIndexUpdate(
+            index,
+            IndexMutationType.ADD,
+            record,
+            element,
+            serializer,
+            (StandardJanusGraphTx)tx,
+            edgeSerializer,
+            hashKeys,
+            hashLength
+        );
+
+        BackendTransaction transaction = ((StandardJanusGraphTx) tx).getTxHandle();
+
+        // Adds index entry of the non-indexed edge to the index. I.e. this line corrupts index.
+        // This is a possible situation of a stale index being introduced.
+        transaction.mutateIndex(update.getKey(), Collections.singletonList(update.getEntry()), Collections.emptyList());
+
+        transaction.commit();
+        tx.commit();
+        managementSystem.rollback();
+        newTx();
+
+        assertTrue(tx.traversal().E().has(namePropKeyStr, "edge1").hasNext());
+        assertTrue(tx.traversal().E(edge.id()).hasNext());
+        assertTrue(tx.traversal().V(vertex1).out(edgeName).is(vertex2).hasNext());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    public void testStaleIndexForceRemoveVertexFromGraphIndexByHelperMethod(boolean withLabelConstraint) throws BackendException {
+        clopenForStaleIndex();
+        String namePropKeyStr = "name";
+        String agePropKeyStr = "age";
+        String indexName = "nameAgeIndex";
+        String nameValue = "testNameValue";
+        Integer ageValue = 123;
+        PropertyKey nameProp = mgmt.makePropertyKey(namePropKeyStr).dataType(String.class).cardinality(Cardinality.SINGLE).make();
+        PropertyKey ageProp = mgmt.makePropertyKey(agePropKeyStr).dataType(Integer.class).cardinality(Cardinality.SINGLE).make();
+        JanusGraphManagement.IndexBuilder indexBuilder = mgmt.buildIndex(indexName, Vertex.class)
+            .addKey(nameProp).addKey(ageProp);
+        String vertexLabelName;
+        if(withLabelConstraint){
+            vertexLabelName = "testVertexLabel";
+            VertexLabel vertexLabel = mgmt.makeVertexLabel(vertexLabelName).make();
+            indexBuilder = indexBuilder.indexOnly(vertexLabel);
+        } else {
+            vertexLabelName = null;
+        }
+        indexBuilder.buildCompositeIndex();
+        finishSchema();
+
+        JanusGraphVertex addedVertex = vertexLabelName == null ?
+            tx.addVertex() :
+            tx.addVertex(vertexLabelName);
+        addedVertex.property(namePropKeyStr, nameValue);
+        addedVertex.property(agePropKeyStr, ageValue);
+
+        tx.commit();
+        newTx();
+
+        Vertex testVertex = getV(namePropKeyStr, nameValue, agePropKeyStr, ageValue, vertexLabelName).next();
+
+        ManagementSystem managementSystem = (ManagementSystem) graph.openManagement();
+        JanusGraphIndex janusGraphIndex = managementSystem.getGraphIndex(indexName);
+        JanusGraphSchemaVertex indexChangeVertex = managementSystem.getSchemaVertex(janusGraphIndex);
+        CompositeIndexType index = (CompositeIndexType) indexChangeVertex.asIndexType();
+        Serializer serializer = graph.getDataSerializer();
+        EdgeSerializer edgeSerializer = graph.getEdgeSerializer();
+        boolean hashKeys = graph.getIndexSerializer().isHashKeys();
+        HashingUtil.HashLength hashLength = graph.getIndexSerializer().getHashLength();
+
+        JanusGraphVertexProperty indexedNameProperty = (JanusGraphVertexProperty) testVertex.property(namePropKeyStr);
+        long namePropertyId = indexedNameProperty.longId();
+        PropertyKey namePropertyKey = indexedNameProperty.propertyKey();
+
+        JanusGraphVertexProperty indexedAgeProperty = (JanusGraphVertexProperty) testVertex.property(agePropKeyStr);
+        long agePropertyId = indexedAgeProperty.longId();
+        PropertyKey agePropertyKey = indexedAgeProperty.propertyKey();
+        IndexRecordEntry[] record = new IndexRecordEntry[]{
+            new IndexRecordEntry(namePropertyId, nameValue, namePropertyKey),
+            new IndexRecordEntry(agePropertyId, ageValue, agePropertyKey)
+        };
+
+        getV(namePropKeyStr, nameValue, agePropKeyStr, ageValue, vertexLabelName).drop().iterate();
+        tx.commit();
+        newTx();
+
+        Object vertexId = testVertex.id();
+        JanusGraphElement element = new CacheVertex((StandardJanusGraphTx) tx, testVertex.id(), ElementLifeCycle.New);
+
+        IndexUpdate<StaticBuffer, Entry> update = IndexRecordUtil.getCompositeIndexUpdate(
+            index,
+            IndexMutationType.ADD,
+            record,
+            element,
+            serializer,
+            (StandardJanusGraphTx)tx,
+            edgeSerializer,
+            hashKeys,
+            hashLength
+        );
+
+        BackendTransaction transaction = ((StandardJanusGraphTx) tx).getTxHandle();
+
+        // Adds index entry of the non-indexed vertex to the index. I.e. this line corrupts index.
+        // This is a possible situation of a stale index being introduced.
+        transaction.mutateIndex(update.getKey(), Collections.singletonList(update.getEntry()), Collections.emptyList());
+
+        transaction.commit();
+        newTx();
+
+        assertFalse(tx.traversal().V(testVertex.id()).hasNext());
+        assertTrue(getV(namePropKeyStr, nameValue, agePropKeyStr, ageValue, vertexLabelName).hasNext());
+
+        // Check that if we try to remove non-existent vertex we receive an exception
+        assertThrows(Exception.class, () -> getV(namePropKeyStr, nameValue, agePropKeyStr, ageValue, vertexLabelName).drop().next());
+
+        newTx();
+        assertFalse(tx.traversal().V(testVertex.id()).hasNext());
+        // Check that even when we tried to remove vertex - it wasn't removed.
+        // Thus, we got a stale index which won't be fixed by itself.
+        assertTrue(getV(namePropKeyStr, nameValue, agePropKeyStr, ageValue, vertexLabelName).hasNext());
+
+        Map<String, Object> indexRecordPropertyValues = new HashMap<>();
+        indexRecordPropertyValues.put(namePropKeyStr, nameValue);
+        indexRecordPropertyValues.put(agePropKeyStr, ageValue);
+
+        // Force-remove index record. I.e. fix stale index.
+        StaleIndexRecordUtil.forceRemoveVertexFromGraphIndex(
+            vertexId,
+            indexRecordPropertyValues,
+            graph,
+            indexName
+        );
+
+        newTx();
+
+        assertFalse(tx.traversal().V(testVertex.id()).hasNext());
+        assertFalse(getV(namePropKeyStr, nameValue, agePropKeyStr, ageValue, vertexLabelName).hasNext());
+    }
+
+    @Test
+    public void shouldThrowExceptionWhenIncorrectAmountOfPropertiesIsUsedDuringForceIndexRecordRemoval() {
+        clopenForStaleIndex();
+        String namePropKeyStr = "name";
+        String agePropKeyStr = "age";
+        String indexName = "nameAgeIndex";
+        PropertyKey nameProp = mgmt.makePropertyKey(namePropKeyStr).dataType(String.class).cardinality(Cardinality.SINGLE).make();
+        PropertyKey ageProp = mgmt.makePropertyKey(agePropKeyStr).dataType(Integer.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.buildIndex(indexName, Vertex.class).addKey(nameProp).addKey(ageProp).buildCompositeIndex();
+        finishSchema();
+
+        JanusGraphVertex addedVertex = tx.addVertex();
+        addedVertex.property(namePropKeyStr, "vertex2");
+        addedVertex.property(agePropKeyStr, 123);
+
+        tx.commit();
+        newTx();
+
+        Vertex vertex2 = tx.traversal().V().has(namePropKeyStr, "vertex2").has(agePropKeyStr, 123).next();
+
+        Assertions.assertThrows(IllegalArgumentException.class, () -> StaleIndexRecordUtil.forceRemoveVertexFromGraphIndex(
+            (Long) vertex2.id(),
+            Collections.singletonMap(namePropKeyStr, "vertex2"),
+            graph,
+            indexName
+        ));
+    }
+
+    @Test
+    public void shouldThrowExceptionWhenIncorrectPropertiesAreUsedDuringForceIndexRecordRemoval() {
+        clopenForStaleIndex();
+        String namePropKeyStr = "name";
+        String agePropKeyStr = "age";
+        String indexName = "nameAgeIndex";
+        PropertyKey nameProp = mgmt.makePropertyKey(namePropKeyStr).dataType(String.class).cardinality(Cardinality.SINGLE).make();
+        PropertyKey ageProp = mgmt.makePropertyKey(agePropKeyStr).dataType(Integer.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.buildIndex(indexName, Vertex.class).addKey(nameProp).addKey(ageProp).buildCompositeIndex();
+        finishSchema();
+
+        JanusGraphVertex addedVertex = tx.addVertex();
+        addedVertex.property(namePropKeyStr, "vertex2");
+        addedVertex.property(agePropKeyStr, 123);
+
+        tx.commit();
+        newTx();
+
+        Vertex vertex2 = tx.traversal().V().has(namePropKeyStr, "vertex2").has(agePropKeyStr, 123).next();
+
+        Map<String, Object> indexRecordPropertyValues = new HashMap<>();
+        indexRecordPropertyValues.put(namePropKeyStr, "vertex2");
+        indexRecordPropertyValues.put("unknownProperty", 123);
+
+        Assertions.assertThrows(IllegalArgumentException.class, () -> StaleIndexRecordUtil.forceRemoveVertexFromGraphIndex(
+            (Long) vertex2.id(),
+            indexRecordPropertyValues,
+            graph,
+            indexName
+        ));
+    }
+
+    protected void clopenForStaleIndex(){
+        clopen();
+    }
+
+    @Test
+    public void testPropertiesAfterProjectWithByThenChooseWithBatchQueryEnabled() {
+        clopen(option(USE_MULTIQUERY),true,
+            option(HAS_STEP_BATCH_MODE), MultiQueryHasStepStrategyMode.NONE.getConfigName(),
+            option(STORAGE_BATCH),false
+        );
+
+        long timestamp = System.currentTimeMillis();
+
+        tx.traversal().addV("test").property("a", timestamp).next();
+
+        newTx();
+
+        assertTrue(tx.traversal().V().has("a", timestamp).project("a").by(__.choose(__.has("a"), __.values("a"))).hasNext());
+    }
+
+    @Test
+    public void testGremlinScriptEvaluationWithGremlinLangScriptEngine() {
+        Exception npe = assertThrows(NullPointerException.class, () -> graph.eval("g.V()", false));
+        assertEquals("graph.script-eval.enabled is not enabled", npe.getMessage());
+
+        clopen(option(SCRIPT_EVAL_ENABLED), true);
+        initializeGraphWithVerticesAndEdges();
+        long vertexCount = graph.traversal().V().count().next();
+
+        // basic queries
+        assertEquals(vertexCount, graph.eval("g.V().count().next()", false));
+        assertEquals(
+            graph.traversal().V().has("_v", 1).values("_v").hasNext(),
+            graph.eval("g.V().has('_v', 1).values('_v').hasNext()", false));
+        assertEquals(
+            graph.traversal().E().has("_e", 1).next(),
+            graph.eval("g.E().has(\"_e\", 1).next()", false));
+
+        // scripts with multiple lines are allowed
+        assertEquals(++vertexCount, graph.eval("g.addV().next();g.V().count().next()", true));
+
+        // non-gremlin query is not allowed
+        JanusGraphException ex = assertThrows(JanusGraphException.class, () -> graph.eval("g.V().map{t -> t.get()}.hasNext()", false));
+        assertEquals("Could not evaluate given gremlin script: g.V().map{t -> t.get()}.hasNext()", ex.getMessage());
+        assertThrows(JanusGraphException.class, () -> graph.eval("1 + 1", false));
+        assertThrows(JanusGraphException.class, () -> graph.eval("while(true) {}", false));
+
+        // cannot circumvent readonly limitation
+        assertThrows(JanusGraphException.class, () -> graph.eval("g2 = g.getGraph().traversal(); g2.V().drop().iterate(); g2.tx().commit();", false));
+
+        // cannot mutate the graph in readonly mode
+        ex = assertThrows(JanusGraphException.class, () -> graph.eval("g.addV().next()", false));
+        assertEquals("Could not evaluate given gremlin script: g.addV().next()", ex.getMessage());
+        assertEquals("org.apache.tinkerpop.gremlin.process.traversal.strategy.verification.VerificationException: " +
+            "The provided traversal has a mutating step and thus is not read only: AddVertexStartStep({label=[vertex]})", ex.getCause().getMessage());
+
+        // can mutate the graph in non-readonly mode
+        graph.eval("g.addV().next()", true);
+        assertEquals(vertexCount + 1, graph.traversal().V().count().next());
+        graph.tx().rollback();
+        assertEquals(vertexCount + 1, graph.traversal().V().count().next());
+
+        // commit in script does not affect other transactions
+        graph.traversal().addV("dummyLabel").next();
+        graph.eval("g.tx().commit()", true);
+        graph.tx().rollback();
+        assertFalse(graph.traversal().V().hasLabel("dummyLabel").hasNext());
+
+        // rollback in script does not affect other transactions
+        graph.traversal().addV("dummyLabel").next();
+        graph.eval("g.tx().rollback()", true);
+        graph.tx().commit();
+        assertTrue(graph.traversal().V().hasLabel("dummyLabel").hasNext());
+    }
+
+    @Test
+    public void testGremlinScriptEvaluationWithGremlinGroovyScriptEngine() {
+        clopen(option(SCRIPT_EVAL_ENABLED), true, option(SCRIPT_EVAL_ENGINE), "GremlinGroovyScriptEngine");
+        initializeGraphWithVerticesAndEdges();
+        final long vertexCount = graph.traversal().V().count().next();
+
+        // basic queries
+        assertEquals(vertexCount, graph.eval("g.V().count().next()", false));
+        assertEquals(
+            graph.traversal().V().has("_v", 1).values("_v").hasNext(),
+            graph.eval("g.V().has('_v', 1).values('_v').hasNext()", false));
+        assertEquals(
+            graph.traversal().E().has("_e", 1).next(),
+            graph.eval("g.E().has(\"_e\", 1).next()", false));
+
+        // basic non standard gremlin scripts
+        assertEquals(2, graph.eval("1 + 1", false));
+        assertEquals(true, graph.eval("g.V().map{t -> t.get()}.hasNext()", false));
+
+        // scripts with multiple lines are allowed
+        assertEquals(vertexCount + 1, graph.eval("g.addV().next();g.V().count().next()", true));
+
+        // can circumvent readonly limitation
+        if (!features.hasLocking()) {
+            graph.eval("g2 = g.getGraph().traversal(); g2.V().drop().iterate(); g2.tx().commit();", false);
+            assertFalse(graph.traversal().V().hasNext());
+        }
+    }
+
+    @Test
+    public void shouldSkipDBCacheAccess(){
+        if(!features.isDistributed()){
+            return;
+        }
+
+        clopen(option(DB_CACHE),true,option(DB_CACHE_CLEAN_WAIT),0,option(DB_CACHE_TIME),0L,
+            option(BASIC_METRICS),true,option(METRICS_MERGE_STORES),false);
+
+        String groupName = "shouldSkipDBCacheAccess";
+        String edgeStoreMetricsName = Backend.EDGESTORE_NAME + Backend.METRICS_CACHE_SUFFIX;
+
+        // Create test vertex
+        JanusGraphTransaction tx = graph.buildTransaction().start();
+        Object vertexId = tx.traversal().addV().property("name", "testProp").next().id();
+        tx.commit();
+        long cacheRetrievalCountAfterCreation = MetricManager.INSTANCE
+            .getCounter(groupName, edgeStoreMetricsName, CacheMetricsAction.RETRIEVAL.getName()).getCount();
+
+        // Check db-cache access works
+        tx = graph.buildTransaction().groupName(groupName).start();
+        tx.traversal().V(vertexId).valueMap().next();
+        long cacheRetrievalCountAfterReadWithCacheEnabled = MetricManager.INSTANCE
+            .getCounter(groupName, edgeStoreMetricsName, CacheMetricsAction.RETRIEVAL.getName()).getCount();
+        tx.rollback();
+        Assertions.assertTrue(cacheRetrievalCountAfterCreation < cacheRetrievalCountAfterReadWithCacheEnabled);
+
+        // Check db-cache read access is skipped when cache is disabled in transaction
+        tx = graph.buildTransaction().skipDBCacheRead().groupName(groupName).start();
+        tx.traversal().V(vertexId).valueMap().next();
+        long cacheRetrievalCountAfterReadWithCacheDisabled = MetricManager.INSTANCE
+            .getCounter(groupName, edgeStoreMetricsName, CacheMetricsAction.RETRIEVAL.getName()).getCount();
+        tx.rollback();
+        Assertions.assertEquals(cacheRetrievalCountAfterReadWithCacheEnabled, cacheRetrievalCountAfterReadWithCacheDisabled);
+    }
+
+    @Test
+    public void testVertexPropertiesForceInvalidationFromDBCache() {
+        if (features.hasLocking() || !features.isDistributed()) {
+            return;
+        }
+
+        JanusGraph graph1 = openInstanceWithDBCacheEnabled("testVertexPropertiesForceInvalidationFromDBCache1");
+        JanusGraph graph2 = openInstanceWithDBCacheEnabled("testVertexPropertiesForceInvalidationFromDBCache2");
+
+        JanusGraphVertex v1 = graph1.addVertex();
+        v1.property("name", "vertex1");
+        JanusGraphVertex v2 = graph1.addVertex();
+        v2.property("name", "vertex2");
+        JanusGraphVertex v3 = graph1.addVertex();
+        v3.property("name", "vertex3");
+
+        graph1.tx().commit();
+
+        // Cache vertices for graph1
+        JanusGraphTransaction tx1 = graph1.newTransaction();
+        tx1.traversal().V().valueMap().toList();
+        tx1.commit();
+
+        // Cache vertices for graph2
+        JanusGraphTransaction tx2 = graph2.newTransaction();
+        tx2.traversal().V().valueMap().toList();
+        tx2.commit();
+
+        tx1 = graph1.newTransaction();
+
+        // Update properties using graph1
+        tx1.traversal().V(v1.id()).property("name", "vertex1_updated").iterate();
+        tx1.traversal().V(v2.id()).property("name", "vertex2_updated").iterate();
+        tx1.traversal().V(v3.id()).property("name", "vertex3_updated").iterate();
+
+        tx1.commit();
+
+        tx2 = graph2.newTransaction();
+
+        // Check that cached properties in graph2 were not refreshed
+        assertEquals(Arrays.asList("vertex1"), tx2.traversal().V(v1.id()).valueMap().next().get("name"));
+        assertEquals(Arrays.asList("vertex2"), tx2.traversal().V(v2.id()).valueMap().next().get("name"));
+        assertEquals(Arrays.asList("vertex3"), tx2.traversal().V(v3.id()).valueMap().next().get("name"));
+
+        tx2.rollback();
+
+        // Invalidate cache for v1 only
+        graph2.getDBCacheInvalidationService().forceInvalidateVertexInEdgeStoreCache(v1.id());
+
+        tx2 = graph2.newTransaction();
+
+        // Check that v1 cache was refreshed but cache for v2 and v3 was not refreshed
+        assertEquals(Arrays.asList("vertex1_updated"), tx2.traversal().V(v1.id()).valueMap().next().get("name"));
+        assertEquals(Arrays.asList("vertex2"), tx2.traversal().V(v2.id()).valueMap().next().get("name"));
+        assertEquals(Arrays.asList("vertex3"), tx2.traversal().V(v3.id()).valueMap().next().get("name"));
+
+        tx2.rollback();
+
+        // Invalidate cache for v2 and v3
+        graph2.getDBCacheInvalidationService().forceInvalidateVerticesInEdgeStoreCache(Arrays.asList(v2.id(), v3.id()));
+
+        tx2 = graph2.newTransaction();
+
+        // Check that cache was refreshed for all three vertices
+        assertEquals(Arrays.asList("vertex1_updated"), tx2.traversal().V(v1.id()).valueMap().next().get("name"));
+        assertEquals(Arrays.asList("vertex2_updated"), tx2.traversal().V(v2.id()).valueMap().next().get("name"));
+        assertEquals(Arrays.asList("vertex3_updated"), tx2.traversal().V(v3.id()).valueMap().next().get("name"));
+
+        tx2.rollback();
+
+        graph1.close();
+        graph2.close();
+    }
+
+    @Test
+    public void testIndexStoreForceInvalidationFromDBCache() throws InterruptedException, ExecutionException {
+        if (features.hasLocking() || !features.isDistributed()) {
+            return;
+        }
+
+        // Define schema with 2 properties and 2 indices which include the same property
+        String indexProp1Name = "indexedProp1";
+        String indexProp2Name = "indexedProp2";
+        String index1Name = "index1";
+        String index2Name = "index2";
+        PropertyKey indexedProp1 = mgmt.makePropertyKey(indexProp1Name).dataType(Integer.class).cardinality(Cardinality.SINGLE).make();
+        PropertyKey indexedProp2 = mgmt.makePropertyKey(indexProp2Name).dataType(Integer.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.buildIndex(index1Name, Vertex.class).addKey(indexedProp1).buildCompositeIndex();
+        mgmt.buildIndex(index2Name, Vertex.class).addKey(indexedProp1).addKey(indexedProp2).buildCompositeIndex();
+        finishSchema();
+        ManagementSystem.awaitGraphIndexStatus(graph, index1Name).call();
+        ManagementSystem.awaitGraphIndexStatus(graph, index2Name).call();
+        mgmt.updateIndex(mgmt.getGraphIndex(index1Name), SchemaAction.REINDEX).get();
+        mgmt.updateIndex(mgmt.getGraphIndex(index2Name), SchemaAction.REINDEX).get();
+        finishSchema();
+
+        StandardJanusGraph graph1 = openInstanceWithDBCacheEnabled("testIndexStoreForceInvalidationFromDBCache1");
+        StandardJanusGraph graph2 = openInstanceWithDBCacheEnabled("testIndexStoreForceInvalidationFromDBCache2");
+
+        // Add 3 vertices which are indexed by 2 indexes
+        JanusGraphVertex v1 = graph1.addVertex();
+        v1.property(indexProp1Name, 1);
+        v1.property(indexProp2Name, 1);
+
+        JanusGraphVertex v2 = graph1.addVertex();
+        v2.property(indexProp1Name, 2);
+        v2.property(indexProp2Name, 2);
+
+        JanusGraphVertex v3 = graph1.addVertex();
+        v3.property(indexProp1Name, 3);
+        v3.property(indexProp2Name, 3);
+
+        graph1.tx().commit();
+
+        // Cache data
+        JanusGraphTransaction tx2 = graph2.newTransaction();
+        // Cache index 1 for graph 2
+        queryVertices(tx2, indexProp1Name, 1, 2, 3, -1, -2, -3);
+        // Cache index 2 and index 3 for graph 2
+        queryVertices(tx2, indexProp1Name, Arrays.asList(1, 2, 3, -1, -2, -3), indexProp2Name, Arrays.asList(1, 2, 3));
+        tx2.commit();
+
+        // Update indexProp1Name for all vertices using graph1
+        JanusGraphTransaction tx1 = graph1.newTransaction();
+        tx1.traversal().V(v1.id()).property(indexProp1Name, -1).iterate();
+        tx1.traversal().V(v2.id()).property(indexProp1Name, -2).iterate();
+        tx1.traversal().V(v3.id()).property(indexProp1Name, -3).iterate();
+        tx1.commit();
+
+        // Check that cached indexed vertices in graph2 were not refreshed
+        tx2 = graph2.newTransaction();
+        // Check that old (outdated) data is retrieved because of the cache
+        assertTrue(tx2.traversal().V().has(indexProp1Name, 1).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, 2).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, 3).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, 1).has(indexProp2Name, 1).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, 2).has(indexProp2Name, 2).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, 3).has(indexProp2Name, 3).hasNext());
+        // Check that new (updated) data is not retrieved because of the cache
+        assertFalse(tx2.traversal().V().has(indexProp1Name, -1).hasNext());
+        assertFalse(tx2.traversal().V().has(indexProp1Name, -2).hasNext());
+        assertFalse(tx2.traversal().V().has(indexProp1Name, -3).hasNext());
+        assertFalse(tx2.traversal().V().has(indexProp1Name, -1).has(indexProp2Name, 1).hasNext());
+        assertFalse(tx2.traversal().V().has(indexProp1Name, -2).has(indexProp2Name, 2).hasNext());
+        assertFalse(tx2.traversal().V().has(indexProp1Name, -3).has(indexProp2Name, 3).hasNext());
+        tx2.rollback();
+
+        invalidateUpdatedVertexProperty(graph2, v1.id(), indexProp1Name, 1, -1);
+
+        tx2 = graph2.newTransaction();
+        // Check that cache for index1 and values `1`, `-1` was refreshed but cache for 2,3,-2,-3 was not refreshed
+        assertFalse(tx2.traversal().V().has(indexProp1Name, 1).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, 2).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, 3).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, -1).hasNext());
+        assertFalse(tx2.traversal().V().has(indexProp1Name, -2).hasNext());
+        assertFalse(tx2.traversal().V().has(indexProp1Name, -3).hasNext());
+        // Check that cache for index2 and values `1`, `-1` was refreshed but cache for 2,3,-2,-3 was not refreshed
+        assertFalse(tx2.traversal().V().has(indexProp1Name, 1).has(indexProp2Name, 1).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, -1).has(indexProp2Name, 1).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, 2).has(indexProp2Name, 2).hasNext());
+        assertFalse(tx2.traversal().V().has(indexProp1Name, -2).has(indexProp2Name, 2).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, 3).has(indexProp2Name, 3).hasNext());
+        assertFalse(tx2.traversal().V().has(indexProp1Name, -3).has(indexProp2Name, 3).hasNext());
+        tx2.rollback();
+
+        invalidateUpdatedVertexProperty(graph2, v2.id(), indexProp1Name, 2, -2);
+        invalidateUpdatedVertexProperty(graph2, v3.id(), indexProp1Name, 3, -3);
+
+        tx2 = graph2.newTransaction();
+        // Check that cache was refreshed for all 3 vertices
+        assertFalse(tx2.traversal().V().has(indexProp1Name, 1).hasNext());
+        assertFalse(tx2.traversal().V().has(indexProp1Name, 2).hasNext());
+        assertFalse(tx2.traversal().V().has(indexProp1Name, 3).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, -1).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, -2).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, -3).hasNext());
+        assertFalse(tx2.traversal().V().has(indexProp1Name, 1).has(indexProp2Name, 1).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, -1).has(indexProp2Name, 1).hasNext());
+        assertFalse(tx2.traversal().V().has(indexProp1Name, 2).has(indexProp2Name, 2).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, -2).has(indexProp2Name, 2).hasNext());
+        assertFalse(tx2.traversal().V().has(indexProp1Name, 3).has(indexProp2Name, 3).hasNext());
+        assertTrue(tx2.traversal().V().has(indexProp1Name, -3).has(indexProp2Name, 3).hasNext());
+
+        graph1.close();
+        graph2.close();
+    }
+
+    @Test
+    public void testIndexWithIndexOnlyConstraintForceInvalidationFromDBCache() throws InterruptedException, ExecutionException {
+        if (features.hasLocking() || !features.isDistributed()) {
+            return;
+        }
+
+        String indexPropName = "indexedProp";
+        String vertexLabelName = "vertexLabelForIndexOnlyConstraint";
+        String indexName = "indexWithIndexOnlyConstraint";
+        PropertyKey indexedProp = mgmt.makePropertyKey(indexPropName).dataType(Integer.class).cardinality(Cardinality.SINGLE).make();
+        VertexLabel vertexLabel = mgmt.makeVertexLabel(vertexLabelName).make();
+        mgmt.buildIndex(indexName, Vertex.class).addKey(indexedProp).indexOnly(vertexLabel).buildCompositeIndex();
+        finishSchema();
+        ManagementSystem.awaitGraphIndexStatus(graph, indexName).call();
+        mgmt.updateIndex(mgmt.getGraphIndex(indexName), SchemaAction.REINDEX).get();
+        finishSchema();
+
+        StandardJanusGraph graph1 = openInstanceWithDBCacheEnabled("testIndexWithIndexOnlyConstraintForceInvalidationFromDBCache1");
+        StandardJanusGraph graph2 = openInstanceWithDBCacheEnabled("testIndexWithIndexOnlyConstraintForceInvalidationFromDBCache2");
+
+        JanusGraphVertex v1 = graph1.addVertex(vertexLabelName);
+        v1.property(indexPropName, 1);
+
+        graph1.tx().commit();
+
+        // Cache data
+        JanusGraphTransaction tx2 = graph2.newTransaction();
+        assertEquals(1L, tx2.traversal().V().hasLabel(vertexLabelName).has(indexPropName, 1).count().next());
+        tx2.commit();
+
+        // Remove vertex
+        JanusGraphTransaction tx1 = graph1.newTransaction();
+        tx1.traversal().V(v1.id()).drop().iterate();
+        tx1.commit();
+
+        // Check that cached indexed vertex in graph2 was not refreshed
+        tx2 = graph2.newTransaction();
+        assertEquals(1L, tx2.traversal().V().hasLabel(vertexLabelName).has(indexPropName, 1).count().next());
+
+        // Try to invalidate data without vertex label with index constraints filter enabled
+        invalidateUpdatedVertexProperty(graph2, v1.id(), indexPropName, 1, -1, true);
+        tx2.rollback();
+
+        tx2 = graph2.newTransaction();
+        // Check that invalidation didn't work
+        assertEquals(1L, tx2.traversal().V().hasLabel(vertexLabelName).has(indexPropName, 1).count().next());
+        tx2.rollback();
+
+        tx2 = graph2.newTransaction();
+        // Invalidate data without vertex label with index constraints filter disabled
+        invalidateUpdatedVertexProperty(graph2, v1.id(), indexPropName, 1, -1, false);
+        tx2.commit();
+
+        tx2 = graph2.newTransaction();
+        // Check that invalidation worked
+        assertEquals(0L, tx2.traversal().V().hasLabel(vertexLabelName).has(indexPropName, 1).count().next());
+        tx2.rollback();
+
+        graph1.close();
+        graph2.close();
+    }
+
+    @Test
+    public void testFullDBCacheInvalidation() throws InterruptedException, ExecutionException {
+        if (features.hasLocking() || !features.isDistributed()) {
+            return;
+        }
+
+        // Define schema with 2 properties and 2 indices which include the same property
+        String indexProp1Name = "someProp1";
+        String index1Name = "someIndex1";
+        PropertyKey indexedProp1 = mgmt.makePropertyKey(indexProp1Name).dataType(Integer.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.buildIndex(index1Name, Vertex.class).addKey(indexedProp1).buildCompositeIndex();
+        finishSchema();
+        ManagementSystem.awaitGraphIndexStatus(graph, index1Name).call();
+        mgmt.updateIndex(mgmt.getGraphIndex(index1Name), SchemaAction.REINDEX).get();
+        finishSchema();
+
+        StandardJanusGraph graph1 = openInstanceWithDBCacheEnabled("testIndexStoreForceInvalidationFromDBCache1");
+        StandardJanusGraph graph2 = openInstanceWithDBCacheEnabled("testIndexStoreForceInvalidationFromDBCache2");
+
+        // Add 3 vertices which are indexed by 2 indexes
+        JanusGraphVertex v1 = graph1.addVertex();
+        v1.property(indexProp1Name, 1);
+
+        graph1.tx().commit();
+
+        // Cache data
+        JanusGraphTransaction tx2 = graph2.newTransaction();
+        tx2.traversal().V(v1.id()).valueMap().next();
+        tx2.traversal().V().has(indexProp1Name, 1).toList();
+        tx2.traversal().V().has(indexProp1Name, -1).toList();
+        tx2.commit();
+
+        // Update indexProp1Name using graph1
+        JanusGraphTransaction tx1 = graph1.newTransaction();
+        tx1.traversal().V(v1.id()).property(indexProp1Name, -1).iterate();
+        tx1.commit();
+
+        // Check that cached indexed vertices in graph2 were not refreshed
+        tx2 = graph2.newTransaction();
+        assertTrue(tx2.traversal().V().has(indexProp1Name, 1).hasNext());
+        assertEquals(Arrays.asList(1), tx2.traversal().V(v1.id()).valueMap().next().get(indexProp1Name));
+        assertFalse(tx2.traversal().V().has(indexProp1Name, -1).hasNext());
+        tx2.rollback();
+
+        graph2.getDBCacheInvalidationService().clearEdgeStoreCache();
+
+        // Check only edgeStore was invalidated
+        tx2 = graph2.newTransaction();
+        assertTrue(tx2.traversal().V().has(indexProp1Name, 1).hasNext());
+        assertEquals(Arrays.asList(-1), tx2.traversal().V(v1.id()).valueMap().next().get(indexProp1Name));
+        assertFalse(tx2.traversal().V().has(indexProp1Name, -1).hasNext());
+        tx2.rollback();
+
+        graph2.getDBCacheInvalidationService().clearIndexStoreCache();
+
+        // Check both edgeStore and indexStore were invalidated
+        tx2 = graph2.newTransaction();
+        assertFalse(tx2.traversal().V().has(indexProp1Name, 1).hasNext());
+        assertEquals(Arrays.asList(-1), tx2.traversal().V(v1.id()).valueMap().next().get(indexProp1Name));
+        assertTrue(tx2.traversal().V().has(indexProp1Name, -1).hasNext());
+        tx2.rollback();
+
+        //// Check full cache clear method
+
+        // Cache data
+        tx2 = graph2.newTransaction();
+        tx2.traversal().V(v1.id()).valueMap().next();
+        tx2.traversal().V().has(indexProp1Name, -1).toList();
+        tx2.traversal().V().has(indexProp1Name, 2).toList();
+        tx2.commit();
+
+        // Update indexProp1Name using graph1 again
+        tx1 = graph1.newTransaction();
+        tx1.traversal().V(v1.id()).property(indexProp1Name, 2).iterate();
+        tx1.commit();
+
+        // Check cached data is now outdated in graph2
+        tx2 = graph2.newTransaction();
+        assertFalse(tx2.traversal().V().has(indexProp1Name, 2).hasNext());
+        assertEquals(Arrays.asList(-1), tx2.traversal().V(v1.id()).valueMap().next().get(indexProp1Name));
+        assertTrue(tx2.traversal().V().has(indexProp1Name, -1).hasNext());
+        tx2.rollback();
+
+        graph2.getDBCacheInvalidationService().clearDBCache();
+
+        // Check both edgeStore and indexStore caches were invalidated
+        tx2 = graph2.newTransaction();
+        assertTrue(tx2.traversal().V().has(indexProp1Name, 2).hasNext());
+        assertEquals(Arrays.asList(2), tx2.traversal().V(v1.id()).valueMap().next().get(indexProp1Name));
+        assertFalse(tx2.traversal().V().has(indexProp1Name, -1).hasNext());
+        tx2.rollback();
+
+        graph1.close();
+        graph2.close();
+    }
+
+    @Test
+    public void testMultiQueryDropsVertices() {
+
+        mgmt.makePropertyKey("id").dataType(Integer.class).cardinality(Cardinality.SINGLE).make();
+        PropertyKey nameProp = mgmt.makePropertyKey("name").dataType(String.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.makePropertyKey("details").dataType(String.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.buildIndex("nameIndex", Vertex.class).addKey(nameProp).buildCompositeIndex();
+
+        finishSchema();
+
+        int verticesAmount = 42;
+
+        addVerticesForDropTest(verticesAmount, tx);
+
+        clopen();
+
+        List<JanusGraphVertex> vertices = tx.traversal()
+            .V()
+            .has("name", "name_test")
+            .toList()
+            .stream()
+            .map(v -> (JanusGraphVertex) v)
+            .collect(Collectors.toList());
+
+        int actualCount = tx.multiQuery(vertices).drop().size();
+        clopen();
+
+        assertEquals(verticesAmount, actualCount);
+
+        long afterDropCount = getVerticesForDropTestCount(tx.traversal());
+
+        assertEquals(0, afterDropCount);
+    }
+
+    @Test
+    public void testMultiQueryDropsStrategyModes() {
+
+        mgmt.makePropertyKey("id").dataType(Integer.class).cardinality(Cardinality.SINGLE).make();
+        PropertyKey nameProp = mgmt.makePropertyKey("name").dataType(String.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.makePropertyKey("details").dataType(String.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.buildIndex("nameIndex", Vertex.class).addKey(nameProp).buildCompositeIndex();
+
+        finishSchema();
+
+        long verticesAmount = 42;
+
+        // Mode: NONE
+
+        addVerticesForDropTest(verticesAmount);
+        graph.tx().commit();
+        clopen(option(DROP_STEP_BATCH_MODE), MultiQueryDropStepStrategyMode.NONE.getConfigName());
+        assertEquals(verticesAmount, getVerticesForDropTestCount());
+        TraversalMetrics profileT = graph.traversal().V().drop().profile().next();
+        assertTrue(profileT.getMetrics().stream().anyMatch(metrics -> metrics.getName().equals(DropStep.class.getSimpleName())));
+        graph.tx().commit();
+        assertEquals(0, getVerticesForDropTestCount());
+
+        // Mode: ALL
+
+        addVerticesForDropTest(verticesAmount);
+        graph.tx().commit();
+        clopen(option(DROP_STEP_BATCH_MODE), MultiQueryDropStepStrategyMode.ALL.getConfigName());
+        assertEquals(verticesAmount, getVerticesForDropTestCount());
+        profileT = graph.traversal().V().drop().profile().next();
+        assertEquals("true", profileT.getMetrics().stream().filter(metrics -> metrics.getName().equals(JanusGraphDropStep.class.getSimpleName())).findAny().get().getAnnotation("multi"));
+        graph.tx().commit();
+        assertEquals(0, getVerticesForDropTestCount());
+
+        // `limit` with `drop` step.
+
+        addVerticesForDropTest(verticesAmount);
+        graph.tx().commit();
+        clopen(option(DROP_STEP_BATCH_MODE), MultiQueryDropStepStrategyMode.NONE.getConfigName());
+        assertEquals(verticesAmount, getVerticesForDropTestCount());
+        int limitSize = 2;
+        profileT = graph.traversal().V().limit(limitSize).drop().profile().next();
+        assertTrue(profileT.getMetrics().stream().anyMatch(metrics -> metrics.getName().equals(DropStep.class.getSimpleName())));
+        graph.tx().commit();
+        long afterDropCount = getVerticesForDropTestCount();
+        assertEquals(verticesAmount-limitSize, afterDropCount);
+        graph.traversal().V().drop().iterate();
+        graph.tx().commit();
+        addVerticesForDropTest(verticesAmount);
+        graph.tx().commit();
+        clopen(option(DROP_STEP_BATCH_MODE), MultiQueryDropStepStrategyMode.ALL.getConfigName());
+        assertEquals(verticesAmount, getVerticesForDropTestCount());
+        profileT = graph.traversal().V().limit(limitSize).drop().profile().next();
+        assertEquals("true", profileT.getMetrics().stream().filter(metrics -> metrics.getName().equals(JanusGraphDropStep.class.getSimpleName())).findAny().get().getAnnotation("multi"));
+        graph.tx().commit();
+        afterDropCount = getVerticesForDropTestCount();
+        assertEquals(verticesAmount-limitSize, afterDropCount);
+    }
+
+    @Test
+    public void testMetaPropertiesDrop(){
+        mgmt.makePropertyKey("id").dataType(Integer.class).cardinality(Cardinality.SINGLE).make();
+        PropertyKey nameProp = mgmt.makePropertyKey("name").dataType(String.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.makePropertyKey("details").dataType(String.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.buildIndex("nameIndex", Vertex.class).addKey(nameProp).buildCompositeIndex();
+
+        finishSchema();
+
+        long verticesAmount = 42;
+
+        for (int i = 0; i < verticesAmount; i++) {
+            Vertex vertex = tx.addVertex("id", i);
+            VertexProperty<String> property = vertex.property("name", "name_test");
+            property.property("details", "details_" + i);
+        }
+        graph.tx().commit();
+
+        clopen(option(DROP_STEP_BATCH_MODE), MultiQueryDropStepStrategyMode.ALL.getConfigName());
+
+        assertEquals(verticesAmount, graph.traversal().V().properties("name").properties("details").count().next());
+
+        graph.traversal().V().properties("name").properties("details").drop().hasNext();
+
+        assertEquals(0, graph.traversal().V().properties("name").properties("details").count().next());
+
+        graph.tx().commit();
+
+        assertEquals(0, graph.traversal().V().properties("name").properties("details").count().next());
+        assertEquals(verticesAmount, graph.traversal().V().has("name").count().next());
+    }
+
+    @Test
+    public void testEdgePropertiesDrop(){
+        mgmt.makePropertyKey("id").dataType(Integer.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.makePropertyKey("name").dataType(String.class).cardinality(Cardinality.SINGLE).make();
+        mgmt.makeEdgeLabel("relate").make();
+
+        finishSchema();
+
+        long verticesAmount = 42;
+
+        for (int i = 0; i < verticesAmount; i++) {
+            Vertex vertex = tx.addVertex("id", i);
+            Vertex vertex2 = tx.addVertex("id", i+verticesAmount);
+            vertex.addEdge("relate", vertex2).property("name", "name_"+i);
+        }
+
+        graph.tx().commit();
+
+        clopen(option(DROP_STEP_BATCH_MODE), MultiQueryDropStepStrategyMode.ALL.getConfigName());
+
+        assertEquals(verticesAmount, graph.traversal().E().properties("name").count().next());
+
+        graph.traversal().E().properties("name").drop().hasNext();
+
+        assertEquals(0, graph.traversal().E().properties("name").count().next());
+
+        graph.tx().commit();
+
+        assertEquals(0, graph.traversal().E().properties("name").count().next());
+        assertEquals(verticesAmount, graph.traversal().E().count().next());
+    }
+
+    private void addVerticesForDropTest(long verticesAmount){
+        addVerticesForDropTest(verticesAmount, graph);
+    }
+
+    private long getVerticesForDropTestCount(){
+        return getVerticesForDropTestCount(graph.traversal());
+    }
+
+    private void addVerticesForDropTest(long verticesAmount, Transaction tx){
+        for (int i = 0; i < verticesAmount; i++) {
+            Vertex vertex = tx.addVertex("id", i);
+            vertex.property("name", "name_test");
+            vertex.property("details", "details_" + i);
+        }
+    }
+
+    private long getVerticesForDropTestCount(GraphTraversalSource g){
+        return g.V()
+            .has("name", "name_test")
+            .count().next();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    public void testParallelBackendOps(boolean parallelBackendOpsEnabled) {
+        clopen(option(PARALLEL_BACKEND_OPS), parallelBackendOpsEnabled);
+
+        int verticesPerLevel = 10;
+        List<Vertex> firstLevelVertices = new ArrayList<>(verticesPerLevel);
+        for(int i=0;i<verticesPerLevel;i++){
+            firstLevelVertices.add(tx.addVertex());
+        }
+        for(Vertex firstLevelVertex : firstLevelVertices){
+            Vertex secondLevelVertex = tx.addVertex();
+            firstLevelVertex.addEdge("knows", secondLevelVertex);
+        }
+        tx.commit();
+        Assertions.assertEquals(verticesPerLevel, graph.traversal().V(firstLevelVertices).out("knows").count().next());
+    }
+
+    private void invalidateUpdatedVertexProperty(StandardJanusGraph graph, Object vertexIdUpdated, String propertyNameUpdated, Object previousPropertyValue, Object newPropertyValue){
+        invalidateUpdatedVertexProperty(graph, vertexIdUpdated, propertyNameUpdated, previousPropertyValue, newPropertyValue, true);
+    }
+
+    private void invalidateUpdatedVertexProperty(StandardJanusGraph graph, Object vertexIdUpdated, String propertyNameUpdated, Object previousPropertyValue, Object newPropertyValue, boolean withIndexConstraintsFilter) {
+        StandardJanusGraphTx tx = (StandardJanusGraphTx) graph.newTransaction();
+        JanusGraphManagement graphMgmt = graph.openManagement();
+        PropertyKey propertyKey = graphMgmt.getPropertyKey(propertyNameUpdated);
+        CacheVertex cacheVertex = new CacheVertex(tx, vertexIdUpdated, ElementLifeCycle.Loaded);
+        StandardVertexProperty propertyPreviousVal = new StandardVertexProperty(propertyKey.longId(), propertyKey, cacheVertex, previousPropertyValue, ElementLifeCycle.Removed);
+        StandardVertexProperty propertyNewVal = new StandardVertexProperty(propertyKey.longId(), propertyKey, cacheVertex, newPropertyValue, ElementLifeCycle.New);
+        IndexSerializer indexSerializer = graph.getIndexSerializer();
+
+        Stream<IndexUpdate> indexUpdates;
+        if (withIndexConstraintsFilter) {
+            indexUpdates = indexSerializer.getIndexUpdates(cacheVertex, Arrays.asList(propertyPreviousVal, propertyNewVal), tx);
+        } else {
+            indexUpdates = indexSerializer.getIndexUpdatesNoConstraints(cacheVertex, Arrays.asList(propertyPreviousVal, propertyNewVal), tx);
+        }
+
+        CacheInvalidationService invalidationService = graph.getDBCacheInvalidationService();
+
+        indexUpdates.forEach(indexUpdate -> {
+            StaticBuffer keyToInvalidate = (StaticBuffer) indexUpdate.getKey();
+            invalidationService.markKeyAsExpiredInIndexStore(keyToInvalidate);
+        });
+
+        invalidationService.forceClearExpiredKeysInIndexStoreCache();
+        invalidationService.forceInvalidateVertexInEdgeStoreCache(vertexIdUpdated);
+
+        graphMgmt.rollback();
+        tx.rollback();
+    }
+
+    private void queryVertices(JanusGraphTransaction tx, String propName, Object ... values){
+        for(Object value : values){
+            tx.traversal().V().has(propName, value).toList();
+        }
+    }
+
+    private void queryVertices(JanusGraphTransaction tx, String prop1Name, Iterable<Object> prop1Values, String prop2Name, Iterable<Object> prop2Values){
+        for(Object prop1Value : prop1Values){
+            for(Object prop2Value : prop2Values){
+                tx.traversal().V().has(prop1Name, prop1Value).has(prop2Name, prop2Value).toList();
+                tx.traversal().V().has(prop2Name, prop2Value).has(prop1Name, prop1Value).toList();
+            }
+        }
+    }
+
+    private StandardJanusGraph openInstanceWithDBCacheEnabled(String uniqueInstanceId){
+        WriteConfiguration configCopy = config.copy();
+        configCopy.set(ConfigElement.getPath(UNIQUE_INSTANCE_ID), uniqueInstanceId);
+        configCopy.set(ConfigElement.getPath(REPLACE_INSTANCE_IF_EXISTS), true);
+        configCopy.set(ConfigElement.getPath(DB_CACHE), true);
+        configCopy.set(ConfigElement.getPath(DB_CACHE_TIME), 0);
+        configCopy.set(ConfigElement.getPath(STORAGE_BATCH), false);
+        return (StandardJanusGraph) JanusGraphFactory.open(configCopy);
+    }
+
+    private GraphTraversal<Vertex, Vertex> getV(String propertyName1, Object value1, String propertyName2, Object value2, String vertexLabel){
+        GraphTraversal<Vertex, Vertex> traversal = tx.traversal().V();
+        if(vertexLabel != null){
+            traversal = traversal.hasLabel(vertexLabel);
+        }
+        return traversal.has(propertyName1, value1).has(propertyName2, value2);
+    }
 }

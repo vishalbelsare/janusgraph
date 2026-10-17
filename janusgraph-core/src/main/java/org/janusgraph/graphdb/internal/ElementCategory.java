@@ -30,6 +30,8 @@ import org.janusgraph.graphdb.types.VertexLabelVertex;
 import org.janusgraph.graphdb.types.vertices.EdgeLabelVertex;
 import org.janusgraph.graphdb.types.vertices.PropertyKeyVertex;
 
+import java.util.Locale;
+
 /**
 * @author Matthias Broecheler (me@matthiasb.com)
 */
@@ -87,15 +89,16 @@ public enum ElementCategory {
     }
 
     public String getName() {
-        return toString().toLowerCase();
+        return toString().toLowerCase(Locale.ROOT);
     }
 
     public JanusGraphElement retrieve(Object elementId, JanusGraphTransaction tx) {
         Preconditions.checkArgument(elementId!=null,"Must provide elementId");
         switch (this) {
             case VERTEX:
-                Preconditions.checkArgument(elementId instanceof Long, "elementId [%s] must be of type Long", elementId);
-                return tx.getVertex((Long) elementId);
+                Preconditions.checkArgument(elementId instanceof Long || elementId instanceof String,
+                    "elementId [%s] must be of type Long or String", elementId);
+                return tx.getVertex(elementId);
             case EDGE:
                 Preconditions.checkArgument(elementId instanceof RelationIdentifier, "elementId [%s] must be of type RelationIdentifier", elementId);
                 return RelationIdentifierUtils.findEdge(((RelationIdentifier)elementId), tx);

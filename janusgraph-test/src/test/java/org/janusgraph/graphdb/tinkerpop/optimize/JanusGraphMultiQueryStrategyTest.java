@@ -21,27 +21,33 @@ import org.apache.tinkerpop.gremlin.process.traversal.dsl.graph.__;
 import org.apache.tinkerpop.gremlin.process.traversal.step.branch.ChooseStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.branch.LocalStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.branch.OptionalStep;
-import org.apache.tinkerpop.gremlin.process.traversal.step.branch.RepeatStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.branch.UnionStep;
+import org.apache.tinkerpop.gremlin.process.traversal.step.filter.AndStep;
+import org.apache.tinkerpop.gremlin.process.traversal.step.filter.OrStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.filter.TraversalFilterStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.NoOpBarrierStep;
+import org.apache.tinkerpop.gremlin.process.traversal.util.TraversalMetrics;
 import org.apache.tinkerpop.gremlin.structure.Edge;
 import org.janusgraph.graphdb.query.profile.QueryProfiler;
 import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphMultiQueryStep;
+import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphNoOpBarrierVertexOnlyStep;
 import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphPropertiesStep;
 import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphStep;
+import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphRepeatStep;
 import org.janusgraph.graphdb.tinkerpop.optimize.step.JanusGraphVertexStep;
 import org.janusgraph.graphdb.tinkerpop.optimize.strategy.JanusGraphLocalQueryOptimizerStrategy;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.JanusGraphUnusedMultiQueryRemovalStrategy;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 
 import static org.apache.tinkerpop.gremlin.process.traversal.Order.desc;
 import static org.janusgraph.graphdb.JanusGraphBaseTest.option;
-import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.LIMIT_BATCH_SIZE;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.LIMITED_BATCH;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.USE_MULTIQUERY;
 import static org.janusgraph.testutil.JanusGraphAssert.assertNumStep;
 import static org.janusgraph.testutil.JanusGraphAssert.assertCount;
+import static org.janusgraph.testutil.JanusGraphAssert.assertStepExists;
 import static org.janusgraph.testutil.JanusGraphAssert.queryProfilerAnnotationIsPresent;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -49,7 +55,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class JanusGraphMultiQueryStrategyTest extends OptimizerStrategyTest {
 
     @Test
-    public void testQueryIsExecutableIfJanusGraphLocalQueryOptimizerStrategyIsEnabled() {
+    public void testQueryIsExecutableIfJanusGraphMultiQueriableReplacementStrategyIsEnabled() {
         clopen(option(USE_MULTIQUERY), true);
         makeSampleGraph();
 
@@ -76,11 +82,11 @@ public class JanusGraphMultiQueryStrategyTest extends OptimizerStrategyTest {
 
     @Test
     public void testNoOpBarrierStepInsertedIfNotPresentAndLimitBatchSize() {
-        clopen(option(USE_MULTIQUERY), true, option(LIMIT_BATCH_SIZE), true);
+        clopen(option(USE_MULTIQUERY), true, option(LIMITED_BATCH), true);
         makeSampleGraph();
 
         final GraphTraversal<?,?> traversalWithoutExplicitBarrier = g.V(sv[0]).outE().inV();
-        assertNumStep(numV, 1, traversalWithoutExplicitBarrier, NoOpBarrierStep.class);
+        assertNumStep(numV, 1, traversalWithoutExplicitBarrier, JanusGraphNoOpBarrierVertexOnlyStep.class);
 
         final GraphTraversal<?,?> traversalWithExplicitBarrier = g.V(sv[0]).barrier(1).outE().inV();
         assertNumStep(numV, 1, traversalWithExplicitBarrier, NoOpBarrierStep.class);
@@ -88,14 +94,14 @@ public class JanusGraphMultiQueryStrategyTest extends OptimizerStrategyTest {
 
     @Test
     public void testNoOpBarrierStepNotInsertedLimitBatchSizeDisabled() {
-        clopen(option(USE_MULTIQUERY), true, option(LIMIT_BATCH_SIZE), false);
+        clopen(option(USE_MULTIQUERY), true, option(LIMITED_BATCH), false);
         makeSampleGraph();
 
-        final GraphTraversal<?,?> traversalWithoutExplicitBarrier = g.V(sv[0]).outE().inV();
-        assertNumStep(numV, 0, traversalWithoutExplicitBarrier, NoOpBarrierStep.class);
+        assertNumStep(numV, 0, g.V(sv[0]).outE().inV(), JanusGraphNoOpBarrierVertexOnlyStep.class);
+        assertNumStep(numV, 0, g.V(sv[0]).outE().inV(), NoOpBarrierStep.class);
 
-        final GraphTraversal<?,?> traversalWithExplicitBarrier = g.V(sv[0]).barrier(1).outE().inV();
-        assertNumStep(numV, 1, traversalWithExplicitBarrier, NoOpBarrierStep.class);
+        assertNumStep(numV, 1, g.V(sv[0]).barrier(1).outE().inV(), NoOpBarrierStep.class);
+        assertNumStep(numV, 0, g.V(sv[0]).barrier(1).outE().inV(), JanusGraphNoOpBarrierVertexOnlyStep.class);
     }
 
     @Test
@@ -121,7 +127,7 @@ public class JanusGraphMultiQueryStrategyTest extends OptimizerStrategyTest {
                 .has("id", loop[0]))
             .times(numV)
             .profile("~metrics");
-        assertNumStep(3, 1, (GraphTraversal)t, RepeatStep.class);
+        assertNumStep(3, 1, (GraphTraversal)t, JanusGraphRepeatStep.class);
         assertEquals(numV - 1, loop[0]);
         assertTrue(queryProfilerAnnotationIsPresent(t, QueryProfiler.MULTIQUERY_ANNOTATION));
 
@@ -149,5 +155,47 @@ public class JanusGraphMultiQueryStrategyTest extends OptimizerStrategyTest {
         t = g.V().has("id", sid).values("names").profile("~metrics");
         assertCount(superV * numV, t);
         assertTrue(queryProfilerAnnotationIsPresent(t, QueryProfiler.MULTIQUERY_ANNOTATION));
+
+        //Verify that multi-query optimization is used with and step
+        t = g.V(vs[0],vs[1],vs[2]).and(__.inE("knows").count().is(P.gte(1)), __.in("knows").count().is(P.gte(2))).profile("~metrics");
+        assertNumStep(3, 1, (GraphTraversal)t, AndStep.class);
+        assertTrue(queryProfilerAnnotationIsPresent(t, QueryProfiler.MULTIQUERY_ANNOTATION));
+        assertStepExists(t, JanusGraphVertexStep.class, 2);
+        assertStepExists(t, JanusGraphMultiQueryStep.class, 1);
+
+        //Verify that multi-query optimization is used with or step
+        t = g.V(vs[0],vs[1],vs[2]).or(__.out("knows").count().is(P.gte(1000)), __.in("knows").count().is(P.gte(1))).profile("~metrics");
+        assertNumStep(3, 1, (GraphTraversal)t, OrStep.class);
+        assertTrue(queryProfilerAnnotationIsPresent(t, QueryProfiler.MULTIQUERY_ANNOTATION));
+        assertStepExists(t, JanusGraphVertexStep.class, 2);
+        assertStepExists(t, JanusGraphMultiQueryStep.class, 1);
+    }
+
+    @Test
+    public void testNonNecessaryMultiQueryUnused(){
+        clopen(option(USE_MULTIQUERY), true);
+        makeSampleGraph();
+
+        TraversalMetrics traversalMetricsWithStrategy = graph.traversal()
+            .V()
+            .choose(__.id().is(P.gte(5000L)), __.constant(12345L), __.id())
+            .limit(3).profile().next();
+
+        Long graphStepTraversalsCount = traversalMetricsWithStrategy.getMetrics().stream().filter(metrics -> metrics.getName().startsWith(JanusGraphStep.class.getSimpleName()))
+            .findFirst().get().getCount(TraversalMetrics.TRAVERSER_COUNT_ID);
+
+        // It would be expected 3, but due to the bug on TinkerPop side it's 4.
+        // See https://issues.apache.org/jira/browse/TINKERPOP-2490
+        assertTrue(graphStepTraversalsCount < 5L);
+
+        TraversalMetrics traversalMetricsWithoutStrategy = graph.traversal().withoutStrategies(JanusGraphUnusedMultiQueryRemovalStrategy.class)
+            .V()
+            .choose(__.id().is(P.gte(5000L)), __.constant(12345L), __.id())
+            .limit(3).profile().next();
+
+        graphStepTraversalsCount = traversalMetricsWithoutStrategy.getMetrics().stream().filter(metrics -> metrics.getName().startsWith(JanusGraphStep.class.getSimpleName()))
+            .findFirst().get().getCount(TraversalMetrics.TRAVERSER_COUNT_ID);
+
+        assertTrue(graphStepTraversalsCount > 5L);
     }
 }

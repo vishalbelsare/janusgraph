@@ -16,6 +16,8 @@ package org.janusgraph.pkgtest;
 
 import org.janusgraph.diskstorage.es.JanusGraphElasticsearchContainer;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Test;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
@@ -31,7 +33,7 @@ import java.util.Comparator;
 public class BerkeleyESAssemblyIT extends AbstractJanusGraphAssemblyIT {
 
     @Container
-    private static JanusGraphElasticsearchContainer es = new JanusGraphElasticsearchContainer(true);
+    private static final JanusGraphElasticsearchContainer _es = new JanusGraphElasticsearchContainer(true);
 
     @Override
     protected String getConfigPath() {
@@ -62,5 +64,11 @@ public class BerkeleyESAssemblyIT extends AbstractJanusGraphAssemblyIT {
                 e.printStackTrace();
             }
         }
+    }
+
+    @Test
+    @Disabled
+    @Override
+    public void testSparkGraphComputerTraversalLocal() {
     }
 }

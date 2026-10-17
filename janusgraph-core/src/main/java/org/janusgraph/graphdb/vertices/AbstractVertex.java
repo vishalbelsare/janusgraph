@@ -32,11 +32,9 @@ import org.janusgraph.core.VertexLabel;
 import org.janusgraph.graphdb.internal.AbstractElement;
 import org.janusgraph.graphdb.internal.ElementLifeCycle;
 import org.janusgraph.graphdb.internal.InternalVertex;
+import org.janusgraph.graphdb.query.vertex.BasicVertexCentricQueryUtil;
 import org.janusgraph.graphdb.query.vertex.VertexCentricQueryBuilder;
 import org.janusgraph.graphdb.transaction.StandardJanusGraphTx;
-import org.janusgraph.graphdb.types.VertexLabelVertex;
-import org.janusgraph.graphdb.types.system.BaseLabel;
-import org.janusgraph.graphdb.types.system.BaseVertexLabel;
 import org.janusgraph.graphdb.util.ElementHelper;
 
 import java.util.Iterator;
@@ -47,7 +45,7 @@ public abstract class AbstractVertex extends AbstractElement implements Internal
     private final StandardJanusGraphTx tx;
 
 
-    protected AbstractVertex(StandardJanusGraphTx tx, long id) {
+    protected AbstractVertex(StandardJanusGraphTx tx, Object id) {
         super(id);
         assert tx != null;
         this.tx = tx;
@@ -58,7 +56,7 @@ public abstract class AbstractVertex extends AbstractElement implements Internal
         if (tx.isOpen())
             return this;
 
-        InternalVertex next = (InternalVertex) tx.getNextTx().getVertex(longId());
+        InternalVertex next = (InternalVertex) tx.getNextTx().getVertex(id());
         if (next == null) throw InvalidElementException.removedException(this);
         else return next;
     }
@@ -73,19 +71,14 @@ public abstract class AbstractVertex extends AbstractElement implements Internal
     }
 
     @Override
-    public long getCompareId() {
-        if (tx.isPartitionedVertex(this)) return tx.getIdInspector().getCanonicalVertexId(longId());
-        else return longId();
+    public Object getCompareId() {
+        if (tx.isPartitionedVertex(this)) return tx.getIdInspector().getCanonicalVertexId(((Number) id()).longValue());
+        else return id();
     }
 
     @Override
     public String toString() {
         return StringFactory.vertexString(this);
-    }
-
-    @Override
-    public Object id() {
-        return longId();
     }
 
     @Override
@@ -105,16 +98,17 @@ public abstract class AbstractVertex extends AbstractElement implements Internal
 	 */
 
     @Override
+    public synchronized void remove(Iterable<JanusGraphRelation> loadedRelations) {
+        verifyAccess();
+        for (JanusGraphRelation r : loadedRelations) {
+            r.remove();
+        }
+    }
+
+    @Override
     public synchronized void remove() {
         verifyAccess();
-//        if (isRemoved()) return; //Remove() is idempotent
-        Iterator<JanusGraphRelation> iterator = it().query().noPartitionRestriction().relations().iterator();
-        while (iterator.hasNext()) {
-            iterator.next();
-            iterator.remove();
-        }
-        //Remove all system types on the vertex
-        for (JanusGraphRelation r : it().query().noPartitionRestriction().system().relations()) {
+        for (JanusGraphRelation r : it().query().noPartitionRestriction().all().relations()) {
             r.remove();
         }
     }
@@ -130,14 +124,12 @@ public abstract class AbstractVertex extends AbstractElement implements Internal
     }
 
     protected Vertex getVertexLabelInternal() {
-        return Iterables.getOnlyElement(tx().query(this).noPartitionRestriction().type(BaseLabel.VertexLabelEdge).direction(Direction.OUT).vertices(),null);
+        return Iterables.getOnlyElement(BasicVertexCentricQueryUtil.withLabelVertices(tx().query(this)).vertices(),null);
     }
 
     @Override
     public VertexLabel vertexLabel() {
-        Vertex label = getVertexLabelInternal();
-        if (label==null) return BaseVertexLabel.DEFAULT_VERTEXLABEL;
-        else return (VertexLabelVertex)label;
+        return BasicVertexCentricQueryUtil.castToVertexLabel(getVertexLabelInternal());
     }
 
     @Override
@@ -202,8 +194,4 @@ public abstract class AbstractVertex extends AbstractElement implements Internal
         return (Iterator)query().direction(direction).labels(edgeLabels).vertices().iterator();
 
     }
-
-
-
-
 }

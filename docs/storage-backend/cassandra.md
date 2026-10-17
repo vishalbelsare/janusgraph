@@ -21,6 +21,14 @@ With Cassandra 4.0, Thrift support will be removed in Cassandra.
 JanusGraph just supports the CQL storage backend.
 
 !!! note
+    The CQL backend is integration tested against Apache Cassandra 3.11,
+    4.0 and 5.0 (with both the Murmur3 and ByteOrdered partitioners). The
+    DataStax Java driver used by JanusGraph negotiates the native protocol
+    automatically, and table creation adapts the `compression` options to
+    the format expected by the detected Cassandra major version, so no
+    configuration changes are required when moving between these versions.
+
+!!! note
     If security is enabled on Cassandra, the user must have
     `CREATE permission on <all keyspaces>`, otherwise the keyspace must be
     created ahead of time by an administrator including the required
@@ -40,8 +48,7 @@ Cassandra communicate with one another via a `localhost` socket. Running
 JanusGraph over Cassandra requires the following setup steps:
 
 1.  [Download Cassandra](http://cassandra.apache.org/download/), unpack
-    it, and set filesystem paths in `conf/cassandra.yaml` and
-    `conf/log4j-server.properties`
+    it, and set filesystem paths in `conf/cassandra.yaml`.
 2.  Connecting Gremlin Server to Cassandra using the default
     configuration files provided in the pre-packaged distribution.
 3.  Start Cassandra by invoking `bin/cassandra -f` on the command line
@@ -179,6 +186,47 @@ More information on Cassandra consistency levels and acceptable
 values can be found [here](https://docs.datastax.com/en/cassandra-oss/3.x/cassandra/dml/dmlDataConsistencyTOC.html).
 In general, higher levels are more consistent and robust but have higher latency.
 
+### Super-node deletion (whole-row delete)
+
+Removing a vertex with many incident edges previously issued one column-level `DELETE` per edge on the
+vertex's partition, creating a large number of cell tombstones that can overwhelm reads on that partition.
+As of 1.2.0, when a vertex is removed JanusGraph instead issues a single partition-level
+`DELETE ... WHERE key = ?`, producing one tombstone for the whole partition. This is controlled by
+`storage.drop-whole-row-on-vertex-removal` (default `true`). Set it to `false` to restore the previous
+per-column behavior.
+
+### Reattempted and speculative requests
+
+The DataStax driver sends a request again, to the same node or another one, after a closed connection, an overloaded
+node or a server error, asks its retry policy about a write which timed out, and runs speculative executions, only for
+statements which are marked idempotent. JanusGraph's reads are idempotent. Its writes, which it sends in batches, are
+marked idempotent while `graph.assign-timestamp` is `true`, the default, as a write sent again then writes the same
+cells with the same timestamp. With `storage.cql.idempotent-writes=false`, or with `graph.assign-timestamp=false`, which
+the Amazon Keyspaces configuration below sets, writes aren't marked and keep the driver's default idempotence,
+`basic.request.default-idempotence`, which is `false` unless configured otherwise. The driver's default retry policy
+resends a write which timed out only when it was the batch log write of a logged batch, as
+`storage.cql.atomic-batch-mutate=true` sends. A failure which the driver doesn't reattempt reaches JanusGraph, which
+reattempts the whole operation after a backoff while the failure is temporary, for up to `storage.read-time` or
+`storage.write-time`.
+
+Speculative executions are off by default. A policy configured through the internal driver configuration, for example
+
+```properties
+storage.cql.internal.string-configuration=datastax-java-driver { advanced.speculative-execution-policy { class = ConstantSpeculativeExecutionPolicy\, max-executions = 2\, delay = 100 milliseconds } }
+```
+
+sends a request which hasn't been answered after the delay to the next node of its query plan as well, and takes the
+first answer: a read, or an idempotent write. JanusGraph reads a comma in a property value as a list separator, so the
+commas of the driver configuration are escaped. The driver checks for due executions every
+`storage.cql.netty.timer-tick-duration`, 100 milliseconds by default, so a shorter delay needs a shorter tick.
+
+A write which is sent again, whether the driver reattempts it or runs a speculative execution of it, writes the same
+cells with the same timestamp, but an insert with a TTL computes its expiry anew where it applies. Of two copies of a
+cell with the same timestamp Cassandra keeps the one which expires later, so a resend can extend the lifetime of a cell
+with a TTL by the time between the sends, even when the first copy was written. JanusGraph's own reattempts of a write
+could already do the same. Where data with a TTL has to expire exactly on time, leave speculative executions off, or
+set `storage.cql.idempotent-writes=false` to keep them to reads.
+
 ## Global Graph Operations
 
 JanusGraph over Cassandra supports global vertex and edge iteration.
@@ -186,7 +234,72 @@ However, note that all these vertices and/or edges will be loaded into
 memory which can cause `OutOfMemoryException`. Use [JanusGraph with TinkerPop’s Hadoop-Gremlin](../advanced-topics/hadoop.md) to
 iterate over all vertices or edges in large graphs effectively.
 
-## Deploying on Amazon Keyspaces (Experimental)
+## Deploying on DataStax Astra
+
+> Astra DB simplifies cloud-native Cassandra application development. It reduces deployment time from weeks to minutes,
+> and delivers an unprecedented combination of serverless, pay-as-you-go pricing with the freedom and agility of
+> multi-cloud and open source.
+>
+> —  [DataStax Astra](https://www.datastax.com/products/datastax-astra)
+
+[Download](https://docs.datastax.com/en/astra/docs/obtaining-database-credentials.html) the secure-connect zipped bundle for your Astra database.
+
+While connecting to Astra DB from JanusGraph, it is preferred to make use of the secure bundle connection file
+as-is without extracting it. There are multiple ways in which a secure bundle connection file can be passed on to
+the JanusGraph configuration to connect to Astra DB using the DataStax driver.
+
+### Internal string configuration
+Set the property `storage.cql.internal.string-configuration` to `datastax-java-driver { basic.cloud.secure-connect-bundle=<path-to-secure-bundle-zip-file> }`
+and set the username, password and keyspace details.
+
+For example:
+```properties
+gremlin.graph=org.janusgraph.core.JanusGraphFactory
+storage.backend=cql
+storage.cql.keyspace=<keyspace name which was created in AstraDB>
+storage.username=<clientID>
+storage.password=<clientSecret>
+storage.cql.internal.string-configuration=datastax-java-driver { basic.cloud.secure-connect-bundle=<path-to-secure-bundle-zip-file> }
+```
+
+Also, you can set a jvm argument to pass the secure bundle file as shown below and remove that property
+`(storage.cql.internal.string-configuration)` from the list above.
+
+`-Ddatastax-java-driver.basic.cloud.secure-connect-bundle=<path-to-secure-bundle-zip-file>`
+
+### Internal file configuration
+Set the property `storage.cql.internal.file-configuration` to an external configuration file if you would like to
+externalize the astra connection related properties to a separate file and specify the secure bundle and credentials information on that file.
+
+For example:
+```properties
+gremlin.graph=org.janusgraph.core.JanusGraphFactory
+storage.backend=cql
+storage.cql.keyspace=<keyspace-name>
+# Link to the external file that DataStax driver understands
+storage.cql.internal.file-configuration=<path-to-astra.conf>
+```
+astra.conf (external file)
+```
+datastax-java-driver {
+  basic.cloud {
+    secure-connect-bundle = "<path-to-secure-bundle-zip-file>"
+  }
+  advanced.auth-provider {
+    class = PlainTextAuthProvider
+    username = "<clientID>"
+    password = "<clientSecret>"
+  }
+}
+```
+
+Note: Client id and Client secret need to be generated and copied from your Astra Account
+as per this [doc](https://docs.datastax.com/en/astra/docs/manage-application-tokens.html).
+
+To learn more about different configuration options of DataStax driver, please refer to the DataStax driver configuration
+[documentation](https://docs.datastax.com/en/developer/java-driver/latest/manual/core/configuration/).
+
+## Deploying on Amazon Keyspaces
 
 > Amazon Keyspaces (for Apache Cassandra) is a scalable, highly available, and managed
 > Apache Cassandra–compatible database service. Amazon Keyspaces is serverless, so you
@@ -270,6 +383,11 @@ storage.password=<your-service-password>
 storage.cql.keyspace=janusgraph
 storage.cql.local-datacenter=<your-datacenter, e.g. ap-east-1>
 
+# Wait for 30 seconds after each table creation, since
+# Amazon Keyspace creates tables asynchronously. Remember to
+# remove this option from config file after the creation of the graph.
+storage.cql.init-wait-time=30000
+
 # SSL related settings
 storage.cql.ssl.enabled=true
 storage.cql.ssl.truststore.location=<your-trust-store-location>
@@ -278,6 +396,13 @@ storage.cql.ssl.truststore.password=<your-trust-store-password>
 # Amazon Keyspaces does not support user-generated timestamps
 # Thus, the below config must be turned off
 graph.assign-timestamp=false
+
+# We strongly recommend you to turn on this config. It will
+# prohibit all full-scan attempts. This is because Amazon keyspace
+# diverges from Apache Cassandra and might result in incomplete
+# results when a full-scan is executed. See issue #3390 for more
+# details
+query.force-index=true
 
 # Amazon Keyspaces only supports LOCAL QUORUM consistency
 storage.cql.only-use-local-consistency-for-system-operations=true
@@ -288,10 +413,12 @@ log.tx.key-consistent=true
 
 # Amazon Keyspaces does not have metadata available to clients
 # Thus, we need to tell JanusGraph that metadata are disabled,
-# and provide a hint of which partitioner AWS is using.
+# and provide a hint of which partitioner AWS is using. Valid
+# partitioner-names are: Murmur3Partitioner, RandomPartitioner,
+# and DefaultPartitioner
 storage.cql.metadata-schema-enabled=false
 storage.cql.metadata-token-map-enabled=false
-storage.cql.partitioner-name=DefaultPartitioner
+storage.cql.partitioner-name=Murmur3Partitioner
 ```
 
 Now you should be able to open the graph via gremlin console
@@ -307,9 +434,11 @@ would likely see error message like
     At the same time, you should be able to see the same table getting created on Amazon Keyspaces console UI.
     The creation process typically takes a few seconds. Once the creation is done, you could open
     the graph again, and the error will be gone. Unfortunately, you would *have to* follow the same process
-    for all tables. Alternatively, you could create the tables on AWS manually, if you are familiar with
-    JanusGraph. Typically nine tables are needed: `edgestore`, `edgestore_lock_`, `graphindex`, `graphindex_lock_`,
-    `janusgraph_ids`, `	system_properties`, `system_properties_lock_`, `systemlog`, and `txlog`.
+    for all tables. To address this problem, you could set `storage.cql.init-wait-time=30000` in your config 
+    file to wait for 30 seconds (or any other duration you feel suitable) after creating each table. You should
+    remove this config after the creation of the graph. Alternatively, you could create the tables on AWS manually,
+    if you are familiar with JanusGraph. Typically nine tables are needed: `edgestore`, `edgestore_lock_`,
+    `graphindex`, `graphindex_lock_`, `janusgraph_ids`, `	system_properties`, `system_properties_lock_`, `systemlog`, and `txlog`.
 
 ## Deploying on Amazon EC2
 

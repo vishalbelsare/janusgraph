@@ -21,6 +21,7 @@ import org.janusgraph.diskstorage.configuration.ModifiableConfiguration;
 import org.janusgraph.example.GraphOfTheGodsFactory;
 import org.janusgraph.graphdb.JanusGraphIndexTest;
 import org.janusgraph.util.system.IOUtils;
+import org.junit.Assert;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
@@ -41,6 +42,19 @@ public class BerkeleyElasticsearchTest extends ElasticsearchJanusGraphIndexTest 
         return getBerkeleyJEConfiguration();
     }
 
+    //Every result larger than a page through a point in time on a cluster which has them, sorted, limited or not
+    @Override
+    protected ElasticSearchPagingMode getPagingMode() {
+        return ElasticSearchPagingMode.POINT_IN_TIME;
+    }
+
+    // flaky test: https://github.com/JanusGraph/janusgraph/issues/3960
+    @RepeatedIfExceptionsTest(repeats = 3)
+    @Override
+    public void indexShouldNotExistAfterDeletion() throws Exception {
+        super.indexShouldNotExistAfterDeletion();
+    }
+
     /**
      * Test {@link org.janusgraph.example.GraphOfTheGodsFactory#create(String)}.
      */
@@ -55,9 +69,22 @@ public class BerkeleyElasticsearchTest extends ElasticsearchJanusGraphIndexTest 
         gotg.close();
     }
 
+    // flaky test: https://github.com/JanusGraph/janusgraph/issues/3651
     @RepeatedIfExceptionsTest(repeats = 3)
     @Override
-    public void testIndexUpdatesWithoutReindex() throws InterruptedException, ExecutionException {
-        super.testIndexUpdatesWithoutReindex();
+    public void testDisableAndDiscardManuallyAndDropEnabledIndex() throws Exception {
+        super.testDisableAndDiscardManuallyAndDropEnabledIndex();
+    }
+
+    // flaky test: https://github.com/JanusGraph/janusgraph/issues/3931
+    @RepeatedIfExceptionsTest(repeats = 3)
+    @Override
+    public void testDiscardAndDropRegisteredIndex() throws ExecutionException, InterruptedException {
+        super.testDiscardAndDropRegisteredIndex();
+    }
+
+    @Test
+    public void testSubsetReindex() {
+        Assert.assertThrows("Code is not implemented", ExecutionException.class, super::testSubsetReindex);
     }
 }

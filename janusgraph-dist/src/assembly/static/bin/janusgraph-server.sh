@@ -95,7 +95,7 @@ if [[ -z "$JANUSGRAPH_LIB" ]]; then
 fi
 
 # absolute file path requires 'file:'
-LOG4J_CONF="file:$JANUSGRAPH_CONF/log4j-server.properties"
+LOG4J_CONF="file:$JANUSGRAPH_CONF/log4j2-server.xml"
 
 # Find Java
 if [[ "$JAVA_HOME" = "" ]] ; then
@@ -108,16 +108,17 @@ COLLECTED_JAVA_OPTIONS_FILE=""
 
 # Read user-defined JVM options from jvm.options file
 if [[ -z "$JAVA_OPTIONS_FILE" ]]; then
-  JAVA_OPTIONS_FILE="$JANUSGRAPH_CONF/jvm.options"
+  JAVA_OPTIONS_FILE="$JANUSGRAPH_CONF/jvm-11.options"
 fi
 if [[ -f "$JAVA_OPTIONS_FILE" ]]; then
-  for opt in `grep "^-" $JAVA_OPTIONS_FILE`
+  for opt in "$(grep '^-' $JAVA_OPTIONS_FILE)"
   do
-    COLLECTED_JAVA_OPTIONS_FILE="$JAVA_OPTIONS_FILE_CURATED $opt"
+    opt=$(echo "$opt" | xargs)
+    COLLECTED_JAVA_OPTIONS_FILE="$COLLECTED_JAVA_OPTIONS_FILE $opt"
   done
 fi
 
-JAVA_OPTIONS="$COLLECTED_JAVA_OPTIONS_FILE $JAVA_OPTIONS -javaagent:$JANUSGRAPH_LIB/jamm-0.3.0.jar"
+JAVA_OPTIONS="$COLLECTED_JAVA_OPTIONS_FILE $JAVA_OPTIONS -javaagent:$JANUSGRAPH_LIB/jamm-0.4.0.jar"
 
 # Build Java CLASSPATH
 if [[ -z "$CP" ]];then
@@ -202,7 +203,7 @@ start() {
       exit 1
     fi
 
-    $JAVA -Dlog4j.configuration=$LOG4J_CONF $JAVA_OPTIONS -cp $CLASSPATH $JANUSGRAPH_SERVER_CMD "$JANUSGRAPH_YAML" >> "$LOG_FILE" 2>&1 &
+    $JAVA -Dlog4j2.configurationFile=$LOG4J_CONF $JAVA_OPTIONS -cp $CLASSPATH $JANUSGRAPH_SERVER_CMD "$JANUSGRAPH_YAML" >> "$LOG_FILE" 2>&1 &
     PID=$!
     disown $PID
     echo $PID > "$PID_FILE"
@@ -220,7 +221,7 @@ start() {
       exit 1
     fi
 
-    su -c "$JAVA -Dlog4j.configuration=$LOG4J_CONF $JAVA_OPTIONS -cp $CLASSPATH $JANUSGRAPH_SERVER_CMD \"$JANUSGRAPH_YAML\" >> \"$LOG_FILE\" 2>&1 & echo \$! "  "$RUNAS" > "$PID_FILE"
+    su -c "$JAVA -Dlog4j2.configurationFile=$LOG4J_CONF $JAVA_OPTIONS -cp $CLASSPATH $JANUSGRAPH_SERVER_CMD \"$JANUSGRAPH_YAML\" >> \"$LOG_FILE\" 2>&1 & echo \$! "  "$RUNAS" > "$PID_FILE"
     chown "$RUNAS" "$PID_FILE"
   fi
 
@@ -246,7 +247,7 @@ startForeground() {
 
   if [[ -z "$RUNAS" ]]; then
     echo "$JANUSGRAPH_YAML will be used to start JanusGraph Server in foreground"
-    exec $JAVA -Dlog4j.configuration=$LOG4J_CONF $JAVA_OPTIONS -cp $CLASSPATH $JANUSGRAPH_SERVER_CMD "$JANUSGRAPH_YAML"
+    exec $JAVA -Dlog4j2.configurationFile=$LOG4J_CONF $JAVA_OPTIONS -cp $CLASSPATH $JANUSGRAPH_SERVER_CMD "$JANUSGRAPH_YAML"
     exit 0
   else
     echo Starting in foreground not supported with RUNAS
@@ -254,8 +255,17 @@ startForeground() {
   fi
 }
 
+printConfig() {
+    echo "JANUSGRAPH_HOME: ${JANUSGRAPH_HOME}"
+    echo "JANUSGRAPH_YAML: ${JANUSGRAPH_YAML}"
+    echo "JANUSGRAPH_SERVER_CMD: ${JANUSGRAPH_SERVER_CMD}"
+    echo "LOG_DIR: ${LOG_DIR}"
+    echo "PID_FILE: ${PID_FILE}"
+    echo "JAVA_OPTIONS: ${JAVA_OPTIONS}"
+}
+
 printUsage() {
-  echo "Usage: $0 {start [conf file]|stop|restart [conf file]|status|console|usage <group> <artifact> <version>|<conf file>}"
+  echo "Usage: $0 {start [conf file]|stop|restart [conf file]|status|console|config [conf file]|usage <group> <artifact> <version>|<conf file>}"
   echo
   echo "    start           Start the server in the background. Configuration file can be specified as a second argument
                     or as JANUSGRAPH_YAML environment variable. If configuration file is not specified
@@ -267,6 +277,7 @@ printUsage() {
   echo "    status          Check if the server is running"
   echo "    console         Start the server in the foreground. Same rules are applied for configurations as described
                     in \"start\" command"
+  echo "    config          Print out internal script variable to debug config"
   echo "    usage           Print out this help message"
   echo
   echo "In case command is not specified and the configuration is specified as the first argument, JanusGraph Server will
@@ -286,6 +297,10 @@ case "$1" in
   start)
     useGremlinServerConfiguration "$2"
     start
+    ;;
+  config)
+    useGremlinServerConfiguration "$2"
+    printConfig
     ;;
   stop)
     stop

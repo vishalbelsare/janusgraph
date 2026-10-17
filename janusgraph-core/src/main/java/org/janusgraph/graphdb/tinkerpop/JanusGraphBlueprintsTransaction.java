@@ -30,6 +30,7 @@ import org.janusgraph.core.JanusGraphTransaction;
 import org.janusgraph.core.JanusGraphVertex;
 import org.janusgraph.core.VertexLabel;
 import org.janusgraph.diskstorage.util.Hex;
+import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
 import org.janusgraph.graphdb.database.StandardJanusGraph;
 import org.janusgraph.graphdb.olap.computer.FulgoraGraphComputer;
 import org.janusgraph.graphdb.relations.RelationIdentifier;
@@ -49,14 +50,32 @@ import java.util.Optional;
 public abstract class JanusGraphBlueprintsTransaction implements JanusGraphTransaction {
 
     /**
+     * The {@link Features} of the graph bound to this transaction, created lazily by {@link #features()}.
+     */
+    private volatile Features features;
+
+    /**
      * Returns the graph that this transaction is based on
      * @return
      */
     protected abstract JanusGraphBlueprintsGraph getGraph();
 
+    /**
+     * Whether this graph allows usage of custom vertex id of non-long-type
+     */
+    protected boolean allowCustomVertexIdType;
+
     @Override
     public Features features() {
-        return getGraph().features();
+        // TinkerPop asks for the features on every property mutation, so the transaction-bound view is created once
+        Features features = this.features;
+        if (features == null) {
+            final Features graphFeatures = getGraph().features();
+            // resolve schema dependent features (e.g. property key cardinality) against this transaction
+            features = graphFeatures instanceof JanusGraphFeatures ? ((JanusGraphFeatures) graphFeatures).forTransaction(this) : graphFeatures;
+            this.features = features;
+        }
+        return features;
     }
 
     @Override
@@ -108,7 +127,13 @@ public abstract class JanusGraphBlueprintsTransaction implements JanusGraphTrans
     public JanusGraphVertex addVertex(Object... keyValues) {
         ElementHelper.legalPropertyKeyValueArray(keyValues);
         final Optional<Object> idValue = ElementHelper.getIdValue(keyValues);
-        if (idValue.isPresent() && !((StandardJanusGraph) getGraph()).getConfiguration().allowVertexIdSetting()) throw Vertex.Exceptions.userSuppliedIdsNotSupported();
+        GraphDatabaseConfiguration config = ((StandardJanusGraph) getGraph()).getConfiguration();
+        if (idValue.isPresent() && !config.allowVertexIdSetting()) {
+            throw Vertex.Exceptions.userSuppliedIdsNotSupported();
+        }
+        if (idValue.isPresent() && !(idValue.get() instanceof Number) && !config.allowCustomVertexIdType()) {
+            throw Vertex.Exceptions.userSuppliedIdsOfThisTypeNotSupported();
+        }
         Object labelValue = null;
         for (int i = 0; i < keyValues.length; i = i + 2) {
             if (keyValues[i].equals(T.label)) {
@@ -122,8 +147,7 @@ public abstract class JanusGraphBlueprintsTransaction implements JanusGraphTrans
         if (labelValue!=null) {
             label = (labelValue instanceof VertexLabel)?(VertexLabel)labelValue:getOrCreateVertexLabel((String) labelValue);
         }
-
-        final Long id = idValue.map(Number.class::cast).map(Number::longValue).orElse(null);
+        Object id = idValue.map(v -> v instanceof Number ? ((Number) v).longValue() : v).orElse(null);
         final JanusGraphVertex vertex = addVertex(id, label);
         org.janusgraph.graphdb.util.ElementHelper.attachProperties(vertex, keyValues);
         return vertex;
@@ -132,12 +156,11 @@ public abstract class JanusGraphBlueprintsTransaction implements JanusGraphTrans
     @Override
     public Iterator<Vertex> vertices(Object... vertexIds) {
         if (vertexIds==null || vertexIds.length==0) return (Iterator)getVertices().iterator();
-        ElementUtils.verifyArgsMustBeEitherIdOrElement(vertexIds);
-        long[] ids = new long[vertexIds.length];
+        Object[] ids = new Object[vertexIds.length];
         int pos = 0;
         for (Object vertexId : vertexIds) {
-            long id = ElementUtils.getVertexId(vertexId);
-            if (id > 0) ids[pos++] = id;
+            Object id = ElementUtils.getVertexId(vertexId);
+            if (!(id instanceof Number) || ((Number) id).longValue() > 0) ids[pos++] = id;
         }
         if (pos==0) return Collections.emptyIterator();
         if (pos<ids.length) ids = Arrays.copyOf(ids,pos);
@@ -147,7 +170,6 @@ public abstract class JanusGraphBlueprintsTransaction implements JanusGraphTrans
     @Override
     public Iterator<Edge> edges(Object... edgeIds) {
         if (edgeIds==null || edgeIds.length==0) return (Iterator)getEdges().iterator();
-        ElementUtils.verifyArgsMustBeEitherIdOrElement(edgeIds);
         RelationIdentifier[] ids = new RelationIdentifier[edgeIds.length];
         int pos = 0;
         for (Object edgeId : edgeIds) {

@@ -23,6 +23,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.tinkerpop.gremlin.structure.Graph;
 import org.janusgraph.core.log.LogProcessorFramework;
 import org.janusgraph.core.log.TransactionRecovery;
+import org.janusgraph.core.util.GraphFactoryUtils;
 import org.janusgraph.diskstorage.Backend;
 import org.janusgraph.diskstorage.BackendException;
 import org.janusgraph.diskstorage.StandardStoreManager;
@@ -33,7 +34,6 @@ import org.janusgraph.diskstorage.configuration.ReadConfiguration;
 import org.janusgraph.diskstorage.configuration.WriteConfiguration;
 import org.janusgraph.diskstorage.configuration.backend.CommonsConfiguration;
 import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
-import org.janusgraph.graphdb.configuration.builder.GraphDatabaseConfigurationBuilder;
 import org.janusgraph.graphdb.database.StandardJanusGraph;
 import org.janusgraph.graphdb.log.StandardLogProcessorFramework;
 import org.janusgraph.graphdb.log.StandardTransactionLogProcessor;
@@ -46,6 +46,7 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.time.Instant;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.Spliterators;
 import java.util.regex.Pattern;
@@ -162,7 +163,7 @@ public class JanusGraphFactory {
         final JanusGraphManager jgm = JanusGraphManagerUtility.getInstance();
         if (null != graphName) {
             Preconditions.checkNotNull(jgm, JANUS_GRAPH_MANAGER_EXPECTED_STATE_MSG);
-            return (JanusGraph) jgm.openGraph(graphName, gName -> new StandardJanusGraph(new GraphDatabaseConfigurationBuilder().build(configuration)));
+            return (JanusGraph) jgm.openGraph(graphName, gName -> GraphFactoryUtils.defineSchemaAndStart(configuration));
         } else {
             if (jgm != null) {
                 log.warn("You should supply \"graph.graphname\" in your .properties file configuration if you are opening " +
@@ -173,7 +174,7 @@ public class JanusGraphFactory {
                          "\"graph.graphname\" so these graphs should be accessed dynamically by supplying a .properties file here " +
                          "or by using the ConfiguredGraphFactory.");
             }
-            return new StandardJanusGraph(new GraphDatabaseConfigurationBuilder().build(configuration));
+            return GraphFactoryUtils.defineSchemaAndStart(configuration);
         }
     }
 
@@ -303,6 +304,18 @@ public class JanusGraphFactory {
         return new StandardTransactionLogProcessor((StandardJanusGraph)graph, start);
     }
 
+    /**
+     * Returns a {@link TransactionRecovery} process for recovering partially failed transactions. The recovery process
+     * will start processing the write-ahead transaction log at the specified transaction time.
+     * Once stopped, this method can be used to start the recovery process again from a specified transaction time.
+     * @param graph
+     * @param start
+     * @return
+     */
+    public static TransactionRecovery startRecurringTransactionRecovery(JanusGraph graph, Instant start) {
+        return new StandardTransactionLogProcessor((StandardJanusGraph) graph, start, true);
+    }
+
     //###################################
     //          HELPER METHODS
     //###################################
@@ -314,7 +327,7 @@ public class JanusGraphFactory {
             int pos = shortcutOrFile.indexOf(':');
             if (pos<0) pos = shortcutOrFile.length();
             String backend = shortcutOrFile.substring(0,pos);
-            Preconditions.checkArgument(StandardStoreManager.getAllManagerClasses().containsKey(backend.toLowerCase()), "Backend shorthand unknown: %s", backend);
+            Preconditions.checkArgument(StandardStoreManager.getAllManagerClasses().containsKey(backend.toLowerCase(Locale.ROOT)), "Backend shorthand unknown: %s", backend);
             String secondArg = null;
             if (pos+1<shortcutOrFile.length()) secondArg = shortcutOrFile.substring(pos + 1).trim();
             BaseConfiguration config = ConfigurationUtil.createBaseConfiguration();

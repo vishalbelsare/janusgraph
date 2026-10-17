@@ -19,6 +19,7 @@ import org.apache.tinkerpop.gremlin.structure.Element;
 import org.janusgraph.core.Cardinality;
 import org.janusgraph.core.PropertyKey;
 import org.janusgraph.core.schema.JanusGraphIndex;
+import org.janusgraph.core.schema.JanusGraphSchemaType;
 import org.janusgraph.core.schema.Parameter;
 import org.janusgraph.core.schema.SchemaStatus;
 import org.janusgraph.graphdb.types.CompositeIndexType;
@@ -35,12 +36,24 @@ public class JanusGraphIndexWrapper implements JanusGraphIndex {
 
     private final IndexType index;
 
+    private static final String[] EMPTY_STRING_ARRAY = new String[0];
+
     public JanusGraphIndexWrapper(IndexType index) {
         this.index = index;
     }
 
     IndexType getBaseIndex() {
         return index;
+    }
+
+    @Override
+    public Object id() {
+        return index.id();
+    }
+
+    @Override
+    public long longId() {
+        return index.longId();
     }
 
     @Override
@@ -69,6 +82,15 @@ public class JanusGraphIndexWrapper implements JanusGraphIndex {
     }
 
     @Override
+    public String[] getInlineFieldKeys() {
+        if (index.isMixedIndex()) {
+            return EMPTY_STRING_ARRAY;
+        } else {
+            return ((CompositeIndexType) index).getInlineFieldKeys();
+        }
+    }
+
+    @Override
     public Parameter[] getParametersFor(PropertyKey key) {
         if (index.isCompositeIndex()) return new Parameter[0];
         return ((MixedIndexType)index).getField(key).getParameters();
@@ -94,6 +116,11 @@ public class JanusGraphIndexWrapper implements JanusGraphIndex {
     @Override
     public boolean isMixedIndex() {
         return index.isMixedIndex();
+    }
+
+    @Override
+    public JanusGraphSchemaType getSchemaTypeConstraint() {
+        return index.getSchemaTypeConstraint();
     }
 
     @Override

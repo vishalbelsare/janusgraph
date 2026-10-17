@@ -22,29 +22,37 @@ import org.apache.tinkerpop.gremlin.server.GraphManager;
 import org.apache.tinkerpop.gremlin.server.Settings;
 import org.apache.tinkerpop.gremlin.server.util.DefaultGraphManager;
 import org.janusgraph.core.JanusGraph;
+import org.janusgraph.core.PropertyKey;
 import org.janusgraph.core.VertexLabel;
 import org.janusgraph.core.schema.EdgeLabelMaker;
+import org.janusgraph.core.schema.JanusGraphIndex;
 import org.janusgraph.core.schema.JanusGraphManagement;
+import org.janusgraph.core.schema.PropertyKeyMaker;
 import org.janusgraph.core.schema.VertexLabelMaker;
+import org.janusgraph.graphdb.database.management.ManagementSystem;
 import org.janusgraph.graphdb.grpc.schema.SchemaManagerImpl;
 import org.janusgraph.graphdb.grpc.schema.util.GrpcUtils;
 import org.janusgraph.graphdb.grpc.types.EdgeLabel;
 import org.janusgraph.graphdb.grpc.types.EdgeLabelOrBuilder;
+import org.janusgraph.graphdb.grpc.types.EdgeProperty;
+import org.janusgraph.graphdb.grpc.types.VertexCompositeGraphIndexOrBuilder;
 import org.janusgraph.graphdb.grpc.types.VertexLabelOrBuilder;
-import org.janusgraph.graphdb.server.TestingServerClosable;
+import org.janusgraph.graphdb.grpc.types.VertexProperty;
+import org.apache.tinkerpop.gremlin.structure.Vertex;
 import org.javatuples.Pair;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 
 import java.io.IOException;
 import java.util.HashMap;
+import java.util.concurrent.TimeUnit;
 
 public abstract class JanusGraphGrpcServerBaseTest {
 
     protected JanusGraphContextHandler contextHandler;
     protected GraphManager graphManager;
     protected ManagedChannel managedChannel;
-    private TestingServerClosable closable;
+    protected Server server;
 
     protected static GraphManager getGraphManager() {
         Settings settings = new Settings();
@@ -56,34 +64,71 @@ public abstract class JanusGraphGrpcServerBaseTest {
         return new DefaultGraphManager(settings);
     }
 
-    public long createVertexLabel(String graph, VertexLabelOrBuilder vertexLabel) {
+    public Object createVertexLabel(String graph, VertexLabelOrBuilder builder) {
         JanusGraphManagement management = ((JanusGraph) graphManager.getGraph(graph)).openManagement();
-        VertexLabelMaker vertexLabelMaker = management.makeVertexLabel(vertexLabel.getName());
-        if (vertexLabel.getReadOnly()) {
+        VertexLabelMaker vertexLabelMaker = management.makeVertexLabel(builder.getName());
+        if (builder.getReadOnly()) {
             vertexLabelMaker.setStatic();
         }
-        if (vertexLabel.getPartitioned()) {
+        if (builder.getPartitioned()) {
             vertexLabelMaker.partition();
         }
-        VertexLabel createdVertexLabel = vertexLabelMaker.make();
+        VertexLabel vertexLabel = vertexLabelMaker.make();
+        for (VertexProperty vertexProperty : builder.getPropertiesList()) {
+            PropertyKeyMaker propertyKeyMaker = management.makePropertyKey(vertexProperty.getName());
+            PropertyKey propertyKey = propertyKeyMaker
+                .cardinality(GrpcUtils.convertGrpcCardinality(vertexProperty.getCardinality()))
+                .dataType(GrpcUtils.convertGrpcPropertyDataType(vertexProperty.getDataType()))
+                .make();
+            management.addProperties(vertexLabel, propertyKey);
+        }
 
         management.commit();
-        return createdVertexLabel.longId();
+        return vertexLabel.id();
     }
 
-    public long createEdgeLabel(String graph, EdgeLabelOrBuilder edgeLabel) {
-        JanusGraphManagement management = ((JanusGraph) graphManager.getGraph(graph)).openManagement();
-        EdgeLabelMaker edgeLabelMaker = management.makeEdgeLabel(edgeLabel.getName());
-        if (edgeLabel.getDirection() == EdgeLabel.Direction.BOTH) {
-            edgeLabelMaker.directed();
-        } else {
-            edgeLabelMaker.unidirected();
+    public Object createVertexCompositeGraphIndex(String graph, VertexCompositeGraphIndexOrBuilder builder) {
+        JanusGraph tx = (JanusGraph) graphManager.getGraph(graph);
+        ManagementSystem management = (ManagementSystem) tx.openManagement();
+        JanusGraphManagement.IndexBuilder indexBuilder = management.buildIndex(builder.getName(), Vertex.class);
+        for (VertexProperty vertexProperty : builder.getKeysList()) {
+            PropertyKey propertyKey = management.getPropertyKey(vertexProperty.getName());
+            indexBuilder.addKey(propertyKey);
         }
-        edgeLabelMaker.multiplicity(GrpcUtils.convertGrpcEdgeMultiplicity(edgeLabel.getMultiplicity()));
-        org.janusgraph.core.EdgeLabel createdEdgeLabel = edgeLabelMaker.make();
+
+        if (builder.hasIndexOnly()) {
+            VertexLabel vertexLabel = management.getVertexLabel(builder.getIndexOnly().getName());
+            indexBuilder.indexOnly(vertexLabel);
+        }
+        if (builder.getUnique()) {
+            indexBuilder.unique();
+        }
+
+        JanusGraphIndex index = indexBuilder.buildCompositeIndex();
+        management.commit();
+        return index.id();
+    }
+
+    public Object createEdgeLabel(String graph, EdgeLabelOrBuilder builder) {
+        JanusGraphManagement management = ((JanusGraph) graphManager.getGraph(graph)).openManagement();
+        EdgeLabelMaker edgeLabelMaker = management.makeEdgeLabel(builder.getName());
+        if (builder.getDirection() == EdgeLabel.Direction.DIRECTION_OUT) {
+            edgeLabelMaker.unidirected();
+        } else {
+            edgeLabelMaker.directed();
+        }
+        edgeLabelMaker.multiplicity(GrpcUtils.convertGrpcEdgeMultiplicity(builder.getMultiplicity()));
+        org.janusgraph.core.EdgeLabel edgeLabel = edgeLabelMaker.make();
+        for (EdgeProperty edgeProperty : builder.getPropertiesList()) {
+            PropertyKeyMaker propertyKeyMaker = management.makePropertyKey(edgeProperty.getName());
+            PropertyKey propertyKey = propertyKeyMaker
+                .dataType(GrpcUtils.convertGrpcPropertyDataType(edgeProperty.getDataType()))
+                .make();
+            management.addProperties(edgeLabel, propertyKey);
+        }
 
         management.commit();
-        return createdEdgeLabel.longId();
+        return edgeLabel.id();
     }
 
     private static Pair<Server, String> createServer(JanusGraphContextHandler contextHandler) throws IOException {
@@ -103,11 +148,18 @@ public abstract class JanusGraphGrpcServerBaseTest {
         contextHandler = new JanusGraphContextHandler(graphManager);
         Pair<Server, String> server = createServer(contextHandler);
         managedChannel = InProcessChannelBuilder.forName(server.getValue1()).directExecutor().build();
-        closable = new TestingServerClosable(server.getValue0(), managedChannel);
+        this.server = server.getValue0();
     }
 
     @AfterEach
     public void stopServer() throws IOException {
-        closable.close();
+        managedChannel.shutdown();
+        server.shutdown();
+        try {
+            managedChannel.awaitTermination(1, TimeUnit.SECONDS);
+            server.awaitTermination();
+        } catch (InterruptedException e) {
+            throw new IOException(e);
+        }
     }
 }

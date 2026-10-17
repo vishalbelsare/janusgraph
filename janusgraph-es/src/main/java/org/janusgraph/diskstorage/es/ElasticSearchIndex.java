@@ -14,13 +14,16 @@
 
 package org.janusgraph.diskstorage.es;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.LinkedListMultimap;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
+import org.elasticsearch.client.ResponseException;
 import org.elasticsearch.client.RestClientBuilder;
 import org.janusgraph.core.Cardinality;
 import org.janusgraph.core.JanusGraphException;
@@ -51,16 +54,22 @@ import org.janusgraph.diskstorage.indexing.IndexProvider;
 import org.janusgraph.diskstorage.indexing.IndexQuery;
 import org.janusgraph.diskstorage.indexing.KeyInformation;
 import org.janusgraph.diskstorage.indexing.RawQuery;
+import org.janusgraph.diskstorage.mixed.utils.MixedIndexUtilsConfigOptions;
+import org.janusgraph.diskstorage.mixed.utils.processor.CircleProcessor;
 import org.janusgraph.diskstorage.util.DefaultTransaction;
 import org.janusgraph.graphdb.configuration.PreInitializeConfigOptions;
 import org.janusgraph.graphdb.database.serialize.AttributeUtils;
 import org.janusgraph.graphdb.query.JanusGraphPredicate;
+import org.janusgraph.graphdb.query.Query;
+import org.janusgraph.graphdb.query.QueryUtil;
 import org.janusgraph.graphdb.query.condition.And;
 import org.janusgraph.graphdb.query.condition.Condition;
 import org.janusgraph.graphdb.query.condition.Not;
 import org.janusgraph.graphdb.query.condition.Or;
 import org.janusgraph.graphdb.query.condition.PredicateCondition;
+import org.janusgraph.graphdb.tinkerpop.optimize.step.Aggregation;
 import org.janusgraph.graphdb.types.ParameterType;
+import org.janusgraph.util.datastructures.IterablesUtil;
 import org.locationtech.spatial4j.shape.Rectangle;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -72,21 +81,20 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Date;
+import java.util.Collections;
 import java.util.HashMap;
-import java.util.Iterator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.Spliterator;
-import java.util.Spliterators;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
-import java.util.stream.StreamSupport;
 
 import static org.janusgraph.diskstorage.configuration.ConfigOption.disallowEmpty;
 import static org.janusgraph.diskstorage.es.ElasticSearchConstants.ES_DOC_KEY;
@@ -94,9 +102,11 @@ import static org.janusgraph.diskstorage.es.ElasticSearchConstants.ES_GEO_COORDS
 import static org.janusgraph.diskstorage.es.ElasticSearchConstants.ES_LANG_KEY;
 import static org.janusgraph.diskstorage.es.ElasticSearchConstants.ES_SCRIPT_KEY;
 import static org.janusgraph.diskstorage.es.ElasticSearchConstants.ES_TYPE_KEY;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.GRAPH_NAME;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_MAX_RESULT_SET_SIZE;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_NAME;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.INDEX_NS;
+import static org.janusgraph.util.StringUtils.lowerCaseCodePoints;
 
 /**
  * @author Matthias Broecheler (me@matthiasb.com)
@@ -174,7 +184,71 @@ public class ElasticSearchIndex implements IndexProvider {
 
     public static final ConfigOption<Integer> ES_SCROLL_KEEP_ALIVE =
             new ConfigOption<>(ELASTICSEARCH_NS, "scroll-keep-alive",
-            "How long (in seconds) elasticsearch should keep alive the scroll context.", ConfigOption.Type.GLOBAL_OFFLINE, 60);
+            "How long (in seconds) elasticsearch should keep alive the scroll context, or the point in time, of a result " +
+                "which is read in pages.", ConfigOption.Type.GLOBAL_OFFLINE, 60);
+
+    public static final ConfigOption<String> PAGING_MODE =
+            new ConfigOption<>(ELASTICSEARCH_NS, "paging-mode",
+            String.format("How a result larger than a page (`index.[X].max-result-set-size`) is read.<br>" +
+                "Supported modes:<br>" +
+                "- `%s` - Every result is read through a scroll.<br>" +
+                "- `%s` - Every result is read through a point in time and `search_after`. A point in time isn't " +
+                "counted against `search.max_open_scroll_context`, its pages don't count the total number of hits, " +
+                "and a page which is sent again after a failure comes back the same, where a scroll may skip it. But " +
+                "it reads the pages more slowly than a scroll unless they come in the order of the index, on an " +
+                "index of one shard and in pages of up to about 500 hits; the Elasticsearch page of the " +
+                "documentation has the measurements.<br>" +
+                "- `%s` - A result is read through a point in time where that is about as fast as a scroll or " +
+                "faster: the result of a graph query without a limit and without an order, whose pages come in the " +
+                "order of the index, on an index of at most `%s` shards and with pages of at most `%s` hits. A graph " +
+                "query is limited where its traversal limits it, where `query.smart-limit` is on, and where " +
+                "`query.hard-max-limit` is lowered. Every other result is read through a scroll.<br>" +
+                "A cluster which reports an Elasticsearch version older than 7.12 scrolls in every mode, as does one " +
+                "whose version isn't asked for (`major-version` 7) or can't be, and OpenSearch, whose point in time " +
+                "lacks the tiebreaker `search_after` needs.",
+                ElasticSearchPagingMode.SCROLL.getConfigName(), ElasticSearchPagingMode.POINT_IN_TIME.getConfigName(),
+                ElasticSearchPagingMode.ADAPTIVE_POINT_IN_TIME.getConfigName(), "adaptive-point-in-time-max-shards",
+                "adaptive-point-in-time-max-page-size"),
+            ConfigOption.Type.MASKABLE, ElasticSearchPagingMode.ADAPTIVE_POINT_IN_TIME.getConfigName(),
+            mode -> ElasticSearchPagingMode.fromConfigName(mode) != null);
+
+    public static final ConfigOption<Integer> ADAPTIVE_POINT_IN_TIME_MAX_SHARDS =
+            new ConfigOption<>(ELASTICSEARCH_NS, "adaptive-point-in-time-max-shards",
+            "The most shards an index may have, as the first request of a result reports them, for `paging-mode` " +
+                "`adaptive_point_in_time` to read the result through a point in time. 1 is the recommended value: " +
+                "on Elasticsearch 9.5.4, reading the pages of an index of two or three shards through a point in " +
+                "time took 4% to 37% longer than through a scroll, even in the order of the index. Raise it only " +
+                "where a point in time keeps up with a scroll on indexes of more shards.",
+            ConfigOption.Type.MASKABLE, 1, ConfigOption.positiveInt());
+
+    public static final ConfigOption<Integer> ADAPTIVE_POINT_IN_TIME_MAX_PAGE_SIZE =
+            new ConfigOption<>(ELASTICSEARCH_NS, "adaptive-point-in-time-max-page-size",
+            "The largest page size (`index.[X].max-result-set-size`) with which `paging-mode` " +
+                "`adaptive_point_in_time` reads a result through a point in time. 500 is the recommended value: on " +
+                "Elasticsearch 9.5.4, a point in time read the pages of an index of one shard in the order of the " +
+                "index about as fast as a scroll or faster with pages of up to 500 hits, and more slowly with pages " +
+                "of 1,000. Lower it where a point in time falls behind a scroll with smaller pages, raise it where " +
+                "it keeps up with larger ones.",
+            ConfigOption.Type.MASKABLE, 500, ConfigOption.positiveInt());
+
+    public static final ConfigOption<Integer> LIMITED_RESULT_MAX_PAGE_SIZE =
+            new ConfigOption<>(ELASTICSEARCH_NS, "limited-result-max-page-size",
+            "The largest page of an index query with a limit which is too large for a single request, one whose " +
+                "offset and limit together go beyond 10,000 hits. Such a result is read from its first hit on in as " +
+                "few pages as this allows, all of one size, which split the hits up to the end of its limit evenly, " +
+                "but never in pages smaller than `index.[X].max-result-set-size`, the page size of a query without " +
+                "a limit. Larger pages take fewer round trips and a larger response each. `scroll-keep-alive` must " +
+                "cover consuming one page: each page renews it, and a consumer which takes longer over a page than " +
+                "the keep-alive loses the scroll context or point in time. The next page then fails, or, where the " +
+                "index's shards sit on several nodes, comes back with the hits of only some shards, which ends the " +
+                "result early or leaves hits out without an error. A slower consumer can lower this option in its " +
+                "local configuration, as it is MASKABLE, or raise `scroll-keep-alive`, which is GLOBAL_OFFLINE. " +
+                "10,000 is the practical ceiling: Elasticsearch accepts at most `index.max_result_window` hits in a " +
+                "page of a scroll or of a point in time, 10,000 by default, which JanusGraph lifts only on the " +
+                "indexes it creates; on those, the time a consumer has for each hit bounds it. A value no larger " +
+                "than `max-result-set-size` reads such results in pages of `max-result-set-size`, as earlier " +
+                "versions did.",
+            ConfigOption.Type.MASKABLE, 250, ConfigOption.positiveInt());
 
     public static final ConfigNamespace ES_INGEST_PIPELINES =
             new ConfigNamespace(ELASTICSEARCH_NS, "ingest-pipeline", "Ingest pipeline applicable to a store of an index.");
@@ -265,22 +339,40 @@ public class ElasticSearchIndex implements IndexProvider {
             "Whether JanusGraph should setup max_open_scroll_context to maximum value for the cluster or not.",
             ConfigOption.Type.MASKABLE, true);
 
+    public static final ConfigOption<Integer> MAJOR_VERSION =
+        new ConfigOption<>(ELASTICSEARCH_NS, "major-version",
+            "Major version of the Elasticsearch API which the index backend provides: 6, 7, 8 or 9. JanusGraph adapts its " +
+                "requests to it. If it isn't set, JanusGraph asks the cluster for its version. OpenSearch provides the " +
+                "Elasticsearch 7 API, which JanusGraph uses when the cluster reports an OpenSearch version. If this option " +
+                "is set for OpenSearch, which has no mapping types since version 2, keep use-mapping-for-es7 disabled.",
+            ConfigOption.Type.MASKABLE, Integer.class, ElasticMajorVersion.supportedNumbers());
+
     public static final ConfigOption<Boolean> USE_MAPPING_FOR_ES7 =
         new ConfigOption<>(ELASTICSEARCH_NS, "use-mapping-for-es7",
             "Mapping types are deprecated in ElasticSearch 7 and JanusGraph will not use mapping types by default " +
                 "for ElasticSearch 7 but if you want to preserve mapping types, you can setup this parameter to true. " +
                 "If you are updating ElasticSearch from 6 to 7 and you don't want to reindex your indexes, you may setup " +
-                "this parameter to true but we do recommend to reindex your indexes and don't use this parameter.",
+                "this parameter to true but we do recommend to reindex your indexes and don't use this parameter. " +
+                "It is ignored when the cluster reports OpenSearch, which has no mapping types since version 2.",
             ConfigOption.Type.MASKABLE, false);
 
     public static final ConfigOption<Long> CLIENT_KEEP_ALIVE =
         new ConfigOption<>(ELASTICSEARCH_NS, "client-keep-alive",
-            "Set a keep-alive timeout (in milliseconds)",
+            "How long (in milliseconds) the Elasticsearch client keeps reusing a connection after a response. " +
+                "Without it the client keeps connections open as long as Elasticsearch does. A load balancer, NAT " +
+                "gateway or firewall between JanusGraph and Elasticsearch may drop a connection which stays idle " +
+                "longer than its own idle timeout, and the next request on it fails. Set this below that timeout.",
             ConfigOption.Type.GLOBAL_OFFLINE, Long.class);
 
     public static final ConfigOption<Integer> RETRY_ON_CONFLICT =
         new ConfigOption<>(ELASTICSEARCH_NS, "retry_on_conflict",
-            "Specify how many times should the operation be retried when a conflict occurs.", ConfigOption.Type.MASKABLE, 0);
+            "How many times Elasticsearch reattempts an update of a document which another request changed after " +
+                "the update read it. JanusGraph updates the document of an element which a transaction changes, " +
+                "and transactions which change the same element at the same time conflict this way. Elasticsearch " +
+                "reattempts the update against the latest version of the document. A conflict which survives these " +
+                "attempts fails the update with status 409, which is permanent unless `retry-error-codes` lists it. " +
+                "Set to 0 to leave conflicts unattempted.", ConfigOption.Type.MASKABLE, 3,
+            ConfigOption.nonnegativeInt());
 
     public static final ConfigOption<Boolean> ENABLE_INDEX_STORE_NAMES_CACHE =
         new ConfigOption<>(ELASTICSEARCH_NS, "enable_index_names_cache",
@@ -297,6 +389,108 @@ public class ElasticSearchIndex implements IndexProvider {
         new ConfigOption<>(ELASTICSEARCH_NS, "socket-timeout",
             "Sets the maximum socket timeout (in milliseconds).", ConfigOption.Type.MASKABLE,
             Integer.class, RestClientBuilder.DEFAULT_SOCKET_TIMEOUT_MILLIS);
+
+    public static final ConfigOption<Integer> MAX_CONNECTIONS_PER_HOST =
+        new ConfigOption<>(ELASTICSEARCH_NS, "max-connections-per-host",
+            "The most connections the Elasticsearch client of this index backend opens to each Elasticsearch host. " +
+                "A request waits until one of them is free, so this caps the requests which the index backend has " +
+                "in flight at a host at once, its queries and the bulk requests of its commits together. Without " +
+                "this option `max-connections` is divided evenly among the hosts, but each gets at least 10, the " +
+                "limit of the Elasticsearch client on its own. So a single host, such as a load balancer or the " +
+                "endpoint of a hosted cluster, can take all 30 connections by default, while three hosts get 10 " +
+                "each, which keeps a host which stops answering from holding every connection. A JanusGraph Server " +
+                "which runs more Gremlin threads than a host can take may need more.",
+            ConfigOption.Type.MASKABLE, Integer.class, ConfigOption.positiveInt());
+
+    public static final ConfigOption<Integer> MAX_CONNECTIONS =
+        new ConfigOption<>(ELASTICSEARCH_NS, "max-connections",
+            "The most connections the Elasticsearch client of this index backend opens to all Elasticsearch hosts " +
+                "together. A request waits until one of them is free. It caps `max-connections-per-host`, whose " +
+                "default it also gives.", ConfigOption.Type.MASKABLE, Integer.class, 30, ConfigOption.positiveInt());
+
+    public static final ConfigOption<Integer> IO_THREADS =
+        new ConfigOption<>(ELASTICSEARCH_NS, "io-threads",
+            "The number of I/O threads with which the Elasticsearch client of this index backend sends requests " +
+                "and receives responses. They don't wait for Elasticsearch, so a few are enough for many " +
+                "connections. Every index backend of every graph has a client of its own, and without this option " +
+                "each client starts as many I/O threads as the JVM has processors. With `compression` on, a thread " +
+                "compresses each request it sends, and the other requests of the thread wait meanwhile.",
+            ConfigOption.Type.MASKABLE, Integer.class, ConfigOption.positiveInt());
+
+    public static final ConfigOption<Boolean> COMPRESSION =
+        new ConfigOption<>(ELASTICSEARCH_NS, "compression",
+            "Whether the Elasticsearch client compresses the bodies of its requests with gzip, bulk requests above " +
+                "all, and asks Elasticsearch to compress its responses, which saves network traffic at the cost of " +
+                "CPU on both sides. Elasticsearch compresses responses only if its `http.compression` setting " +
+                "allows it, which it does by default on a cluster without TLS. The client compresses a request on " +
+                "one of its I/O threads, whose other requests wait meanwhile, so a large bulk request can delay " +
+                "queries. More `io-threads` make it less likely that a query shares that thread, and a smaller " +
+                "`bulk-chunk-size-limit-bytes` shortens the wait. A compressed request is sent in chunks without a " +
+                "Content-Length header, which some request signers, such as interceptors which sign requests with " +
+                "AWS Signature Version 4, may not handle.",
+            ConfigOption.Type.MASKABLE, false);
+
+    public static final ConfigOption<Integer> RETRY_LIMIT =
+        new ConfigOption<>(ELASTICSEARCH_NS, "retry-limit",
+            "Number of times the Elasticsearch client reattempts a request which failed transiently before giving " +
+                "up on it: a request answered with a status code listed in `retry-error-codes`, or one which " +
+                "produced no response at all when `retry-transport-failures` is enabled. The failed items of a bulk " +
+                "request are reattempted on their own, so these attempts do not resend items which already " +
+                "succeeded. Set to 0 to disable them. A failure which survives these attempts is then classified by " +
+                "the same two options, and an index mutation which is still transient is reattempted as a whole by " +
+                "JanusGraph for up to `storage.write-time`.", ConfigOption.Type.LOCAL, Integer.class, 3);
+
+    public static final ConfigOption<Long> RETRY_INITIAL_WAIT =
+        new ConfigOption<>(ELASTICSEARCH_NS, "retry-initial-wait",
+            "The backoff (in milliseconds) before the first of the `retry-limit` reattempts of the Elasticsearch " +
+                "client. The backoff before each further reattempt is ten times the one before, up to " +
+                "`retry-max-wait`. The client waits a random time between half of the backoff and all of it, so " +
+                "that requests which failed together don't all come back at the same moment.",
+            ConfigOption.Type.LOCAL, Long.class, 1L);
+
+    public static final ConfigOption<Long> RETRY_MAX_WAIT =
+        new ConfigOption<>(ELASTICSEARCH_NS, "retry-max-wait",
+            "The largest backoff (in milliseconds) before a reattempt of the Elasticsearch client. See " +
+                "`retry-initial-wait`.", ConfigOption.Type.LOCAL,
+            Long.class, 1000L);
+
+    public static final ConfigOption<String[]> RETRY_ERROR_CODES =
+        new ConfigOption<>(ELASTICSEARCH_NS, "retry-error-codes",
+            "Comma separated list of Elasticsearch HTTP status codes which are considered transient, whether " +
+                "answered to a request or reported for a single bulk item. Such a failure is reattempted at two " +
+                "levels. First the Elasticsearch client reattempts the request `retry-limit` times, resending only " +
+                "the failed items of a bulk request. If that does not succeed, an index mutation which failed this " +
+                "way is reported as a temporary rather than a permanent backend exception, so JanusGraph reattempts " +
+                "the whole mutation with exponential backoff for up to `storage.write-time` instead of dropping it " +
+                "and leaving the mixed index inconsistent with the graph; a bulk request qualifies only when every " +
+                "item which failed did so with one of these codes. Resubmitting a whole mutation resends items " +
+                "which already succeeded, which duplicates the values of LIST cardinality properties - the client " +
+                "level attempts do not. Queries get the client level attempts only. Set to an empty list to " +
+                "consider every status code permanent, which disables both levels. E.g. \"429,502,503,504\"",
+            ConfigOption.Type.LOCAL, String[].class, new String[]{"429", "502", "503", "504"},
+            ElasticSearchIndex::isStatusCodeList);
+
+    public static final ConfigOption<Boolean> RETRY_TRANSPORT_FAILURES =
+        new ConfigOption<>(ELASTICSEARCH_NS, "retry-transport-failures",
+            "Whether Elasticsearch failures which never produced an HTTP response - connection refused, connection " +
+                "reset, socket timeout, prematurely closed connection, TLS failure - are considered transient and " +
+                "reattempted at the same two levels as a status code listed in `retry-error-codes`: `retry-limit` " +
+                "times by the Elasticsearch client, then as a whole index mutation by JanusGraph for up to " +
+                "`storage.write-time`. Such a failure leaves it unknown whether Elasticsearch applied the request, " +
+                "so any reattempt may resubmit items which already succeeded; resubmission is idempotent except for " +
+                "LIST cardinality properties, whose values are appended. While this option is enabled every TLS " +
+                "failure is treated as transient, not only a handshake which was interrupted, so a write against a " +
+                "persistently misconfigured or untrusted certificate is reattempted for the whole write time before " +
+                "it fails.", ConfigOption.Type.LOCAL, true);
+
+    public static final ConfigOption<Integer> BULK_CHUNK_SIZE_LIMIT_BYTES =
+        new ConfigOption<>(ELASTICSEARCH_NS, "bulk-chunk-size-limit-bytes",
+            "The total size limit in bytes of a bulk request. Mutation batches in excess of this limit will be " +
+                "chunked to this size. If a single bulk item exceeds this limit an exception will be thrown after the " +
+                "smaller bulk items are submitted. Ensure that this limit is always less than or equal to the configured " +
+                "limit of `http.max_content_length` on the Elasticsearch servers. For more information, refer to the " +
+                "[Elasticsearch documentation](https://www.elastic.co/guide/en/elasticsearch/reference/master/modules-network.html).",
+            ConfigOption.Type.LOCAL, Integer.class, 100_000_000);
 
     public static final int HOST_PORT_DEFAULT = 9200;
 
@@ -322,6 +516,36 @@ public class ElasticSearchIndex implements IndexProvider {
             "    }",
             "}");
 
+    //Every change of one document in one script - its removals, its collection additions and its single valued
+    //fields - for the update which carries the element's complete document as its upsert: Elasticsearch writes the
+    //upsert of an update whose document is missing and skips its script, so the outcome the snapshot already holds is
+    //not applied a second time. Removing one occurrence of a LIST value, or adding one, is what a second application
+    //would get wrong. A single valued field is assigned as a whole, an object value such as a geo shape included
+    private static final String PARAMETERIZED_MUTATION_SCRIPT = parameterizedScriptPrepare("",
+            "for (field in params.deletions) {",
+            "    if (field.cardinality == 'SINGLE') {",
+            "        ctx._source.remove(field.name);",
+            "    } else if (ctx._source.containsKey(field.name)) {",
+            "        def fieldIndex = ctx._source[field.name].indexOf(field.value);",
+            "        if (fieldIndex >= 0 && fieldIndex < ctx._source[field.name].size()) {",
+            "            ctx._source[field.name].remove(fieldIndex);",
+            "        }",
+            "    }",
+            "}",
+            "for (field in params.additions) {",
+            "    if (ctx._source[field.name] == null) {",
+            "        ctx._source[field.name] = [];",
+            "    }",
+            "    if (field.cardinality != 'SET' || ctx._source[field.name].indexOf(field.value) == -1) {",
+            "        ctx._source[field.name].add(field.value);",
+            "    }",
+            "}",
+            "ctx._source.putAll(params.doc);");
+
+    private static final String MUTATION_SCRIPT_DELETIONS_KEY = "deletions";
+    private static final String MUTATION_SCRIPT_ADDITIONS_KEY = "additions";
+    private static final String MUTATION_SCRIPT_DOC_KEY = "doc";
+
     private static final String PARAMETERIZED_ADDITION_SCRIPT = parameterizedScriptPrepare("",
             "for (field in params.fields) {",
             "    if (ctx._source[field.name] == null) {",
@@ -333,16 +557,14 @@ public class ElasticSearchIndex implements IndexProvider {
             "}");
 
     static final String INDEX_NAME_SEPARATOR = "_";
+
+    private static final int MIN_HTTP_STATUS_CODE = 100;
+
+    private static final int MAX_HTTP_STATUS_CODE = 599;
     private static final String SCRIPT_ID_SEPARATOR = "-";
 
     private static final String MAX_OPEN_SCROLL_CONTEXT_PARAMETER = "search.max_open_scroll_context";
     private static final Map<String, Object> MAX_RESULT_WINDOW = ImmutableMap.of("index.max_result_window", Integer.MAX_VALUE);
-
-    private static final Parameter[] NULL_PARAMETERS = null;
-
-    private static final String TRACK_TOTAL_HITS_PARAMETER = "track_total_hits";
-    private static final Parameter[] TRACK_TOTAL_HITS_DISABLED_PARAMETERS = new Parameter[]{new Parameter<>(TRACK_TOTAL_HITS_PARAMETER, false)};
-    private static final Map<String, Object> TRACK_TOTAL_HITS_DISABLED_REQUEST_BODY = ImmutableMap.of(TRACK_TOTAL_HITS_PARAMETER, false);
 
     private final Function<String, String> generateIndexStoreNameFunction = this::generateIndexStoreName;
     private final Map<String, String> indexStoreNamesCache = new ConcurrentHashMap<>();
@@ -350,6 +572,7 @@ public class ElasticSearchIndex implements IndexProvider {
 
     private final AbstractESCompat compat;
     private final ElasticSearchClient client;
+    private final ElasticSearchSearcher searcher;
     private final String indexName;
     private final int batchSize;
     private final boolean useExternalMappings;
@@ -358,36 +581,57 @@ public class ElasticSearchIndex implements IndexProvider {
     private final long createSleep;
     private final boolean useAllField;
     private final Map<String, Object> ingestPipelines;
-    private final boolean useMappingForES7;
     private final String parameterizedAdditionScriptId;
     private final String parameterizedDeletionScriptId;
+    private final String parameterizedMutationScriptId;
+    private final boolean supportsGeoShapePrefixTree;
+    private final CircleProcessor bdbCircleProcessor;
+    private final Set<Integer> retryErrorCodes;
+    private final boolean retryTransportFailures;
 
     public ElasticSearchIndex(Configuration config) throws BackendException {
-
-        indexName = config.get(INDEX_NAME);
+        indexName = determineIndexName(config);
         parameterizedAdditionScriptId = generateScriptId("add");
         parameterizedDeletionScriptId = generateScriptId("del");
+        parameterizedMutationScriptId = generateScriptId("mut");
         useAllField = config.get(USE_ALL_FIELD);
         useExternalMappings = config.get(USE_EXTERNAL_MAPPINGS);
         allowMappingUpdate = config.get(ALLOW_MAPPING_UPDATE);
         createSleep = config.get(CREATE_SLEEP);
         ingestPipelines = config.getSubset(ES_INGEST_PIPELINES);
-        useMappingForES7 = config.get(USE_MAPPING_FOR_ES7);
         indexStoreNameCacheEnabled = config.get(ENABLE_INDEX_STORE_NAMES_CACHE);
         batchSize = config.get(INDEX_MAX_RESULT_SET_SIZE);
         log.debug("Configured ES query nb result by query to {}", batchSize);
+        bdbCircleProcessor = MixedIndexUtilsConfigOptions.buildBKDCircleProcessor(config);
+        retryErrorCodes = parseStatusCodes(config.get(RETRY_ERROR_CODES));
+        retryTransportFailures = config.get(RETRY_TRANSPORT_FAILURES);
 
         client = interfaceConfiguration(config).getClient();
+        supportsGeoShapePrefixTree = client.getMajorVersion().getValue() <= 7;
 
         checkClusterHealth(config.get(HEALTH_REQUEST_TIMEOUT));
 
         compat = ESCompatUtils.acquireCompatForVersion(client.getMajorVersion());
+        //The option's verification rejects any other value as the configuration is read; this names it all the same
+        final String pagingModeName = config.get(PAGING_MODE);
+        final ElasticSearchPagingMode pagingMode = ElasticSearchPagingMode.fromConfigName(pagingModeName);
+        Preconditions.checkArgument(pagingMode != null, "Unknown %s: %s", PAGING_MODE.toStringWithoutRoot(),
+            pagingModeName);
+        searcher = new ElasticSearchSearcher(client, compat, batchSize, config.get(LIMITED_RESULT_MAX_PAGE_SIZE),
+            pagingMode, config.get(ADAPTIVE_POINT_IN_TIME_MAX_SHARDS),
+            config.get(ADAPTIVE_POINT_IN_TIME_MAX_PAGE_SIZE));
 
         indexSetting = ElasticSearchSetup.getSettingsFromJanusGraphConf(config);
 
         setupMaxOpenScrollContextsIfNeeded(config);
 
         setupStoredScripts();
+    }
+
+    public static String determineIndexName(Configuration config) {
+        return !config.has(INDEX_NAME) && config.has(GRAPH_NAME)
+            ? config.get(GRAPH_NAME)
+            : config.get(INDEX_NAME);
     }
 
     private void checkClusterHealth(String healthCheck) throws BackendException {
@@ -401,6 +645,7 @@ public class ElasticSearchIndex implements IndexProvider {
     private void setupStoredScripts() throws PermanentBackendException {
         setupStoredScriptIfNeeded(parameterizedAdditionScriptId, PARAMETERIZED_ADDITION_SCRIPT);
         setupStoredScriptIfNeeded(parameterizedDeletionScriptId, PARAMETERIZED_DELETION_SCRIPT);
+        setupStoredScriptIfNeeded(parameterizedMutationScriptId, PARAMETERIZED_MUTATION_SCRIPT);
     }
 
     private void setupStoredScriptIfNeeded(String storedScriptId, String source) throws PermanentBackendException {
@@ -496,12 +741,230 @@ public class ElasticSearchIndex implements IndexProvider {
         }
     }
 
+    //BackendOperation reattempts a temporary failure by calling mutate again with the same map, so take out of it what
+    //is known to have applied: every store whose bulk request returned, and in the bulk which failed every document
+    //none of whose items failed - which leaves in the documents whose items failed and the documents of the chunks
+    //the failure stopped from being sent. A failure which reports no item statuses - no response at all, or a status
+    //for the bulk request as a whole - says nothing about what the bulk it interrupted applied, so that bulk is resent
+    //whole. A resent document which had applied is written twice, which appends the values of its LIST cardinality
+    //properties again, so what is taken out is exactly what a reattempt would otherwise duplicate
+    @VisibleForTesting
+    static void retainUnappliedDocuments(Map<String, Map<String, IndexMutation>> mutations, Set<String> appliedStores,
+                                         Set<String> storesInBulk, Exception failure) {
+        //A map the caller does not allow to change is left alone: when the applied stores cannot be taken out of it,
+        //nothing inside it is narrowed either, and the whole mutation is resent
+        if (!narrowQuietly("the stores whose bulk request returned", () -> mutations.keySet().removeAll(appliedStores))) {
+            return;
+        }
+        final ElasticSearchBulkFailureException bulkFailure = findBulkFailure(failure);
+        if (bulkFailure == null) {
+            return;
+        }
+        final Map<String, Set<String>> documentsToResend = documentsToResend(bulkFailure);
+        //Only narrow the bulk when the response names documents this mutation holds; anything else would leave the
+        //reattempt with nothing to resend and the failure silently forgotten
+        if (documentsToResend.isEmpty() || !namesPendingDocuments(documentsToResend, mutations)) {
+            return;
+        }
+        for (final String store : storesInBulk) {
+            final Map<String, IndexMutation> documents = mutations.get(store);
+            if (documents == null) {
+                continue;
+            }
+            narrowQuietly("the applied documents of store " + store, () -> {
+                documents.keySet().retainAll(documentsToResend.getOrDefault(store, Collections.emptySet()));
+                if (documents.isEmpty()) {
+                    mutations.remove(store);
+                }
+            });
+        }
+    }
+
+    //Each step takes out only content which is known to have applied and stands on its own, so a document map the
+    //caller does not allow to change simply has that store resent whole, while the other stores are still narrowed.
+    //Nothing which must be resent is ever lost, whichever steps go through
+    private static boolean narrowQuietly(String what, Runnable narrowing) {
+        try {
+            narrowing.run();
+            return true;
+        } catch (UnsupportedOperationException e) {
+            log.debug("Could not take {} out of the Elasticsearch mutation before its reattempt", what, e);
+            return false;
+        }
+    }
+
+    //The documents a failed bulk request leaves to resend: those whose items failed, and those of the chunks which
+    //were never sent because an earlier chunk failed
+    private static Map<String, Set<String>> documentsToResend(ElasticSearchBulkFailureException failure) {
+        final Map<String, Set<String>> toResend = new HashMap<>();
+        failure.getFailedDocumentsByStore().forEach((store, ids) ->
+            toResend.computeIfAbsent(store, k -> new HashSet<>()).addAll(ids));
+        failure.getUnsentDocumentsByStore().forEach((store, ids) ->
+            toResend.computeIfAbsent(store, k -> new HashSet<>()).addAll(ids));
+        return toResend;
+    }
+
+    private static boolean namesPendingDocuments(Map<String, Set<String>> documentsToResend,
+                                                 Map<String, Map<String, IndexMutation>> mutations) {
+        for (final Map.Entry<String, Set<String>> store : documentsToResend.entrySet()) {
+            final Map<String, IndexMutation> documents = mutations.get(store.getKey());
+            if (documents == null || !documents.keySet().containsAll(store.getValue())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static ElasticSearchBulkFailureException findBulkFailure(Throwable failure) {
+        for (final Throwable cause : TransientFailures.causalChain(failure)) {
+            if (cause instanceof ElasticSearchBulkFailureException) {
+                return (ElasticSearchBulkFailureException) cause;
+            }
+        }
+        return null;
+    }
+
+    //With the element's complete document in hand, the document is updated by exactly one update, which carries the
+    //complete document as its upsert, so a document which turns out to be missing is recreated whole in the same round
+    //trip - and nothing is applied on top of it: Elasticsearch writes the upsert of an update whose document is
+    //missing and skips that update's script. So every change of the document travels in one script, which either
+    //applies to the existing document or is skipped as a whole; sent separately, a later part would apply to a snapshot
+    //which already holds its outcome, and removing or adding one occurrence of a LIST value is not idempotent. Being
+    //one item, the update is also applied or rejected as a whole: a bulk request split into chunks cannot separate the
+    //changes of a document, and a reattempt of a failed document never replays a part of them which had applied.
+    //An update the complete document would make too large to send goes without it, as the client decides
+    private void addUpdatesCarryingTheCompleteDocument(List<ElasticSearchMutation> requests, String indexStoreName,
+                                                       String storeName, String documentId, IndexMutation mutation,
+                                                       KeyInformation.IndexRetriever information,
+                                                       Map<String, Object> completeDocument) throws BackendException {
+        final KeyInformation.StoreRetriever storeRetriever = information.get(storeName);
+        final List<Map<String, Object>> deletions = mutation.hasDeletions()
+            ? getParameters(storeRetriever, mutation.getDeletions(), true) : Collections.emptyList();
+        final List<Map<String, Object>> collectionAdditions = mutation.hasAdditions()
+            ? getParameters(storeRetriever, mutation.getAdditions(), false, Cardinality.SINGLE) : Collections.emptyList();
+        final Map<String, Object> singleValuedAdditions = mutation.hasAdditions()
+            ? getAdditionDoc(information, storeName, mutation) : Collections.emptyMap();
+        if (deletions.isEmpty() && collectionAdditions.isEmpty() && singleValuedAdditions.isEmpty()) {
+            return;
+        }
+        final ImmutableMap.Builder<String, Object> script = compat.prepareStoredScript(parameterizedMutationScriptId,
+            ImmutableMap.of(MUTATION_SCRIPT_DELETIONS_KEY, deletions, MUTATION_SCRIPT_ADDITIONS_KEY, collectionAdditions,
+                MUTATION_SCRIPT_DOC_KEY, singleValuedAdditions));
+        requests.add(ElasticSearchMutation.createUpdateRequestWithCompleteDocument(indexStoreName, storeName,
+            documentId, script, completeDocument, collectionAdditions.isEmpty() && singleValuedAdditions.isEmpty()));
+        log.trace("Mutation script {} with deletions {}, collection additions {} and single valued additions {}",
+            PARAMETERIZED_MUTATION_SCRIPT, deletions, collectionAdditions, singleValuedAdditions);
+    }
+
+    //The complete indexed content of the element as an Elasticsearch document, when the transaction supplied it for
+    //an update of an existing document and the element has anything indexed; null otherwise, which includes a complete
+    //document supplied empty: there is nothing to recreate a missing document from, so the mutation goes as without one
+    private Map<String, Object> completeDocument(IndexMutation mutation, KeyInformation.StoreRetriever storeRetriever)
+            throws BackendException {
+        if (mutation.isNew() || mutation.isDeleted() || !mutation.hasCompleteDocument()) {
+            return null;
+        }
+        final List<IndexEntry> entries = mutation.getCompleteDocument();
+        return entries.isEmpty() ? null : getNewDocument(entries, storeRetriever);
+    }
+
     private BackendException convert(Exception esException) {
-        if (esException instanceof InterruptedException) {
+        return convert(esException, retryErrorCodes, retryTransportFailures);
+    }
+
+    //Only a TemporaryBackendException is reattempted by BackendOperation, so a transient failure classified as
+    //permanent means the index mutation is dropped rather than reattempted
+    @VisibleForTesting
+    static BackendException convert(Exception esException, Set<Integer> retryErrorCodes,
+                                    boolean retryTransportFailures) {
+        final Throwable temporaryCause = findTemporaryCause(esException, retryErrorCodes, retryTransportFailures);
+        if (temporaryCause instanceof InterruptedException) {
+            //Throwing the InterruptedException cleared the interrupt status of the thread, and the exception itself
+            //is consumed here, so restore the status. BackendOperation reattempts a temporary failure and relies on
+            //the status to abort that wait, without which a cancelled operation keeps reattempting the mutation for
+            //the whole write time budget
+            Thread.currentThread().interrupt();
             return new TemporaryBackendException("Interrupted while waiting for response", esException);
+        } else if (temporaryCause != null) {
+            return new TemporaryBackendException("Temporary exception while executing index operation, classified as "
+                + "transient by " + describe(temporaryCause), esException);
         } else {
             return new PermanentBackendException("Unknown exception while executing index operation", esException);
         }
+    }
+
+    //Names the signal the classification was taken from, so that an operator reading the log knows whether the
+    //reattempt was decided by a status code, by the statuses of the failed bulk items, or by a transport failure
+    private static String describe(Throwable temporaryCause) {
+        if (temporaryCause instanceof ResponseException) {
+            return "HTTP status "
+                + ((ResponseException) temporaryCause).getResponse().getStatusLine().getStatusCode();
+        }
+        if (temporaryCause instanceof ElasticSearchBulkFailureException) {
+            return "bulk item statuses "
+                + ((ElasticSearchBulkFailureException) temporaryCause).getFailedItemStatusCodes();
+        }
+        return "transport failure " + temporaryCause.getClass().getSimpleName();
+    }
+
+    //Returns the first cause indicating that the operation may succeed if reattempted, or null if the failure is not
+    //recognised as transient. The whole chain is inspected because the Elasticsearch client wraps the failure, and
+    //wraps an interrupt during a client side retry wait in a RuntimeException
+    private static Throwable findTemporaryCause(Throwable throwable, Set<Integer> retryErrorCodes,
+                                                boolean retryTransportFailures) {
+        for (Throwable cause : TransientFailures.causalChain(throwable)) {
+            if (cause instanceof InterruptedException) {
+                return cause;
+            } else if (cause instanceof ResponseException) {
+                final int statusCode = ((ResponseException) cause).getResponse().getStatusLine().getStatusCode();
+                if (retryErrorCodes.contains(statusCode)) {
+                    return cause;
+                }
+            } else if (cause instanceof ElasticSearchBulkFailureException) {
+                //A bulk request is only worth reattempting if every item which failed did so transiently
+                final Set<Integer> statusCodes = ((ElasticSearchBulkFailureException) cause).getFailedItemStatusCodes();
+                if (!statusCodes.isEmpty() && retryErrorCodes.containsAll(statusCodes)) {
+                    return cause;
+                }
+            } else if (retryTransportFailures && TransientFailures.isTransportFailure(cause)) {
+                return cause;
+            }
+        }
+        return null;
+    }
+
+    //An empty list is meaningful here - it turns both levels of reattempt off, and both the option description and
+    //the changelog document it as the way to restore the previous behavior - so the disallowEmpty verification which
+    //ConfigOption installs by default cannot be used. Verify the shape of the value instead, because otherwise a
+    //value which is not a status code leaves the constructor as a bare NumberFormatException naming neither the
+    //option nor the offending entry. Public because RestClientSetup reads the same option for the client level
+    public static boolean isStatusCodeList(String[] statusCodes) {
+        if (statusCodes == null) {
+            return false;
+        }
+        return nonBlank(statusCodes).allMatch(ElasticSearchIndex::isStatusCode);
+    }
+
+    //A value outside the range an HTTP status code can take never matches a response, so accepting it would leave
+    //the classification it was meant to enable switched off with nothing said about it
+    private static boolean isStatusCode(String statusCode) {
+        try {
+            final int parsed = Integer.parseInt(statusCode);
+            return parsed >= MIN_HTTP_STATUS_CODE && parsed <= MAX_HTTP_STATUS_CODE;
+        } catch (NumberFormatException notAStatusCode) {
+            return false;
+        }
+    }
+
+    //Immutable, because the parsed set is held for the lifetime of the index and read from every classification
+    public static Set<Integer> parseStatusCodes(String[] statusCodes) {
+        return nonBlank(statusCodes).map(Integer::parseInt).collect(ImmutableSet.toImmutableSet());
+    }
+
+    //A trailing separator, or a separator surrounded by spaces, is a plausible way to write the list and says
+    //nothing about the codes which were intended
+    private static Stream<String> nonBlank(String[] statusCodes) {
+        return Arrays.stream(statusCodes).map(String::trim).filter(statusCode -> !statusCode.isEmpty());
     }
 
     private static String getDualMappingName(String key) {
@@ -513,7 +976,7 @@ public class ElasticSearchIndex implements IndexProvider {
     }
 
     private String generateIndexStoreName(String store){
-        return indexName + INDEX_NAME_SEPARATOR + store.toLowerCase();
+        return indexName + INDEX_NAME_SEPARATOR + store.toLowerCase(Locale.ROOT);
     }
 
     private String getIndexStoreName(String store) {
@@ -531,8 +994,14 @@ public class ElasticSearchIndex implements IndexProvider {
         final Class<?> dataType = information.getDataType();
         final Mapping map = Mapping.getMapping(information);
         Preconditions.checkArgument(map==Mapping.DEFAULT || AttributeUtils.isString(dataType) ||
-                (map==Mapping.PREFIX_TREE && AttributeUtils.isGeo(dataType)),
+            AttributeUtils.isGeo(dataType) && (map==Mapping.BKD || map==Mapping.PREFIX_TREE),
                 "Specified illegal mapping [%s] for data type [%s]",map,dataType);
+        if(map==Mapping.PREFIX_TREE && !supportsGeoShapePrefixTree){
+            String error = "PREFIX_TREE geo_shape indexing strategy was removed in ElasticSearch 8. " +
+                "Please, select BKD strategy for geo_shape index. Key ["+key+"].";
+            log.error(error);
+            throw new IllegalArgumentException(error);
+        }
         final String indexStoreName = getIndexStoreName(store);
         if (useExternalMappings) {
             try {
@@ -614,6 +1083,9 @@ public class ElasticSearchIndex implements IndexProvider {
             properties.put(key, ImmutableMap.of(ES_TYPE_KEY, "boolean"));
         } else if (dataType == Geoshape.class) {
             switch (map) {
+                case BKD:
+                    properties.put(key, ImmutableMap.of(ES_TYPE_KEY, "geo_shape"));
+                    break;
                 case PREFIX_TREE:
                     final int maxLevels = ParameterType.INDEX_GEO_MAX_LEVELS.findParameter(information.getParameters(),
                             DEFAULT_GEO_MAX_LEVELS);
@@ -725,7 +1197,7 @@ public class ElasticSearchIndex implements IndexProvider {
         return doc;
     }
 
-    private static Object convertToEsType(Object value, Mapping mapping) {
+    private Object convertToEsType(Object value, Mapping mapping) {
         if (value instanceof Number) {
             if (AttributeUtils.isWholeNumber((Number) value)) {
                 return ((Number) value).longValue();
@@ -748,8 +1220,8 @@ public class ElasticSearchIndex implements IndexProvider {
     }
 
     @SuppressWarnings("unchecked")
-    private static Object convertGeoshape(Geoshape geoshape, Mapping mapping) {
-        if (geoshape.getType() == Geoshape.Type.POINT && Mapping.PREFIX_TREE != mapping) {
+    private Object convertGeoshape(Geoshape geoshape, Mapping mapping) {
+        if (geoshape.getType() == Geoshape.Type.POINT && Mapping.BKD != mapping && Mapping.PREFIX_TREE != mapping) {
             final Geoshape.Point p = geoshape.getPoint();
             return new double[]{p.getLongitude(), p.getLatitude()};
         } else if (geoshape.getType() == Geoshape.Type.BOX) {
@@ -760,7 +1232,13 @@ public class ElasticSearchIndex implements IndexProvider {
             return map;
         } else if (geoshape.getType() == Geoshape.Type.CIRCLE) {
             try {
-                final Map<String,Object> map = geoshape.toMap();
+                if(Mapping.BKD.equals(mapping)){
+                    geoshape = bdbCircleProcessor.process(geoshape);
+                    if (geoshape.getType() != Geoshape.Type.CIRCLE){
+                        return convertGeoshape(geoshape, mapping);
+                    }
+                }
+                Map<String,Object> map = geoshape.toMap();
                 map.put("radius", map.get("radius") + ((Map<String, String>) map.remove("properties")).get("radius_units"));
                 return map;
             } catch (final IOException e) {
@@ -779,6 +1257,11 @@ public class ElasticSearchIndex implements IndexProvider {
     public void mutate(Map<String, Map<String, IndexMutation>> mutations, KeyInformation.IndexRetriever information,
                        BaseTransaction tx) throws BackendException {
         final List<ElasticSearchMutation> requests = new ArrayList<>();
+        //Which stores were sent in a bulk request which returned, and which are in the one in flight, so that a
+        //reattempt after a temporary failure resends only what is not known to have applied
+        final Set<String> appliedStores = new HashSet<>();
+        final Set<String> storesInBulk = new HashSet<>();
+        final Set<String> pooledStores = new HashSet<>();
         try {
             for (final Map.Entry<String, Map<String, IndexMutation>> stores : mutations.entrySet()) {
                 final List<ElasticSearchMutation> requestByStore = new ArrayList<>();
@@ -791,67 +1274,90 @@ public class ElasticSearchIndex implements IndexProvider {
                     Preconditions.checkArgument(!(mutation.isNew() && mutation.isDeleted()));
                     Preconditions.checkArgument(!mutation.isNew() || !mutation.hasDeletions());
                     Preconditions.checkArgument(!mutation.isDeleted() || !mutation.hasAdditions());
-                    //Deletions first
-                    if (mutation.hasDeletions()) {
-                        if (mutation.isDeleted()) {
-                            log.trace("Deleting entire document {}", documentId);
-                            requestByStore.add(ElasticSearchMutation.createDeleteRequest(indexStoreName, storeName,
-                                    documentId));
-                        } else {
+                    //The complete indexed content of the element, when the transaction supplied it, is the upsert of
+                    //every update sent for the document: a document which turns out to be missing is recreated whole
+                    //in the same round trip, rather than from the touched fields alone or not at all
+                    final Map<String, Object> completeDocument = completeDocument(mutation, information.get(storeName));
+                    if (mutation.hasDeletions() && mutation.isDeleted()) {
+                        log.trace("Deleting entire document {}", documentId);
+                        requestByStore.add(ElasticSearchMutation.createDeleteRequest(indexStoreName, storeName,
+                                documentId));
+                    } else if (completeDocument != null) {
+                        addUpdatesCarryingTheCompleteDocument(requestByStore, indexStoreName, storeName, documentId,
+                            mutation, information, completeDocument);
+                    } else {
+                        //Deletions first
+                        if (mutation.hasDeletions()) {
                             List<Map<String, Object>> params = getParameters(information.get(storeName),
                                 mutation.getDeletions(), true);
                             Map doc = compat.prepareStoredScript(parameterizedDeletionScriptId, params).build();
                             log.trace("Deletion script {} with params {}", PARAMETERIZED_DELETION_SCRIPT, params);
-                            requestByStore.add(ElasticSearchMutation.createUpdateRequest(indexStoreName, storeName,
-                                documentId, doc));
+                            requestByStore.add(ElasticSearchMutation.createFieldDeletionRequest(indexStoreName,
+                                storeName, documentId, doc));
                         }
-                    }
-                    if (mutation.hasAdditions()) {
-                        if (mutation.isNew()) { //Index
-                            log.trace("Adding entire document {}", documentId);
-                            final Map<String, Object> source = getNewDocument(mutation.getAdditions(),
-                                    information.get(storeName));
-                            requestByStore.add(ElasticSearchMutation.createIndexRequest(indexStoreName, storeName,
-                                    documentId, source));
-                        } else {
-                            final Map upsert;
-                            if (!mutation.hasDeletions()) {
-                                upsert = getNewDocument(mutation.getAdditions(), information.get(storeName));
+                        if (mutation.hasAdditions()) {
+                            if (mutation.isNew()) { //Index
+                                log.trace("Adding entire document {}", documentId);
+                                final Map<String, Object> source = getNewDocument(mutation.getAdditions(),
+                                        information.get(storeName));
+                                requestByStore.add(ElasticSearchMutation.createIndexRequest(indexStoreName, storeName,
+                                        documentId, source));
                             } else {
-                                upsert = null;
-                            }
+                                final Map upsert;
+                                if (!mutation.hasDeletions()) {
+                                    upsert = getNewDocument(mutation.getAdditions(), information.get(storeName));
+                                } else {
+                                    upsert = null;
+                                }
 
-                            List<Map<String, Object>> params = getParameters(information.get(storeName),
-                                    mutation.getAdditions(), false, Cardinality.SINGLE);
-                            if (!params.isEmpty()) {
-                                ImmutableMap.Builder builder = compat.prepareStoredScript(parameterizedAdditionScriptId, params);
-                                requestByStore.add(ElasticSearchMutation.createUpdateRequest(indexStoreName, storeName,
-                                        documentId, builder, upsert));
-                                log.trace("Adding script {} with params {}", PARAMETERIZED_ADDITION_SCRIPT, params);
-                            }
+                                List<Map<String, Object>> params = getParameters(information.get(storeName),
+                                        mutation.getAdditions(), false, Cardinality.SINGLE);
+                                if (!params.isEmpty()) {
+                                    ImmutableMap.Builder builder = compat.prepareStoredScript(parameterizedAdditionScriptId, params);
+                                    requestByStore.add(ElasticSearchMutation.createUpdateRequest(indexStoreName, storeName,
+                                            documentId, builder, upsert));
+                                    log.trace("Adding script {} with params {}", PARAMETERIZED_ADDITION_SCRIPT, params);
+                                }
 
-                            final Map<String, Object> doc = getAdditionDoc(information, storeName, mutation);
-                            if (!doc.isEmpty()) {
-                                final ImmutableMap.Builder builder = ImmutableMap.builder().put(ES_DOC_KEY, doc);
-                                requestByStore.add(ElasticSearchMutation.createUpdateRequest(indexStoreName, storeName,
-                                        documentId, builder, upsert));
-                                log.trace("Adding update {}", doc);
+                                final Map<String, Object> doc = getAdditionDoc(information, storeName, mutation);
+                                if (!doc.isEmpty()) {
+                                    final ImmutableMap.Builder builder = ImmutableMap.builder().put(ES_DOC_KEY, doc);
+                                    requestByStore.add(ElasticSearchMutation.createUpdateRequest(indexStoreName, storeName,
+                                            documentId, builder, upsert));
+                                    log.trace("Adding update {}", doc);
+                                }
                             }
                         }
                     }
                 }
                 if (!requestByStore.isEmpty() && ingestPipelines.containsKey(storeName)) {
+                    storesInBulk.clear();
+                    storesInBulk.add(storeName);
                     client.bulkRequest(requestByStore, String.valueOf(ingestPipelines.get(storeName)));
+                    appliedStores.add(storeName);
                 } else if (!requestByStore.isEmpty()) {
                     requests.addAll(requestByStore);
+                    pooledStores.add(storeName);
+                } else {
+                    appliedStores.add(storeName);
                 }
             }
             if (!requests.isEmpty()) {
+                storesInBulk.clear();
+                storesInBulk.addAll(pooledStores);
                 client.bulkRequest(requests, null);
             }
         } catch (final Exception e) {
-            log.error("Failed to execute bulk Elasticsearch mutation", e);
-            throw convert(e);
+            final BackendException converted = convert(e);
+            //Reserve the error level for a mutation which is about to be dropped: a temporary failure is reattempted
+            //by BackendOperation, and is only lost if the write time budget runs out, which commit reports itself
+            if (converted instanceof TemporaryBackendException) {
+                retainUnappliedDocuments(mutations, appliedStores, storesInBulk, e);
+                log.warn("Transient failure while executing bulk Elasticsearch mutation", e);
+            } else {
+                log.error("Failed to execute bulk Elasticsearch mutation", e);
+            }
+            throw converted;
         }
     }
 
@@ -941,7 +1447,7 @@ public class ElasticSearchIndex implements IndexProvider {
             case EQUAL:
                 return compat.term(key, value);
             case NOT_EQUAL:
-                return compat.boolMustNot(compat.term(key, value));
+                return compat.boolMust(ImmutableList.of(compat.exists(key), compat.boolMustNot(compat.term(key, value))));
             case LESS_THAN:
                 return compat.lt(key, value);
             case LESS_THAN_EQUAL:
@@ -975,7 +1481,9 @@ public class ElasticSearchIndex implements IndexProvider {
                     throw new IllegalArgumentException("Text mapped string values only support CONTAINS and Compare queries and not: " + predicate);
                 if (mapping==Mapping.STRING && Text.HAS_CONTAINS.contains(predicate))
                     throw new IllegalArgumentException("String mapped string values do not support CONTAINS queries: " + predicate);
-                if (mapping==Mapping.TEXTSTRING && !(Text.HAS_CONTAINS.contains(predicate) || (predicate instanceof Cmp && predicate != Cmp.EQUAL))) {
+                //A TEXTSTRING key holds the string whole in its dual field, which it is sorted by, and its words in its
+                //text field: the predicates on words, as CONTAINS is, read the text field, and the others the string
+                if (mapping==Mapping.TEXTSTRING && !Text.HAS_CONTAINS.contains(predicate)) {
                     fieldName = getDualMappingName(key);
                 } else {
                     fieldName = key;
@@ -993,20 +1501,20 @@ public class ElasticSearchIndex implements IndexProvider {
                         compat.boolMustNot(compat.matchPhrase(fieldName, value))));
                 } else if (predicate == Text.CONTAINS_PREFIX) {
                     if (!ParameterType.TEXT_ANALYZER.hasParameter(information.get(key).getParameters()))
-                        value = ((String) value).toLowerCase();
+                        value = lowerCaseCodePoints((String) value);
                     return compat.prefix(fieldName, value);
                 } else if (predicate == Text.NOT_CONTAINS_PREFIX) {
                     if (!ParameterType.TEXT_ANALYZER.hasParameter(information.get(key).getParameters()))
-                        value = ((String) value).toLowerCase();
+                        value = lowerCaseCodePoints((String) value);
                     return compat.boolMust(ImmutableList.of(compat.exists(fieldName),
                         compat.boolMustNot(compat.prefix(fieldName, value))));
                 } else if (predicate == Text.CONTAINS_REGEX) {
                     if (!ParameterType.TEXT_ANALYZER.hasParameter(information.get(key).getParameters()))
-                        value = ((String) value).toLowerCase();
+                        value = lowerCaseCodePoints((String) value);
                     return compat.regexp(fieldName, value);
                 } else if (predicate == Text.NOT_CONTAINS_REGEX) {
                     if (!ParameterType.TEXT_ANALYZER.hasParameter(information.get(key).getParameters()))
-                        value = ((String) value).toLowerCase();
+                        value = lowerCaseCodePoints((String) value);
                     return compat.boolMust(ImmutableList.of(compat.exists(fieldName),
                         compat.boolMustNot(compat.regexp(fieldName, value))));
                 } else if (predicate == Text.PREFIX) {
@@ -1020,7 +1528,7 @@ public class ElasticSearchIndex implements IndexProvider {
                     return compat.boolMust(ImmutableList.of(compat.exists(fieldName),
                         compat.boolMustNot(compat.regexp(fieldName, value))));
                 } else if (predicate == Cmp.NOT_EQUAL) {
-                    return compat.boolMustNot(compat.match(fieldName, value));
+                    return compat.boolMust(ImmutableList.of(compat.exists(fieldName), compat.boolMustNot(compat.match(fieldName, value))));
                 } else if (predicate == Text.FUZZY || predicate == Text.CONTAINS_FUZZY) {
                     return compat.fuzzyMatch(fieldName, value);
                 } else if (predicate == Text.NOT_FUZZY || predicate == Text.NOT_CONTAINS_FUZZY) {
@@ -1128,7 +1636,7 @@ public class ElasticSearchIndex implements IndexProvider {
                     case EQUAL:
                         return compat.term(key, value);
                     case NOT_EQUAL:
-                        return compat.boolMustNot(compat.term(key, value));
+                        return compat.boolMust(ImmutableList.of(compat.exists(key), compat.boolMustNot(compat.term(key, value))));
                     default:
                         throw new IllegalArgumentException("Boolean types only support EQUAL or NOT_EQUAL");
                 }
@@ -1136,7 +1644,7 @@ public class ElasticSearchIndex implements IndexProvider {
                 if (predicate == Cmp.EQUAL) {
                     return compat.term(key, value);
                 } else if (predicate == Cmp.NOT_EQUAL) {
-                    return compat.boolMustNot(compat.term(key, value));
+                    return compat.boolMust(ImmutableList.of(compat.exists(key), compat.boolMustNot(compat.term(key, value))));
                 } else {
                     throw new IllegalArgumentException("Only equal or not equal is supported for UUIDs: "
                             + predicate);
@@ -1145,11 +1653,11 @@ public class ElasticSearchIndex implements IndexProvider {
         } else if (condition instanceof Not) {
             return compat.boolMustNot(getFilter(((Not) condition).getChild(),information));
         } else if (condition instanceof And) {
-            final List queries = StreamSupport.stream(condition.getChildren().spliterator(), false)
+            final List queries = IterablesUtil.stream(condition.getChildren())
                 .map(c -> getFilter(c,information)).collect(Collectors.toList());
             return compat.boolMust(queries);
         } else if (condition instanceof Or) {
-            final List queries = StreamSupport.stream(condition.getChildren().spliterator(), false)
+            final List queries = IterablesUtil.stream(condition.getChildren())
                 .map(c -> getFilter(c,information)).collect(Collectors.toList());
             return compat.boolShould(queries);
         } else throw new IllegalArgumentException("Invalid condition: " + condition);
@@ -1164,45 +1672,39 @@ public class ElasticSearchIndex implements IndexProvider {
         if (!query.getOrder().isEmpty()) {
             addOrderToQuery(informations, sr, query.getOrder(), query.getStore());
         }
-        sr.setFrom(0);
-        if (query.hasLimit()) {
-            sr.setSize(Math.min(query.getLimit(), batchSize));
-        } else {
-            sr.setSize(batchSize);
-        }
-
         sr.setDisableSourceRetrieval(true);
 
-        ElasticSearchResponse response;
         try {
-            final String indexStoreName = getIndexStoreName(query.getStore());
-            final boolean useScroll = sr.getSize() >= batchSize;
-            response = client.search(indexStoreName,
-                compat.createRequestBody(sr, useScroll? NULL_PARAMETERS : TRACK_TOTAL_HITS_DISABLED_PARAMETERS),
-                useScroll);
-            log.debug("First Executed query [{}] in {} ms", query.getCondition(), response.getTook());
-            final Iterator<RawQuery.Result<String>> resultIterator = getResultsIterator(useScroll, response, sr.getSize());
-            final Stream<RawQuery.Result<String>> toReturn
-                    = StreamSupport.stream(Spliterators.spliteratorUnknownSize(resultIterator, Spliterator.ORDERED), false);
-            return (query.hasLimit() ? toReturn.limit(query.getLimit()) : toReturn).map(RawQuery.Result::getResult);
-        } catch (final IOException | UncheckedIOException e) {
-            throw new PermanentBackendException(e);
+            log.debug("Executing query [{}]", query.getCondition());
+            return searcher.search(getIndexStoreName(query.getStore()), sr, null, 0, query.getLimit())
+                .map(RawQuery.Result::getResult);
+        } catch (final IOException e) {
+            //Classified like a write failure, so that BackendOperation reattempts a transient one within the read time
+            throw convert(e);
         }
     }
 
-    private Iterator<RawQuery.Result<String>> getResultsIterator(boolean useScroll, ElasticSearchResponse response, int windowSize){
-        return (useScroll)? new ElasticSearchScroll(client, response, windowSize) : response.getResults().iterator();
-    }
-
+    //The unmapped_type of a sort by a key of the data type: the type which Elasticsearch takes the field for in an
+    //index without a mapping of it, where no document holds a value of it. It is the type which pushMapping maps a
+    //sortable field of the data type to, but keyword for any string key, which pushMapping maps to text where it has a
+    //string analyzer: with no values to sort, any type which Elasticsearch can sort by will do. Elasticsearch rejects a
+    //sort whose unmapped_type is null, and from version 8 on, where the index has no mapping of the field, one whose
+    //unmapped_type is "string", which versions 6 and 7 read as keyword with a deprecation warning
     private String convertToEsDataType(Class<?> dataType, Mapping mapping) {
         if(String.class.isAssignableFrom(dataType)) {
-            return "string";
+            return "keyword";
         }
         else if (Integer.class.isAssignableFrom(dataType)) {
             return "integer";
         }
         else if (Long.class.isAssignableFrom(dataType)) {
             return "long";
+        }
+        else if (Short.class.isAssignableFrom(dataType)) {
+            return "short";
+        }
+        else if (Byte.class.isAssignableFrom(dataType)) {
+            return "byte";
         }
         else if (Float.class.isAssignableFrom(dataType)) {
             return "float";
@@ -1226,41 +1728,19 @@ public class ElasticSearchIndex implements IndexProvider {
         return null;
     }
 
-    private ElasticSearchResponse runCommonQuery(RawQuery query, KeyInformation.IndexRetriever informations, BaseTransaction tx, int size,
-                                                 boolean useScroll) throws BackendException{
-        final ElasticSearchRequest sr = new ElasticSearchRequest();
-        sr.setQuery(compat.queryString(query.getQuery()));
-        if (!query.getOrders().isEmpty()) {
-            addOrderToQuery(informations, sr, query.getOrders(), query.getStore());
-        }
-        sr.setFrom(0);
-        sr.setSize(size);
-        sr.setDisableSourceRetrieval(true);
-        try {
-            Map<String, Object> requestBody = compat.createRequestBody(sr, query.getParameters());
-            if(!useScroll) {
-                if (requestBody == null) {
-                    requestBody = TRACK_TOTAL_HITS_DISABLED_REQUEST_BODY;
-                } else {
-                    requestBody.put(TRACK_TOTAL_HITS_PARAMETER, false);
-                }
-            }
-            return client.search(
-                getIndexStoreName(query.getStore()),
-                requestBody,
-                useScroll);
-        } catch (final IOException | UncheckedIOException e) {
-            throw new PermanentBackendException(e);
-        }
-    }
-
     private long runCountQuery(RawQuery query) throws BackendException{
+        if (countsNothing(query)) {
+            return 0;
+        }
         try {
-            return client.countTotal(
+            long countTotal = client.countTotal(
                 getIndexStoreName(query.getStore()),
-                compat.createRequestBody(compat.queryString(query.getQuery()), query.getParameters()));
+                compat.createRequestBody(compat.queryString(query.getQuery()), query.getParameters()),
+                countBound(query.getOffset(), query));
+            return QueryUtil.applyOffsetWithQueryLimitAfterCount(countTotal, query.getOffset(), query);
         } catch (final IOException | UncheckedIOException e) {
-            throw new PermanentBackendException(e);
+            //Classified like a write failure, so that BackendOperation reattempts a transient one within the read time
+            throw convert(e);
         }
     }
 
@@ -1272,36 +1752,74 @@ public class ElasticSearchIndex implements IndexProvider {
             final Mapping mapping = Mapping.getMapping(information);
             final Class<?> datatype = orderEntry.getDatatype();
             final String key = hasDualStringMapping(information) ? getDualMappingName(orderEntry.getKey()) : orderEntry.getKey();
-            sr.addSort(key, order.toLowerCase(), convertToEsDataType(datatype, mapping));
+            sr.addSort(key, order.toLowerCase(Locale.ROOT), convertToEsDataType(datatype, mapping));
         }
     }
 
     @Override
     public Stream<RawQuery.Result<String>> query(RawQuery query, KeyInformation.IndexRetriever information,
                                                  BaseTransaction tx) throws BackendException {
-        final int size = query.hasLimit() ? Math.min(query.getLimit() + query.getOffset(), batchSize) : batchSize;
-        final boolean useScroll = size >= batchSize;
-        final ElasticSearchResponse response = runCommonQuery(query, information, tx, size, useScroll);
-        log.debug("First Executed query [{}] in {} ms", query.getQuery(), response.getTook());
-        final Iterator<RawQuery.Result<String>> resultIterator = getResultsIterator(useScroll, response, size);
-        final Stream<RawQuery.Result<String>> toReturn
-                = StreamSupport.stream(Spliterators.spliteratorUnknownSize(resultIterator, Spliterator.ORDERED),
-                false).skip(query.getOffset());
-        return query.hasLimit() ? toReturn.limit(query.getLimit()) : toReturn;
+        final ElasticSearchRequest sr = new ElasticSearchRequest();
+        sr.setQuery(compat.queryString(query.getQuery()));
+        if (!query.getOrders().isEmpty()) {
+            addOrderToQuery(information, sr, query.getOrders(), query.getStore());
+        }
+        //The hits of a raw query carry their scores, and come in their order
+        sr.setRelevanceOrdered(true);
+        sr.setDisableSourceRetrieval(true);
+        try {
+            log.debug("Executing query [{}]", query.getQuery());
+            return searcher.search(getIndexStoreName(query.getStore()), sr, query.getParameters(), query.getOffset(),
+                query.getLimit());
+        } catch (final IOException e) {
+            //Classified like a write failure, so that BackendOperation reattempts a transient one within the read time
+            throw convert(e);
+        }
     }
 
     @Override
-    public Long queryCount(IndexQuery query, KeyInformation.IndexRetriever information, BaseTransaction tx) throws BackendException {
+    public Number queryAggregation(IndexQuery query, KeyInformation.IndexRetriever information, BaseTransaction tx, Aggregation aggregation) throws BackendException {
         final ElasticSearchRequest sr = new ElasticSearchRequest();
-        final Map<String,Object> esQuery = getFilter(query.getCondition(), information.get(query.getStore()));
+        final Map<String, Object> esQuery = getFilter(query.getCondition(), information.get(query.getStore()));
         sr.setQuery(compat.prepareQuery(esQuery));
         try {
-            return client.countTotal(
-                getIndexStoreName(query.getStore()),
-                compat.createRequestBody(sr, null));
+            final String indexName = getIndexStoreName(query.getStore());
+            final Map<String,Object> requestData = compat.createRequestBody(sr, null);
+            switch (aggregation.getType()) {
+                case COUNT: return countsNothing(query) ? 0L : QueryUtil.applyQueryLimitAfterCount(client.countTotal(indexName, requestData, countBound(0, query)), query);
+                case MIN: return client.min(indexName, requestData, aggregation.getFieldName(), aggregation.getDataType());
+                case MAX: return client.max(indexName, requestData, aggregation.getFieldName(), aggregation.getDataType());
+                case AVG: return client.avg(indexName, requestData, aggregation.getFieldName());
+                case SUM: return client.sum(indexName, requestData, aggregation.getFieldName(), aggregation.getDataType());
+                default: throw new UnsupportedOperationException();
+            }
         } catch (final IOException | UncheckedIOException e) {
-            throw new PermanentBackendException(e);
+            //Classified like a write failure, so that BackendOperation reattempts a transient one within the read time
+            throw convert(e);
         }
+    }
+
+    /**
+     * Whether a count of the given query is 0 before any match is counted: with a limit of 0, which the count would be
+     * clamped to, there is nothing to ask Elasticsearch.
+     */
+    @VisibleForTesting
+    static boolean countsNothing(Query query) {
+        return query.hasLimit() && query.getLimit() <= 0;
+    }
+
+    /**
+     * The most matches a count of the given query has to find: its offset and limit, which the count is clamped to
+     * afterwards, or 0, no bound, without a limit, and also where the two don't fit an int, as a bound no count
+     * reaches would only keep Elasticsearch from answering a count from its statistics.
+     */
+    @VisibleForTesting
+    static int countBound(int offset, Query query) {
+        if (!query.hasLimit()) {
+            return 0;
+        }
+        final long bound = (long) offset + query.getLimit();
+        return bound < Integer.MAX_VALUE ? (int) bound : 0;
     }
 
     @Override
@@ -1320,7 +1838,7 @@ public class ElasticSearchIndex implements IndexProvider {
         final Class<?> dataType = information.getDataType();
         final Mapping mapping = Mapping.getMapping(information);
         if (mapping!=Mapping.DEFAULT && !AttributeUtils.isString(dataType) &&
-                !(mapping==Mapping.PREFIX_TREE && AttributeUtils.isGeo(dataType))) return false;
+                !(AttributeUtils.isGeo(dataType) && (mapping==Mapping.BKD || mapping==Mapping.PREFIX_TREE))) return false;
 
         if (Number.class.isAssignableFrom(dataType)) {
             return janusgraphPredicate instanceof Cmp;
@@ -1328,6 +1846,7 @@ public class ElasticSearchIndex implements IndexProvider {
             switch(mapping) {
                 case DEFAULT:
                     return janusgraphPredicate instanceof Geo && janusgraphPredicate != Geo.CONTAINS;
+                case BKD:
                 case PREFIX_TREE:
                     return janusgraphPredicate instanceof Geo;
             }
@@ -1370,7 +1889,7 @@ public class ElasticSearchIndex implements IndexProvider {
             return mapping == Mapping.DEFAULT || mapping == Mapping.STRING
                 || mapping == Mapping.TEXT || mapping == Mapping.TEXTSTRING;
         } else if (AttributeUtils.isGeo(dataType)) {
-            return mapping == Mapping.DEFAULT || mapping == Mapping.PREFIX_TREE;
+            return mapping == Mapping.DEFAULT || mapping == Mapping.BKD || mapping == Mapping.PREFIX_TREE && supportsGeoShapePrefixTree;
         }
         return false;
     }
@@ -1413,6 +1932,19 @@ public class ElasticSearchIndex implements IndexProvider {
     }
 
     @Override
+    public void clearStore(String storeName) throws BackendException {
+        //Derive the name the same way every read and write path does, so that a store name which is not already
+        //lowercase still resolves to the Elasticsearch index which actually holds its documents
+        final String indexStoreName = getIndexStoreName(storeName);
+        try {
+            client.clearStore(indexStoreName);
+        } catch (final Exception e) {
+            throw new PermanentBackendException("Could not clear store " + storeName
+                + " (Elasticsearch index " + indexStoreName + ")", e);
+        }
+    }
+
+    @Override
     public boolean exists() throws BackendException {
         try {
             return client.indexExists(indexName);
@@ -1425,8 +1957,8 @@ public class ElasticSearchIndex implements IndexProvider {
         return client.getMajorVersion();
     }
 
-    boolean isUseMappingForES7(){
-        return useMappingForES7;
+    boolean usesMappingTypes() {
+        return client.usesMappingTypes();
     }
 
     private static String parameterizedScriptPrepare(String ... lines){

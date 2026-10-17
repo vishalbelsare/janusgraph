@@ -23,10 +23,10 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 public class CqlESAssemblyIT extends AbstractJanusGraphAssemblyIT {
 
     @Container
-    private static JanusGraphCassandraContainer _cql = new JanusGraphCassandraContainer(true);
+    private static final JanusGraphCassandraContainer _cql = new JanusGraphCassandraContainer(true);
 
     @Container
-    private static JanusGraphElasticsearchContainer es = new JanusGraphElasticsearchContainer(true);
+    private static final JanusGraphElasticsearchContainer _es = new JanusGraphElasticsearchContainer(true);
 
     @Override
     protected String getConfigPath() {
@@ -36,6 +36,11 @@ public class CqlESAssemblyIT extends AbstractJanusGraphAssemblyIT {
     @Override
     protected String getServerConfigPath() {
         return "conf/gremlin-server/gremlin-server-cql-es.yaml";
+    }
+
+    @Override
+    protected String getLocalSparkGraphConfigPath() {
+        return "conf/hadoop-graph/read-cql.properties";
     }
 
     @Override

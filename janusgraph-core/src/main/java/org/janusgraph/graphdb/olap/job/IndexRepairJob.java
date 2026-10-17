@@ -17,6 +17,7 @@ package org.janusgraph.graphdb.olap.job;
 import com.google.common.base.Preconditions;
 import org.apache.tinkerpop.gremlin.structure.Direction;
 import org.janusgraph.core.BaseVertexQuery;
+import org.janusgraph.core.JanusGraph;
 import org.janusgraph.core.JanusGraphElement;
 import org.janusgraph.core.JanusGraphException;
 import org.janusgraph.core.JanusGraphVertex;
@@ -31,11 +32,14 @@ import org.janusgraph.diskstorage.BackendException;
 import org.janusgraph.diskstorage.BackendTransaction;
 import org.janusgraph.diskstorage.Entry;
 import org.janusgraph.diskstorage.StaticBuffer;
+import org.janusgraph.diskstorage.configuration.Configuration;
 import org.janusgraph.diskstorage.indexing.IndexEntry;
 import org.janusgraph.diskstorage.keycolumnvalue.cache.KCVSCache;
 import org.janusgraph.diskstorage.keycolumnvalue.scan.ScanMetrics;
+import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
 import org.janusgraph.graphdb.database.EdgeSerializer;
 import org.janusgraph.graphdb.database.IndexSerializer;
+import org.janusgraph.graphdb.database.index.IndexUpdate;
 import org.janusgraph.graphdb.database.management.RelationTypeIndexWrapper;
 import org.janusgraph.graphdb.internal.InternalRelation;
 import org.janusgraph.graphdb.internal.InternalRelationType;
@@ -53,6 +57,7 @@ import org.janusgraph.util.StringUtils;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -74,7 +79,41 @@ public class IndexRepairJob extends IndexUpdateJob implements VertexScanJob {
      */
     public static final String DOCUMENT_UPDATES_COUNT = "doc-updates";
 
+    /**
+     * The number of batched mixed-index restore calls (bulk flushes) issued to the index backend.
+     */
+    public static final String MIXED_INDEX_FLUSH_COUNT = "mixed-index-flushes";
+
+    /**
+     * The total number of documents sent to the index backend through batched restore calls.
+     */
+    public static final String MIXED_INDEX_FLUSHED_DOCUMENTS = "mixed-index-flushed-docs";
+
+    /**
+     * Cumulative wall-clock milliseconds (summed across workers) spent inside index-backend restore
+     * calls. Divide by {@link #MIXED_INDEX_FLUSH_COUNT} for the average flush latency, or compare
+     * against per-worker elapsed time to see what fraction of the reindex is index-backend-bound.
+     */
+    public static final String MIXED_INDEX_FLUSH_TIME_MS = "mixed-index-flush-time-ms";
+
     private Map<String,Map<String,List<IndexEntry>>> documentsPerStore = new HashMap<>();
+
+    /**
+     * Maximum number of mixed-index documents to accumulate before flushing them to the index backend
+     * via a single {@code restore} call. A non-positive value disables size-based flushing, in which case
+     * documents are only flushed once per scan iteration in {@link #workerIterationEnd(ScanMetrics)} (the
+     * legacy behavior). Resolved from configuration in {@link #workerIterationStart}.
+     */
+    private int mixedIndexBatchSize = -1;
+
+    /**
+     * The resolved index type and serializer for this reindex. They are constant for the whole job,
+     * so they are computed once in {@link #workerIterationStart} rather than per processed vertex
+     * (each {@code asIndexType()} call otherwise allocates a fresh wrapper). Only set when the target
+     * is a {@link JanusGraphIndex}; remain {@code null} for relation-type indexes.
+     */
+    private IndexType indexType;
+    private IndexSerializer indexSerializer;
 
     public IndexRepairJob() {
         super();
@@ -84,6 +123,29 @@ public class IndexRepairJob extends IndexUpdateJob implements VertexScanJob {
 
     public IndexRepairJob(final String indexName, final String indexType) {
         super(indexName,indexType);
+    }
+
+    @Override
+    public void workerIterationStart(JanusGraph graph, Configuration config, ScanMetrics metrics) {
+        super.workerIterationStart(graph, config, metrics);
+        // Resolve the mixed-index reindex batch size so that documents are flushed incrementally as they
+        // are produced, rather than being buffered for an entire scan segment. This bounds worker memory
+        // and lets restored documents stream to the index backend while the storage scan continues. It is
+        // particularly important for the distributed (MapReduce/Spark) reindex, whose mapper only flushes
+        // once per input split. Single-node reindex already flushes per work block of the same size, so
+        // this does not change its behavior.
+        final Configuration graphConfig = this.graph.getConfiguration().getConfiguration();
+        if (graphConfig.get(GraphDatabaseConfiguration.MIXED_INDEX_REINDEX_BATCH_ENABLED)) {
+            mixedIndexBatchSize = graphConfig.get(GraphDatabaseConfiguration.MIXED_INDEX_REINDEX_BATCH_SIZE);
+        } else {
+            mixedIndexBatchSize = -1;
+        }
+        // Resolve the index type and serializer once: they are constant for the whole reindex and
+        // were previously recomputed for every processed vertex (asIndexType() allocates a wrapper).
+        if (index instanceof JanusGraphIndex) {
+            indexType = managementSystem.getSchemaVertex(index).asIndexType();
+            indexSerializer = this.graph.getIndexSerializer();
+        }
     }
 
     /**
@@ -157,14 +219,14 @@ public class IndexRepairJob extends IndexUpdateJob implements VertexScanJob {
                         } else {
                             assert pos == 1;
                             InternalVertex otherVertex = janusgraphRelation.getVertex(1);
-                            StaticBuffer otherVertexKey = writeTx.getIdInspector().getKey(otherVertex.longId());
+                            StaticBuffer otherVertexKey = writeTx.getIdInspector().getKey(otherVertex.id());
                             inAdditionsMap.computeIfAbsent(otherVertexKey, k -> new ArrayList<>()).add(entry);
                         }
                     }
                 }
 
                 //Mutating all OUT relationships for the current vertex
-                StaticBuffer vertexKey = writeTx.getIdInspector().getKey(vertex.longId());
+                StaticBuffer vertexKey = writeTx.getIdInspector().getKey(vertex.id());
                 mutator.mutateEdges(vertexKey, outAdditions, KCVSCache.NO_DELETIONS);
 
                 //Mutating all IN relationships for the current vertex
@@ -177,30 +239,28 @@ public class IndexRepairJob extends IndexUpdateJob implements VertexScanJob {
                 }
                 metrics.incrementCustom(ADDED_RECORDS_COUNT, outAdditions.size()+totalInAdditions);
             } else if (index instanceof JanusGraphIndex) {
-                IndexType indexType = managementSystem.getSchemaVertex(index).asIndexType();
+                // indexType and indexSerializer were resolved once in workerIterationStart.
                 assert indexType!=null;
-                IndexSerializer indexSerializer = graph.getIndexSerializer();
                 //Gather elements to index
-                List<JanusGraphElement> elements;
+                Iterator<? extends JanusGraphElement> elements;
                 switch (indexType.getElement()) {
                     case VERTEX:
-                        elements = Collections.singletonList(vertex);
+                        elements = Collections.singletonList(vertex).iterator();
                         break;
                     case PROPERTY:
-                        elements = new ArrayList<>();
-                        addIndexSchemaConstraint(vertex.query(),indexType).properties().forEach(elements::add);
+                        elements = addIndexSchemaConstraint(vertex.query(),indexType).properties().iterator();
                         break;
                     case EDGE:
-                        elements = new ArrayList<>();
-                        addIndexSchemaConstraint(vertex.query().direction(Direction.OUT),indexType).edges().forEach(elements::add);
+                        elements = addIndexSchemaConstraint(vertex.query().direction(Direction.OUT),indexType).edges().iterator();
                         break;
                     default: throw new AssertionError("Unexpected category: " + indexType.getElement());
                 }
                 if (indexType.isCompositeIndex()) {
-                    for (JanusGraphElement element : elements) {
-                        Set<IndexSerializer.IndexUpdate<StaticBuffer,Entry>> updates =
-                                indexSerializer.reindexElement(element, (CompositeIndexType) indexType);
-                        for (IndexSerializer.IndexUpdate<StaticBuffer,Entry> update : updates) {
+                    while (elements.hasNext()) {
+                        JanusGraphElement element = elements.next();
+                        Set<IndexUpdate<StaticBuffer,Entry>> updates =
+                                indexSerializer.reindexElement(element, (CompositeIndexType) indexType, writeTx);
+                        for (IndexUpdate<StaticBuffer,Entry> update : updates) {
                             log.debug("Mutating index {}: {}", indexType, update.getEntry());
                             mutator.mutateIndex(update.getKey(), new ArrayList<Entry>(1){{add(update.getEntry());}}, KCVSCache.NO_DELETIONS);
                             metrics.incrementCustom(ADDED_RECORDS_COUNT);
@@ -208,10 +268,16 @@ public class IndexRepairJob extends IndexUpdateJob implements VertexScanJob {
                     }
                 } else {
                     assert indexType.isMixedIndex();
-                    for (JanusGraphElement element : elements) {
+                    while (elements.hasNext()) {
+                        JanusGraphElement element = elements.next();
                         if (indexSerializer.reindexElement(element, (MixedIndexType) indexType, documentsPerStore)) {
                             metrics.incrementCustom(DOCUMENT_UPDATES_COUNT);
                         }
+                    }
+                    // Flush as soon as enough documents have been buffered so that worker memory stays bounded
+                    // and restored documents stream to the index backend while the scan keeps producing rows.
+                    if (mixedIndexBatchSize > 0 && countBufferedDocuments() >= mixedIndexBatchSize) {
+                        restoreDocuments(mutator, indexType, metrics);
                     }
                 }
 
@@ -224,15 +290,43 @@ public class IndexRepairJob extends IndexUpdateJob implements VertexScanJob {
         }
     }
 
+    private int countBufferedDocuments() {
+        int count = 0;
+        for (Map<String, List<IndexEntry>> documents : documentsPerStore.values()) {
+            count += documents.size();
+        }
+        return count;
+    }
+
+    /**
+     * Sends the buffered documents to the index backend, tracking flush count/size/time as custom
+     * scan metrics so a slow reindex can be attributed to (or exonerated from) index-backend writes:
+     * comparing {@link #MIXED_INDEX_FLUSH_TIME_MS} against wall-clock-per-worker shows the fraction
+     * of worker time spent inside index-backend restores.
+     */
+    private void restoreDocuments(BackendTransaction mutator, IndexType indexType, ScanMetrics metrics) throws BackendException {
+        final int documents = countBufferedDocuments();
+        final long flushStart = System.nanoTime();
+        mutator.getIndexTransaction(indexType.getBackingIndexName()).restore(documentsPerStore);
+        documentsPerStore = new HashMap<>();
+        metrics.incrementCustom(MIXED_INDEX_FLUSH_COUNT);
+        metrics.incrementCustom(MIXED_INDEX_FLUSHED_DOCUMENTS, documents);
+        // Round to nearest ms: truncation would systematically undercount across many fast flushes.
+        metrics.incrementCustom(MIXED_INDEX_FLUSH_TIME_MS, (System.nanoTime() - flushStart + 500_000) / 1_000_000);
+    }
+
     @Override
     public void workerIterationEnd(final ScanMetrics metrics) {
         try {
-            if (index instanceof JanusGraphIndex) {
+            // If writeTx is `null` it means that `workerIterationStart` failed previously and write transaction was
+            // never assigned. In this case, instead of raising NPE here we skip this block which will
+            // properly propagate root cause exception instead of NPE exception.
+            // See the first `catch` block in `StandardScannerExecutor.run`.
+            if (index instanceof JanusGraphIndex && writeTx != null) {
                 BackendTransaction mutator = writeTx.getTxHandle();
                 IndexType indexType = managementSystem.getSchemaVertex(index).asIndexType();
                 if (indexType.isMixedIndex() && documentsPerStore.size() > 0) {
-                    mutator.getIndexTransaction(indexType.getBackingIndexName()).restore(documentsPerStore);
-                    documentsPerStore = new HashMap<>();
+                    restoreDocuments(mutator, indexType, metrics);
                 }
             }
         } catch (BackendException e) {

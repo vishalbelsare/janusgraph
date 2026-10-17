@@ -24,6 +24,8 @@ import org.janusgraph.diskstorage.indexing.RawQuery;
 import org.janusgraph.diskstorage.keycolumnvalue.KeyIterator;
 import org.janusgraph.diskstorage.keycolumnvalue.KeyRangeQuery;
 import org.janusgraph.diskstorage.keycolumnvalue.KeySliceQuery;
+import org.janusgraph.diskstorage.keycolumnvalue.KeysQueriesGroup;
+import org.janusgraph.diskstorage.keycolumnvalue.MultiKeysQueryGroups;
 import org.janusgraph.diskstorage.keycolumnvalue.SliceQuery;
 import org.janusgraph.diskstorage.keycolumnvalue.StoreFeatures;
 import org.janusgraph.diskstorage.keycolumnvalue.StoreTransaction;
@@ -33,6 +35,7 @@ import org.janusgraph.diskstorage.log.kcvs.ExternalCachePersistor;
 import org.janusgraph.diskstorage.util.BackendOperation;
 import org.janusgraph.diskstorage.util.BufferUtil;
 import org.janusgraph.graphdb.database.serialize.DataOutput;
+import org.janusgraph.graphdb.tinkerpop.optimize.step.Aggregation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,6 +48,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
+
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.ALLOW_CUSTOM_VERTEX_ID_TYPES;
 
 /**
  * Bundles all storage/index transactions and provides a proxy for some of their
@@ -80,12 +85,14 @@ public class BackendTransaction implements LoggableTransaction {
     private final Map<String, IndexTransaction> indexTx;
 
     private boolean acquiredLock = false;
-    private boolean cacheEnabled = true;
+    private boolean cacheEnabled;
+    private boolean allowCustomVertexIdType;
 
     public BackendTransaction(CacheTransaction storeTx, BaseTransactionConfig txConfig,
                               StoreFeatures features, KCVSCache edgeStore, KCVSCache indexStore,
                               KCVSCache txLogStore, Duration maxReadTime,
-                              Map<String, IndexTransaction> indexTx, Executor threadPool) {
+                              Map<String, IndexTransaction> indexTx, Executor threadPool,
+                              boolean cacheEnabled, boolean allowCustomVertexIdType) {
         this.storeTx = storeTx;
         this.txConfig = txConfig;
         this.storeFeatures = features;
@@ -95,6 +102,8 @@ public class BackendTransaction implements LoggableTransaction {
         this.maxReadTime = maxReadTime;
         this.indexTx = indexTx;
         this.threadPool = threadPool;
+        this.cacheEnabled = cacheEnabled;
+        this.allowCustomVertexIdType = allowCustomVertexIdType;
     }
 
     public boolean hasAcquiredLock() {
@@ -130,6 +139,10 @@ public class BackendTransaction implements LoggableTransaction {
 
     public void enableCache() {
         this.cacheEnabled = true;
+    }
+
+    public boolean isCacheEnabled(){
+        return cacheEnabled;
     }
 
     public void commitStorage() throws BackendException {
@@ -200,7 +213,11 @@ public class BackendTransaction implements LoggableTransaction {
      * @param deletions List of columns to be removed
      */
     public void mutateEdges(StaticBuffer key, List<Entry> additions, List<Entry> deletions) throws BackendException {
-        edgeStore.mutateEntries(key, additions, deletions, storeTx);
+        mutateEdges(key, additions, deletions, false);
+    }
+
+    public void mutateEdges(StaticBuffer key, List<Entry> additions, List<Entry> deletions, boolean wholeRowDeletion) throws BackendException {
+        edgeStore.mutateEntries(key, additions, deletions, wholeRowDeletion, storeTx);
     }
 
     /**
@@ -297,66 +314,81 @@ public class BackendTransaction implements LoggableTransaction {
                 }
             });
         } else {
-            final Map<StaticBuffer,EntryList> results = new HashMap<>(keys.size());
-            if (threadPool == null || keys.size() < MIN_TASKS_TO_PARALLELIZE) {
-                for (StaticBuffer key : keys) {
-                    results.put(key,edgeStoreQuery(new KeySliceQuery(key, query)));
+            return multiThreadedEdgeStoreMultiQuery(keys, query);
+        }
+    }
+
+    public Map<SliceQuery, Map<StaticBuffer, EntryList>> edgeStoreMultiQuery(final MultiKeysQueryGroups<StaticBuffer, SliceQuery> multiSliceQueriesWithKeys) {
+        if (storeFeatures.hasMultiQuery()) {
+            return executeRead(new Callable<Map<SliceQuery, Map<StaticBuffer, EntryList>>>() {
+                @Override
+                public Map<SliceQuery, Map<StaticBuffer, EntryList>> call() throws Exception {
+                    return cacheEnabled?edgeStore.getMultiSlices(multiSliceQueriesWithKeys, storeTx):
+                        edgeStore.getMultiSlicesNoCache(multiSliceQueriesWithKeys, storeTx);
                 }
-            } else {
-                final CountDownLatch doneSignal = new CountDownLatch(keys.size());
-                final AtomicInteger failureCount = new AtomicInteger(0);
-                EntryList[] resultArray = new EntryList[keys.size()];
-                for (int i = 0; i < keys.size(); i++) {
-                    threadPool.execute(new SliceQueryRunner(new KeySliceQuery(keys.get(i), query),
-                            doneSignal, failureCount, resultArray, i));
+
+                @Override
+                public String toString() {
+                    return "MultiEdgeStoreQuery";
                 }
-                try {
-                    doneSignal.await();
-                } catch (InterruptedException e) {
-                    throw new JanusGraphException("Interrupted while waiting for multi-query to complete", e);
-                }
-                if (failureCount.get() > 0) {
-                    throw new JanusGraphException("Could not successfully complete multi-query. " + failureCount.get() + " individual queries failed.");
-                }
-                for (int i=0;i<keys.size();i++) {
-                    assert resultArray[i]!=null;
-                    results.put(keys.get(i),resultArray[i]);
+            });
+        } else {
+            final Map<SliceQuery, Map<StaticBuffer, EntryList>> results = new HashMap<>();
+            for(KeysQueriesGroup<StaticBuffer, SliceQuery> queriesForKeysPair : multiSliceQueriesWithKeys.getQueryGroups()){
+                List<StaticBuffer> keys = queriesForKeysPair.getKeysGroup();
+                for(SliceQuery query : queriesForKeysPair.getQueries()){
+                    Map<StaticBuffer, EntryList> sliceResult = multiThreadedEdgeStoreMultiQuery(keys, query);
+                    results.put(query, sliceResult);
                 }
             }
             return results;
         }
     }
 
-    private class SliceQueryRunner implements Runnable {
-
-        final KeySliceQuery kq;
-        final CountDownLatch doneSignal;
-        final AtomicInteger failureCount;
-        final Object[] resultArray;
-        final int resultPosition;
-
-        private SliceQueryRunner(KeySliceQuery kq, CountDownLatch doneSignal, AtomicInteger failureCount,
-                                 Object[] resultArray, int resultPosition) {
-            this.kq = kq;
-            this.doneSignal = doneSignal;
-            this.failureCount = failureCount;
-            this.resultArray = resultArray;
-            this.resultPosition = resultPosition;
-        }
-
-        @Override
-        public void run() {
+    /**
+     * This method uses `threadPool` to execute a slice query for each key in parallel.
+     * Notice, however, that it is recommended to send all these keys in balk for execution directly to the storage
+     * implementation if the storage has multiQuery (`storeFeatures.hasMultiQuery()`) support because many
+     * storage backends can leverage optimized execution for multiple keys (asynchronous or grouped execution) and
+     * thus, don't require a separate thread for each SliceQuery + key pair execution.
+     */
+    private Map<StaticBuffer,EntryList> multiThreadedEdgeStoreMultiQuery(final List<StaticBuffer> keys, final SliceQuery query){
+        final Map<StaticBuffer,EntryList> results = new HashMap<>(keys.size());
+        if (threadPool == null || keys.size() < MIN_TASKS_TO_PARALLELIZE) {
+            for (StaticBuffer key : keys) {
+                results.put(key,edgeStoreQuery(new KeySliceQuery(key, query)));
+            }
+        } else {
+            final CountDownLatch doneSignal = new CountDownLatch(keys.size());
+            final AtomicInteger failureCount = new AtomicInteger(0);
+            EntryList[] resultArray = new EntryList[keys.size()];
+            for (int i = 0; i < keys.size(); i++) {
+                final int pos = i;
+                threadPool.execute(() -> {
+                    try {
+                        resultArray[pos] = edgeStoreQuery(new KeySliceQuery(keys.get(pos), query));
+                    } catch (Exception e) {
+                        failureCount.incrementAndGet();
+                        log.warn("Individual query in multi-transaction failed: ", e);
+                    } finally {
+                        doneSignal.countDown();
+                    }
+                });
+            }
             try {
-                List<Entry> result;
-                result = edgeStoreQuery(kq);
-                resultArray[resultPosition] = result;
-            } catch (Exception e) {
-                failureCount.incrementAndGet();
-                log.warn("Individual query in multi-transaction failed: ", e);
-            } finally {
-                doneSignal.countDown();
+                doneSignal.await();
+            } catch (InterruptedException e) {
+                throw new JanusGraphException("Interrupted while waiting for multi-query to complete", e);
+            }
+            if (failureCount.get() > 0) {
+                throw new JanusGraphException("Could not successfully complete multi-query. " + failureCount.get() + " individual queries failed.");
+            }
+            for (int i=0;i<keys.size();i++) {
+                assert resultArray[i]!=null;
+                results.put(keys.get(i),resultArray[i]);
             }
         }
+        return results;
     }
 
     public KeyIterator edgeStoreKeys(final SliceQuery sliceQuery) {
@@ -366,9 +398,10 @@ public class BackendTransaction implements LoggableTransaction {
         return executeRead(new Callable<KeyIterator>() {
             @Override
             public KeyIterator call() throws Exception {
-                return (storeFeatures.isKeyOrdered())
-                        ? edgeStore.getKeys(new KeyRangeQuery(EDGESTORE_MIN_KEY, EDGESTORE_MAX_KEY, sliceQuery), storeTx)
-                        : edgeStore.getKeys(sliceQuery, storeTx);
+                return (storeFeatures.isKeyOrdered() && !allowCustomVertexIdType)
+                    // if non-long-type vertex id is allowed, then min key and max key are unknown
+                    ? edgeStore.getKeys(new KeyRangeQuery(EDGESTORE_MIN_KEY, EDGESTORE_MAX_KEY, sliceQuery), storeTx)
+                    : edgeStore.getKeys(sliceQuery, storeTx);
             }
 
             @Override
@@ -380,7 +413,11 @@ public class BackendTransaction implements LoggableTransaction {
 
     public KeyIterator edgeStoreKeys(final KeyRangeQuery range) {
         Preconditions.checkArgument(storeFeatures.hasOrderedScan(), "The configured storage backend does not support ordered scans");
-
+        if (allowCustomVertexIdType) {
+            throw new IllegalArgumentException(ALLOW_CUSTOM_VERTEX_ID_TYPES.getName() + " must be disabled since current " +
+                "backend does not support unordered scan. Global graph operations require unordered scan when " +
+                ALLOW_CUSTOM_VERTEX_ID_TYPES.getName() + " is enabled");
+        }
         return executeRead(new Callable<KeyIterator>() {
             @Override
             public KeyIterator call() throws Exception {
@@ -410,6 +447,40 @@ public class BackendTransaction implements LoggableTransaction {
 
     }
 
+    /**
+     * Whether {@link #indexStoreMultiQuery(List, SliceQuery)} reads its keys in one call to the storage backend, which
+     * it does for a backend with multi-key queries. Otherwise it reads them one after the other, and a caller which can
+     * stop at a limit is better off reading them one by one itself.
+     */
+    public boolean hasMultiKeyIndexQueries() {
+        return storeFeatures.hasMultiQuery();
+    }
+
+    /**
+     * Reads the same slice of each of the keys from the index store.
+     */
+    public Map<StaticBuffer, EntryList> indexStoreMultiQuery(final List<StaticBuffer> keys, final SliceQuery query) {
+        if (!storeFeatures.hasMultiQuery()) {
+            final Map<StaticBuffer, EntryList> results = new HashMap<>(keys.size());
+            for (StaticBuffer key : keys) {
+                results.put(key, indexQuery(new KeySliceQuery(key, query)));
+            }
+            return results;
+        }
+        return executeRead(new Callable<Map<StaticBuffer, EntryList>>() {
+            @Override
+            public Map<StaticBuffer, EntryList> call() throws Exception {
+                return cacheEnabled ? indexStore.getSlice(keys, query, storeTx) :
+                                      indexStore.getSliceNoCache(keys, query, storeTx);
+            }
+
+            @Override
+            public String toString() {
+                return "MultiIndexStoreQuery";
+            }
+        });
+    }
+
 
     public Stream<String> indexQuery(final String index, final IndexQuery query) {
         final IndexTransaction indexTx = getIndexTransaction(index);
@@ -426,17 +497,17 @@ public class BackendTransaction implements LoggableTransaction {
         });
     }
 
-    public Long indexQueryCount(final String index, final IndexQuery query) {
+    public Number indexQueryAggregation(final String index, final IndexQuery query, final Aggregation aggregation) {
         final IndexTransaction indexTx = getIndexTransaction(index);
-        return executeRead(new Callable<Long>() {
+        return executeRead(new Callable<Number>() {
             @Override
-            public Long call() throws Exception {
-                return indexTx.queryCount(query);
+            public Number call() throws Exception {
+                return indexTx.queryAggregation(query, aggregation);
             }
 
             @Override
             public String toString() {
-                return "indexQueryCount";
+                return "indexQueryAggregation";
             }
         });
 

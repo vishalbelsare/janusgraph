@@ -16,6 +16,8 @@ package org.janusgraph.graphdb.database.management;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterables;
+import org.apache.commons.codec.DecoderException;
+import org.apache.commons.codec.binary.Hex;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.tinkerpop.gremlin.structure.Direction;
 import org.apache.tinkerpop.gremlin.structure.Edge;
@@ -35,6 +37,7 @@ import org.janusgraph.core.Multiplicity;
 import org.janusgraph.core.PropertyKey;
 import org.janusgraph.core.RelationType;
 import org.janusgraph.core.VertexLabel;
+import org.janusgraph.core.schema.CompositeIndexInfo;
 import org.janusgraph.core.schema.ConsistencyModifier;
 import org.janusgraph.core.schema.EdgeLabelMaker;
 import org.janusgraph.core.schema.Index;
@@ -51,15 +54,20 @@ import org.janusgraph.core.schema.SchemaAction;
 import org.janusgraph.core.schema.SchemaStatus;
 import org.janusgraph.core.schema.VertexLabelMaker;
 import org.janusgraph.diskstorage.BackendException;
+import org.janusgraph.diskstorage.StaticBuffer;
 import org.janusgraph.diskstorage.configuration.BasicConfiguration;
 import org.janusgraph.diskstorage.configuration.ConfigOption;
 import org.janusgraph.diskstorage.configuration.ModifiableConfiguration;
 import org.janusgraph.diskstorage.configuration.TransactionalConfiguration;
 import org.janusgraph.diskstorage.configuration.UserModifiableConfiguration;
 import org.janusgraph.diskstorage.configuration.backend.KCVSConfiguration;
+import org.janusgraph.diskstorage.keycolumnvalue.scan.EmptyScanJobFuture;
+import org.janusgraph.diskstorage.keycolumnvalue.scan.ScanJobFuture;
 import org.janusgraph.diskstorage.keycolumnvalue.scan.ScanMetrics;
 import org.janusgraph.diskstorage.keycolumnvalue.scan.StandardScanner;
 import org.janusgraph.diskstorage.log.Log;
+import org.janusgraph.diskstorage.util.StaticArrayBuffer;
+import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
 import org.janusgraph.graphdb.database.IndexSerializer;
 import org.janusgraph.graphdb.database.StandardJanusGraph;
 import org.janusgraph.graphdb.database.cache.SchemaCache;
@@ -70,8 +78,11 @@ import org.janusgraph.graphdb.internal.JanusGraphSchemaCategory;
 import org.janusgraph.graphdb.internal.Order;
 import org.janusgraph.graphdb.internal.Token;
 import org.janusgraph.graphdb.olap.VertexJobConverter;
+import org.janusgraph.graphdb.olap.job.GhostVertexRemover;
 import org.janusgraph.graphdb.olap.job.IndexRemoveJob;
 import org.janusgraph.graphdb.olap.job.IndexRepairJob;
+import org.janusgraph.graphdb.olap.job.MixedIndexStaleEntryRemover;
+import org.janusgraph.graphdb.olap.job.StaleIndexEntryRemoveJob;
 import org.janusgraph.graphdb.query.QueryUtil;
 import org.janusgraph.graphdb.transaction.StandardJanusGraphTx;
 import org.janusgraph.graphdb.types.CompositeIndexType;
@@ -95,6 +106,7 @@ import org.janusgraph.graphdb.types.vertices.EdgeLabelVertex;
 import org.janusgraph.graphdb.types.vertices.JanusGraphSchemaVertex;
 import org.janusgraph.graphdb.types.vertices.PropertyKeyVertex;
 import org.janusgraph.graphdb.types.vertices.RelationTypeVertex;
+import org.janusgraph.util.datastructures.IterablesUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -102,6 +114,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -111,12 +124,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
-import java.util.stream.StreamSupport;
 
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.REGISTRATION_NS;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.REGISTRATION_TIME;
@@ -262,7 +271,10 @@ public class ManagementSystem implements JanusGraphManagement {
     public synchronized void rollback() {
         ensureOpen();
         transactionalConfig.rollback();
-        transaction.rollback();
+        //A commit which failed, or the graph's close, has closed the transaction already
+        if (transaction.isOpen()) {
+            transaction.rollback();
+        }
         close();
     }
 
@@ -381,7 +393,7 @@ public class ManagementSystem implements JanusGraphManagement {
     }
 
     private static String composeRelationTypeIndexName(RelationType type, String name) {
-        return String.valueOf(type.longId()) + RELATION_INDEX_SEPARATOR + name;
+        return String.valueOf(type.id()) + RELATION_INDEX_SEPARATOR + name;
     }
 
     @Override
@@ -404,10 +416,12 @@ public class ManagementSystem implements JanusGraphManagement {
 
     @Override
     public Iterable<RelationTypeIndex> getRelationIndexes(final RelationType type) {
-        Preconditions.checkArgument(type != null && type instanceof InternalRelationType, "Invalid relation type provided: %s", type);
-        return StreamSupport.stream(((InternalRelationType) type).getRelationIndexes().spliterator(), false)
-            .filter(internalRelationType -> !type.equals(internalRelationType))
-            .map(internalType -> (RelationTypeIndex) new RelationTypeIndexWrapper(internalType))::iterator;
+        Preconditions.checkArgument(type instanceof InternalRelationType, "Invalid relation type provided: %s", type);
+        // We don't use here stream::iterator because such iterable can be traversed only once.
+        return Iterables.transform(
+            Iterables.filter(((InternalRelationType) type).getRelationIndexes(),
+                internalRelationType -> !type.equals(internalRelationType)),
+            internalType -> (RelationTypeIndex) new RelationTypeIndexWrapper(internalType));
     }
 
     /* --------------
@@ -433,8 +447,8 @@ public class ManagementSystem implements JanusGraphManagement {
 
     @Override
     public Iterable<JanusGraphIndex> getGraphIndexes(final Class<? extends Element> elementType) {
-        return StreamSupport.stream(
-            QueryUtil.getVertices(transaction, BaseKey.SchemaCategory, JanusGraphSchemaCategory.GRAPHINDEX).spliterator(), false)
+        return IterablesUtil.stream(
+            QueryUtil.getVertices(transaction, BaseKey.SchemaCategory, JanusGraphSchemaCategory.GRAPHINDEX))
             .map(janusGraphVertex -> {
                 assert janusGraphVertex instanceof JanusGraphSchemaVertex;
                 return ((JanusGraphSchemaVertex) janusGraphVertex).asIndexType();
@@ -543,6 +557,28 @@ public class ManagementSystem implements JanusGraphManagement {
         return this.printIndexes(true);
     }
 
+    @Override
+    public Object getVertexId(String hexString) throws DecoderException {
+        return this.graph.getIDManager().getKeyID(StaticArrayBuffer.of(Hex.decodeHex(hexString)));
+    }
+
+    @Override
+    public String getVertexKey(Object vertexId) {
+        return Hex.encodeHexString(graph.getIDManager().getKey(vertexId).asByteBuffer());
+    }
+
+    @Override
+    public String getIndexKey(String indexName, Map<String, Object> fieldValues) {
+        StaticBuffer staticBuffer = transaction.getCompositeIndexKey(indexName, fieldValues);
+        return Hex.encodeHexString(staticBuffer.asByteBuffer());
+    }
+
+    @Override
+    public CompositeIndexInfo getIndexInfo(String hexString) throws DecoderException {
+        StaticArrayBuffer indexKey = StaticArrayBuffer.of(Hex.decodeHex(hexString));
+        return transaction.getCompositeIndexInfo(indexKey);
+    }
+
     private String printIndexes(boolean calledDirectly) {
         StringBuilder sb = new StringBuilder();
         String pattern = "%-30s | %-11s | %-9s | %-14s | %-10s %10s |%n";
@@ -581,6 +617,39 @@ public class ManagementSystem implements JanusGraphManagement {
             sb.append(DASHBREAK);
         }
         return sb.toString();
+    }
+
+    public List<JanusGraphIndex> getGraphIndices(SchemaStatus withoutStatusFilter){
+        List<JanusGraphIndex> indices = filter(getGraphIndexes(Vertex.class), withoutStatusFilter);
+        indices.addAll(filter(getGraphIndexes(Edge.class), withoutStatusFilter));
+        return indices;
+    }
+
+    private List<JanusGraphIndex> filter(Iterable<JanusGraphIndex> graphIndices, SchemaStatus withoutStatusFilter){
+        List<JanusGraphIndex> indicesWithStatus = new ArrayList<>();
+        for(JanusGraphIndex graphIndex : graphIndices){
+            for(PropertyKey propertyKey : graphIndex.getFieldKeys()){
+                if(!withoutStatusFilter.equals(graphIndex.getIndexStatus(propertyKey))){
+                    indicesWithStatus.add(graphIndex);
+                    break;
+                }
+            }
+        }
+        return indicesWithStatus;
+    }
+
+    public List<RelationTypeIndex> getVertexCentricIndices(SchemaStatus withoutStatusFilter){
+        Iterable<RelationType> relationTypes = getRelationTypes(RelationType.class);
+        LinkedList<RelationTypeIndex> relationIndexes  = new LinkedList<>();
+        for (RelationType rt :relationTypes) {
+            Iterable<RelationTypeIndex> rti = getRelationIndexes(rt);
+            rti.forEach(relationTypeIndex -> {
+                if(!withoutStatusFilter.equals(relationTypeIndex.getIndexStatus())){
+                    relationIndexes.add(relationTypeIndex);
+                }
+            });
+        }
+        return relationIndexes;
     }
 
     private String iterateIndexes(String pattern, Iterable<JanusGraphIndex> indexes) {
@@ -636,7 +705,6 @@ public class ManagementSystem implements JanusGraphManagement {
         return new GraphIndexStatusWatcher(g, graphIndexName);
     }
 
-
     /**
      * Returns a {@link RelationIndexStatusWatcher} configured to watch the index specified by
      * {@code relationIndexName} and {@code relationIndexType} through graph {@code g}.
@@ -660,10 +728,26 @@ public class ManagementSystem implements JanusGraphManagement {
         Preconditions.checkArgument(getGraphIndex(indexName) == null, "An index with name '%s' has already been defined", indexName);
     }
 
+    //An index backend derives its own index name from the JanusGraph index name case-insensitively (Elasticsearch
+    //lowercases it, Lucene names a directory after it), so two mixed indexes on the same backing index whose names
+    //differ only in case would share one backend index, and with it each other's documents and mappings.
+    private void checkMixedIndexNameDistinctIgnoringCase(String indexName, String backingIndex) {
+        for (JanusGraphIndex index : getGraphIndexes(Element.class)) {
+            if (index.isMixedIndex() && backingIndex.equals(index.getBackingIndex())
+                && indexName.equalsIgnoreCase(index.name())) {
+                throw new IllegalArgumentException(String.format("Cannot create mixed index '%s' on backing index "
+                    + "'%s': mixed index '%s' is already defined there, and mixed index names on one backing index must "
+                    + "differ in more than case, because the backing index derives its own index name from them "
+                    + "case-insensitively.", indexName, backingIndex, index.name()));
+            }
+        }
+    }
+
     private JanusGraphIndex createMixedIndex(String indexName, ElementCategory elementCategory,
                                              JanusGraphSchemaType constraint, String backingIndex) {
         Preconditions.checkArgument(graph.getIndexSerializer().containsIndex(backingIndex), "Unknown external index backend: %s", backingIndex);
         checkIndexName(indexName);
+        checkMixedIndexNameDistinctIgnoringCase(indexName, backingIndex);
 
         TypeDefinitionMap def = new TypeDefinitionMap();
         def.setValue(TypeDefinitionCategory.INTERNAL_INDEX, false);
@@ -723,7 +807,32 @@ public class ManagementSystem implements JanusGraphManagement {
         if (!key.isNew()) updateIndex(index, SchemaAction.REGISTER_INDEX);
     }
 
-    private JanusGraphIndex createCompositeIndex(String indexName, ElementCategory elementCategory, boolean unique, JanusGraphSchemaType constraint, PropertyKey... keys) {
+    @Override
+    public void addInlinePropertyKey(final JanusGraphIndex index, final PropertyKey key) {
+        Preconditions.checkArgument(index != null && key != null && index instanceof JanusGraphIndexWrapper
+            && !(key instanceof BaseKey), "Need to provide valid index and key");
+        IndexType indexType = ((JanusGraphIndexWrapper) index).getBaseIndex();
+        Preconditions.checkArgument(indexType instanceof CompositeIndexType, "Can only add keys to a composite index, not %s", index.name());
+        Preconditions.checkArgument(indexType instanceof IndexTypeWrapper && key instanceof JanusGraphSchemaVertex
+            && ((IndexTypeWrapper) indexType).getSchemaBase() instanceof JanusGraphSchemaVertex);
+
+        JanusGraphSchemaVertex indexVertex = (JanusGraphSchemaVertex) ((IndexTypeWrapper) indexType).getSchemaBase();
+
+        for (IndexField field : indexType.getFieldKeys())
+            Preconditions.checkArgument(!field.getFieldKey().equals(key), "Key [%s] has already been added to index %s", key.name(), index.name());
+
+        addSchemaEdge(indexVertex, key, TypeDefinitionCategory.INDEX_INLINE_KEY, null);
+        updateSchemaVertex(indexVertex);
+        indexType.resetCache();
+
+        if (!indexVertex.isNew()) updatedTypes.add(indexVertex);
+    }
+
+    private JanusGraphIndex createCompositeIndex(String indexName, ElementCategory elementCategory,
+                                                 boolean unique,
+                                                 JanusGraphSchemaType constraint,
+                                                 Set<PropertyKey> inlineProps,
+                                                 PropertyKey... keys) {
         checkIndexName(indexName);
         Preconditions.checkArgument(keys != null && keys.length > 0, "Need to provide keys to index [%s]", indexName);
         Preconditions.checkArgument(!unique || elementCategory == ElementCategory.VERTEX, "Unique indexes can only be created on vertices [%s]", indexName);
@@ -755,6 +864,10 @@ public class ManagementSystem implements JanusGraphManagement {
             addSchemaEdge(indexVertex, keys[i], TypeDefinitionCategory.INDEX_FIELD, paras);
         }
 
+        for(PropertyKey propertyKey: inlineProps) {
+            addSchemaEdge(indexVertex, propertyKey, TypeDefinitionCategory.INDEX_INLINE_KEY, null);
+        }
+
         Preconditions.checkArgument(constraint == null || (elementCategory.isValidConstraint(constraint) && constraint instanceof JanusGraphSchemaVertex));
         if (constraint != null) {
             addSchemaEdge(indexVertex, (JanusGraphSchemaVertex) constraint, TypeDefinitionCategory.INDEX_SCHEMA_CONSTRAINT, null);
@@ -778,6 +891,8 @@ public class ManagementSystem implements JanusGraphManagement {
         private JanusGraphSchemaType constraint = null;
         private final Map<PropertyKey, Parameter[]> keys = new HashMap<>();
 
+        private final Set<PropertyKey> inlinePropKeys = new HashSet<>();
+
         private IndexBuilder(String indexName, ElementCategory elementCategory) {
             this.indexName = indexName;
             this.elementCategory = elementCategory;
@@ -794,6 +909,13 @@ public class ManagementSystem implements JanusGraphManagement {
         public JanusGraphManagement.IndexBuilder addKey(PropertyKey key, Parameter... parameters) {
             Preconditions.checkArgument(key != null && (key instanceof PropertyKeyVertex), "Key must be a user defined key: %s", key);
             keys.put(key, parameters);
+            return this;
+        }
+
+        @Override
+        public JanusGraphManagement.IndexBuilder addInlinePropertyKey(PropertyKey key) {
+            Preconditions.checkArgument(key != null && (key instanceof PropertyKeyVertex), "Key must be a user defined key: %s", key);
+            inlinePropKeys.add(key);
             return this;
         }
 
@@ -820,13 +942,14 @@ public class ManagementSystem implements JanusGraphManagement {
                 Preconditions.checkArgument(entry.getValue() == null, "Cannot specify parameters for composite index: %s", entry.getKey());
                 keyArr[pos++] = entry.getKey();
             }
-            return createCompositeIndex(indexName, elementCategory, unique, constraint, keyArr);
+            return createCompositeIndex(indexName, elementCategory, unique, constraint, inlinePropKeys, keyArr);
         }
 
         @Override
         public JanusGraphIndex buildMixedIndex(String backingIndex) {
             Preconditions.checkArgument(StringUtils.isNotBlank(backingIndex), "Need to specify backing index name");
             Preconditions.checkArgument(!unique, "An external index cannot be unique");
+            Preconditions.checkArgument(inlinePropKeys.isEmpty(), "An external index cannot contain inline properties");
 
             JanusGraphIndex index = createMixedIndex(indexName, elementCategory, constraint, backingIndex);
             for (Map.Entry<PropertyKey, Parameter[]> entry : keys.entrySet()) {
@@ -839,9 +962,22 @@ public class ManagementSystem implements JanusGraphManagement {
     /* --------------
     Schema Update
      --------------- */
+    @Override
+    public ScanJobFuture updateIndex(Index index, SchemaAction updateAction) {
+        return updateIndex(index, updateAction, null, Runtime.getRuntime().availableProcessors());
+    }
 
     @Override
-    public IndexJobFuture updateIndex(Index index, SchemaAction updateAction) {
+    public ScanJobFuture updateIndex(Index index, SchemaAction updateAction, int numOfThreads) {
+        return updateIndex(index, updateAction, null, numOfThreads);
+    }
+
+    @Override
+    public ScanJobFuture updateIndex(Index index, SchemaAction updateAction, List<Object> vertexOnly) {
+        return updateIndex(index, updateAction, vertexOnly, Runtime.getRuntime().availableProcessors());
+    }
+
+    private ScanJobFuture updateIndex(Index index, SchemaAction updateAction, List<Object> vertexOnly, int numOfThreads) {
         Preconditions.checkArgument(index != null, "Need to provide an index");
         Preconditions.checkArgument(updateAction != null, "Need to provide update action");
 
@@ -869,8 +1005,15 @@ public class ManagementSystem implements JanusGraphManagement {
                     if (applicableStatus.contains(field.getStatus()))
                         keySubset.add((PropertyKeyVertex) field.getFieldKey());
                 }
-                if (keySubset.isEmpty())
-                    return null;
+                //A mixed index keeps a status per field instead of one status on the index, so this is the
+                //equivalent of the isApplicableStatus check the composite branch makes above. Without it an action
+                //which matches no field reaches setStatusVertex, whose precondition is guaranteed to fail for a
+                //mixed index and carries no message at all, so the caller is left with a bare
+                //IllegalArgumentException saying nothing about the real problem
+                Preconditions.checkArgument(!keySubset.isEmpty(),
+                    "Update action [%s] cannot be invoked for index [%s] because none of its fields has one of the" +
+                        " applicable statuses %s. The current status of each field is %s", updateAction, index.name(),
+                    orderedStatuses(applicableStatus), fieldStatuses(mixedIndexType));
 
                 dependentTypes.addAll(keySubset);
             }
@@ -878,50 +1021,105 @@ public class ManagementSystem implements JanusGraphManagement {
 
         IndexIdentifier indexId = new IndexIdentifier(index);
         StandardScanner.Builder builder;
-        IndexJobFuture future;
+        ScanJobFuture future;
         switch (updateAction) {
             case REGISTER_INDEX:
                 setStatus(schemaVertex, SchemaStatus.INSTALLED, keySubset);
                 updatedTypes.add(schemaVertex);
                 updatedTypes.addAll(dependentTypes);
                 setUpdateTrigger(new UpdateStatusTrigger(graph, schemaVertex, SchemaStatus.REGISTERED, keySubset));
-                future = new EmptyIndexJobFuture();
+                future = new EmptyScanJobFuture();
                 break;
             case REINDEX:
                 builder = graph.getBackend().buildEdgeScanJob();
-                builder.setFinishJob(indexId.getIndexJobFinisher(graph, SchemaAction.ENABLE_INDEX));
+                configureMixedIndexReindexBatching(index, builder);
+                if (isWriteOnlyEnabled(index, schemaVertex)) {
+                    //An explicitly write-only index keeps its status after reindexing instead of being
+                    //automatically enabled for queries
+                    builder.setFinishJob(indexId.getIndexJobFinisher());
+                } else {
+                    builder.setFinishJob(indexId.getIndexJobFinisher(graph, SchemaAction.ENABLE_INDEX));
+                }
                 builder.setJobId(indexId);
-                builder.setJob(VertexJobConverter.convert(graph, new IndexRepairJob(indexId.indexName, indexId.relationTypeName)));
+                builder.setNumProcessingThreads(numOfThreads);
+                builder.setJob(VertexJobConverter.convert(graph, new IndexRepairJob(indexId.indexName, indexId.relationTypeName), vertexOnly));
                 try {
                     future = builder.execute();
                 } catch (BackendException e) {
                     throw new JanusGraphException(e);
                 }
                 break;
+            case REMOVE_STALE_ENTRIES:
+                if (index instanceof RelationTypeIndex) {
+                    throw new UnsupportedOperationException("Stale index entry removal is not supported for" +
+                        " vertex-centric indexes: " + index.name());
+                }
+                if (((JanusGraphIndex) index).isMixedIndex()) {
+                    //Stale document deletions are flushed through the same bulk restore() calls as reindex
+                    //document restores, so the reindex batch size option governs both
+                    future = MixedIndexStaleEntryRemover.submit(graph, indexId.indexName,
+                        graph.getConfiguration().getConfiguration().get(GraphDatabaseConfiguration.MIXED_INDEX_REINDEX_BATCH_SIZE));
+                } else {
+                    builder = graph.getBackend().buildGraphIndexScanJob();
+                    builder.setFinishJob(indexId.getIndexJobFinisher());
+                    builder.setJobId(indexId);
+                    builder.setNumProcessingThreads(numOfThreads);
+                    builder.setJob(new StaleIndexEntryRemoveJob(graph, indexId.indexName, indexId.relationTypeName));
+                    try {
+                        future = builder.execute();
+                    } catch (BackendException e) {
+                        throw new JanusGraphException(e);
+                    }
+                }
+                break;
+            case ENABLE_WRITE_ONLY:
+                setStatus(schemaVertex, SchemaStatus.WRITE_ONLY_ENABLED, keySubset);
+                updatedTypes.add(schemaVertex);
+                if (!keySubset.isEmpty()) updatedTypes.addAll(dependentTypes);
+                future = new EmptyScanJobFuture();
+                break;
             case ENABLE_INDEX:
                 setStatus(schemaVertex, SchemaStatus.ENABLED, keySubset);
                 updatedTypes.add(schemaVertex);
                 if (!keySubset.isEmpty()) updatedTypes.addAll(dependentTypes);
-                future = new EmptyIndexJobFuture();
+                future = new EmptyScanJobFuture();
                 break;
             case DISABLE_INDEX:
-                setStatus(schemaVertex, SchemaStatus.INSTALLED, keySubset);
+                setStatus(schemaVertex, SchemaStatus.DISABLED, keySubset);
                 updatedTypes.add(schemaVertex);
                 if (!keySubset.isEmpty()) updatedTypes.addAll(dependentTypes);
-                setUpdateTrigger(new UpdateStatusTrigger(graph, schemaVertex, SchemaStatus.DISABLED, keySubset));
-                future = new EmptyIndexJobFuture();
+                future = new EmptyScanJobFuture();
                 break;
-            case REMOVE_INDEX:
-                if (index instanceof RelationTypeIndex) {
+            case MARK_DISCARDED:
+                setStatus(schemaVertex, SchemaStatus.DISCARDED, keySubset);
+                updatedTypes.add(schemaVertex);
+                if (!keySubset.isEmpty()) updatedTypes.addAll(dependentTypes);
+                future = new EmptyScanJobFuture();
+                break;
+            case DISCARD_INDEX:
+                if (index instanceof JanusGraphIndex && ((JanusGraphIndex) index).isMixedIndex()) {
+                    try {
+                        JanusGraphIndexWrapper indexWrapper = (JanusGraphIndexWrapper) index;
+                        MixedIndexType mixedIndex = (MixedIndexType) indexWrapper.getBaseIndex();
+                        IndexSerializer.clearStore(mixedIndex, transaction.getTxHandle());
+                        setStatus(schemaVertex, SchemaStatus.DISCARDED, keySubset);
+                        updatedTypes.add(schemaVertex);
+                        if (!keySubset.isEmpty()) updatedTypes.addAll(dependentTypes);
+                    } catch (BackendException ex) {
+                        throw new UnsupportedOperationException("Index removal is not supported for this Backend. Index must be removed in the indexing system directly.", ex);
+                    }
+                    future = new EmptyScanJobFuture();
+                    break;
+                } else if (index instanceof JanusGraphIndex && ((JanusGraphIndex) index).isCompositeIndex()) {
+                    builder = graph.getBackend().buildGraphIndexScanJob();
+                } else if (index instanceof RelationTypeIndex) {
                     builder = graph.getBackend().buildEdgeScanJob();
                 } else {
-                    JanusGraphIndex graphIndex = (JanusGraphIndex) index;
-                    if (graphIndex.isMixedIndex())
-                        throw new UnsupportedOperationException("External mixed indexes must be removed in the indexing system directly.");
-                    builder = graph.getBackend().buildGraphIndexScanJob();
+                    throw new IllegalArgumentException("Unsupported Index Type");
                 }
-                builder.setFinishJob(indexId.getIndexJobFinisher());
+                builder.setFinishJob(indexId.getIndexJobFinisher(graph, SchemaAction.MARK_DISCARDED));
                 builder.setJobId(indexId);
+                builder.setNumProcessingThreads(numOfThreads);
                 builder.setJob(new IndexRemoveJob(graph, indexId.indexName, indexId.relationTypeName));
                 try {
                     future = builder.execute();
@@ -929,10 +1127,42 @@ public class ManagementSystem implements JanusGraphManagement {
                     throw new JanusGraphException(e);
                 }
                 break;
+            case DROP_INDEX:
+                updatedTypes.add(schemaVertex);
+                updatedTypes.addAll(dependentTypes);
+                schemaVertex.remove();
+                future = new EmptyScanJobFuture();
+                break;
             default:
                 throw new UnsupportedOperationException("Update action not supported: " + updateAction);
         }
         return future;
+    }
+
+    private void configureMixedIndexReindexBatching(Index index, StandardScanner.Builder builder) {
+        if (index instanceof JanusGraphIndex && ((JanusGraphIndex) index).isMixedIndex()
+                && graph.getConfiguration().getConfiguration().get(GraphDatabaseConfiguration.MIXED_INDEX_REINDEX_BATCH_ENABLED)) {
+            builder.setWorkBlockSize(graph.getConfiguration().getConfiguration().get(GraphDatabaseConfiguration.MIXED_INDEX_REINDEX_BATCH_SIZE));
+        }
+    }
+
+    /**
+     * Determines whether the given index is explicitly enabled for writes only. A mixed index counts as
+     * write-only if any of its field keys has the {@link SchemaStatus#WRITE_ONLY_ENABLED} status because
+     * such a status can only be reached through an explicit {@link SchemaAction#ENABLE_WRITE_ONLY} request.
+     */
+    private static boolean isWriteOnlyEnabled(Index index, JanusGraphSchemaVertex schemaVertex) {
+        if (index instanceof RelationTypeIndex) {
+            return schemaVertex.getStatus() == SchemaStatus.WRITE_ONLY_ENABLED;
+        }
+        IndexType indexType = schemaVertex.asIndexType();
+        if (indexType.isCompositeIndex()) {
+            return schemaVertex.getStatus() == SchemaStatus.WRITE_ONLY_ENABLED;
+        }
+        for (ParameterIndexField field : ((MixedIndexType) indexType).getFieldKeys()) {
+            if (field.getStatus() == SchemaStatus.WRITE_ONLY_ENABLED) return true;
+        }
+        return false;
     }
 
     /**
@@ -974,39 +1204,6 @@ public class ManagementSystem implements JanusGraphManagement {
         }
     }
 
-    private static class EmptyIndexJobFuture implements IndexJobFuture {
-
-        @Override
-        public ScanMetrics getIntermediateResult() {
-            return null;
-        }
-
-        @Override
-        public boolean cancel(boolean mayInterruptIfRunning) {
-            return false;
-        }
-
-        @Override
-        public boolean isCancelled() {
-            return false;
-        }
-
-        @Override
-        public boolean isDone() {
-            return true;
-        }
-
-        @Override
-        public ScanMetrics get() throws InterruptedException, ExecutionException {
-            return null;
-        }
-
-        @Override
-        public ScanMetrics get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
-            return null;
-        }
-    }
-
     private static class UpdateStatusTrigger implements Callable<Boolean> {
 
         private static final Logger log =
@@ -1021,7 +1218,7 @@ public class ManagementSystem implements JanusGraphManagement {
             this.graph = graph;
             this.schemaVertexId = vertex.longId();
             this.newStatus = newStatus;
-            this.propertyKeys = StreamSupport.stream(keys.spliterator(), false)
+            this.propertyKeys = IterablesUtil.stream(keys)
                 .map(PropertyKey::longId)
                 .collect(Collectors.toSet());
         }
@@ -1033,9 +1230,32 @@ public class ManagementSystem implements JanusGraphManagement {
                 JanusGraphVertex vertex = management.transaction.getVertex(schemaVertexId);
                 Preconditions.checkArgument(vertex != null && vertex instanceof JanusGraphSchemaVertex);
                 JanusGraphSchemaVertex schemaVertex = (JanusGraphSchemaVertex) vertex;
+                //Only complete the pending status handshake for schema elements which are still INSTALLED:
+                //a concurrent status change (e.g. DISABLE_INDEX) supersedes the pending status update
                 Set<PropertyKeyVertex> keys = new HashSet<>(propertyKeys.size());
-                for (Long keyId : propertyKeys) {
-                    keys.add((PropertyKeyVertex) management.transaction.getVertex(keyId));
+                if (propertyKeys.isEmpty()) {
+                    if (schemaVertex.getStatus() != SchemaStatus.INSTALLED) {
+                        log.info("Skipping status update to {} on schema element (ID#{}) because its status" +
+                                " is no longer INSTALLED", newStatus, schemaVertexId);
+                        management.rollback();
+                        return true;
+                    }
+                } else {
+                    MixedIndexType indexType = (MixedIndexType) schemaVertex.asIndexType();
+                    for (Long keyId : propertyKeys) {
+                        PropertyKeyVertex key = (PropertyKeyVertex) management.transaction.getVertex(keyId);
+                        ParameterIndexField field = indexType.getField(key);
+                        if (field != null && field.getStatus() == SchemaStatus.INSTALLED) {
+                            keys.add(key);
+                        } else {
+                            log.info("Skipping status update to {} for property key (ID#{}) on schema element (ID#{})" +
+                                    " because its status is no longer INSTALLED", newStatus, keyId, schemaVertexId);
+                        }
+                    }
+                    if (keys.isEmpty()) {
+                        management.rollback();
+                        return true;
+                    }
                 }
                 management.setStatus(schemaVertex, newStatus, keys);
                 management.updatedTypes.addAll(keys);
@@ -1084,6 +1304,20 @@ public class ManagementSystem implements JanusGraphManagement {
         updatedTypeTriggers.add(trigger);
     }
 
+    //Renders statuses in the natural order of the enum, which the JLS defines as the order they are declared in, so
+    //that a user facing message does not inherit the iteration order of whatever collection happens to hold them -
+    //the applicable statuses of an action reach this as an unordered Set
+    private static String orderedStatuses(Collection<SchemaStatus> statuses) {
+        return statuses.stream().sorted().map(SchemaStatus::name).collect(Collectors.joining(", ", "[", "]"));
+    }
+
+    //Reports the status of every field of a mixed index, so that a rejected update action can say why it was rejected
+    private static String fieldStatuses(MixedIndexType index) {
+        return Arrays.stream(index.getFieldKeys())
+            .map(field -> field.getFieldKey().name() + "=" + field.getStatus().name())
+            .collect(Collectors.joining(", ", "[", "]"));
+    }
+
     private void setStatus(JanusGraphSchemaVertex vertex, SchemaStatus status, Set<PropertyKeyVertex> keys) {
         if (keys.isEmpty()) setStatusVertex(vertex, status);
         else setStatusEdges(vertex, status, keys);
@@ -1127,7 +1361,7 @@ public class ManagementSystem implements JanusGraphManagement {
     }
 
     @Override
-    public IndexJobFuture getIndexJobStatus(Index index) {
+    public ScanJobFuture getIndexJobStatus(Index index) {
         IndexIdentifier indexId = new IndexIdentifier(index);
         return graph.getBackend().getScanJobStatus(indexId);
     }
@@ -1378,6 +1612,25 @@ public class ManagementSystem implements JanusGraphManagement {
         setTypeModifier(type, ModifierType.TTL, ttlSeconds);
     }
 
+    @Override
+    public ScanJobFuture removeGhostVertices(int numOfThreads) {
+        StandardScanner.Builder builder = graph.getBackend().buildEdgeScanJob();
+        builder.setJob(new GhostVertexRemover(graph));
+        builder.setNumProcessingThreads(numOfThreads);
+        ScanJobFuture future;
+        try {
+            future = builder.execute();
+        } catch (BackendException e) {
+            throw new JanusGraphException(e);
+        }
+        return future;
+    }
+
+    @Override
+    public ScanJobFuture removeGhostVertices() {
+        return removeGhostVertices(Runtime.getRuntime().availableProcessors());
+    }
+
     private void setTypeModifier(final JanusGraphSchemaElement element,
                                  final ModifierType modifierType,
                                  final Object value) {
@@ -1551,5 +1804,11 @@ public class ManagementSystem implements JanusGraphManagement {
     public synchronized JanusGraphConfiguration set(String path, Object value) {
         ensureOpen();
         return userConfig.set(path, value);
+    }
+
+    @Override
+    public JanusGraphConfiguration remove(String path) {
+        ensureOpen();
+        return userConfig.remove(path);
     }
 }

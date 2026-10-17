@@ -14,6 +14,7 @@
 
 package org.janusgraph.diskstorage.lucene;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.Sets;
@@ -34,6 +35,7 @@ import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexNotFoundException;
 import org.apache.lucene.index.IndexReader;
@@ -47,6 +49,7 @@ import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.BooleanQuery.Builder;
 import org.apache.lucene.search.DocValuesFieldExistsQuery;
+import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.FuzzyQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
@@ -60,6 +63,7 @@ import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TermRangeQuery;
 import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.search.TopFieldDocs;
 import org.apache.lucene.spatial.SpatialStrategy;
 import org.apache.lucene.spatial.prefix.PrefixTreeStrategy;
 import org.apache.lucene.spatial.prefix.RecursivePrefixTreeStrategy;
@@ -70,6 +74,7 @@ import org.apache.lucene.spatial.query.SpatialOperation;
 import org.apache.lucene.spatial.vector.PointVectorStrategy;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.LockObtainFailedException;
 import org.apache.lucene.util.BytesRef;
 import org.janusgraph.core.Cardinality;
 import org.janusgraph.core.attribute.Cmp;
@@ -95,11 +100,13 @@ import org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration;
 import org.janusgraph.graphdb.database.serialize.AttributeUtils;
 import org.janusgraph.graphdb.internal.Order;
 import org.janusgraph.graphdb.query.JanusGraphPredicate;
+import org.janusgraph.graphdb.query.QueryUtil;
 import org.janusgraph.graphdb.query.condition.And;
 import org.janusgraph.graphdb.query.condition.Condition;
 import org.janusgraph.graphdb.query.condition.Not;
 import org.janusgraph.graphdb.query.condition.Or;
 import org.janusgraph.graphdb.query.condition.PredicateCondition;
+import org.janusgraph.graphdb.tinkerpop.optimize.step.Aggregation;
 import org.janusgraph.graphdb.types.ParameterType;
 import org.janusgraph.util.system.IOUtils;
 import org.locationtech.spatial4j.context.SpatialContext;
@@ -119,6 +126,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -128,8 +136,11 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+
+import static org.janusgraph.util.StringUtils.lowerCaseCodePoints;
 
 /**
  * @author Matthias Broecheler (me@matthiasb.com)
@@ -176,9 +187,19 @@ public class LuceneIndex implements IndexProvider {
     private final String basePath;
 
     /**
-     * lazy cache for the delegating analyzers used for writing or querrying for each store
+     * The delegating analyzer of each store. It belongs to the store's index writer, so it outlives the transactions,
+     * and serves the store's queries too; it resolves the key of each field through {@link #scopedKeyInformation}.
      */
-    private final Map<String, LuceneCustomAnalyzer> delegatingAnalyzers = new HashMap<>();
+    private final Map<String, LuceneCustomAnalyzer> delegatingAnalyzers = new ConcurrentHashMap<>();
+
+    /**
+     * The key information of the transaction on whose behalf the current thread writes to or queries a store, set
+     * for the length of the call: a store's analyzer has to resolve fields through the key information of the
+     * transaction which analyzes, not of the one which first used the store, which may have closed since, after
+     * which its key information can't read the schema, and knows nothing of the keys added to the index after it
+     * last read them.
+     */
+    private final ThreadLocal<KeyInformation.IndexRetriever> scopedKeyInformation = new ThreadLocal<>();
 
     public LuceneIndex(Configuration config) {
         final String dir = config.get(GraphDatabaseConfiguration.INDEX_DIRECTORY);
@@ -205,18 +226,24 @@ public class LuceneIndex implements IndexProvider {
         }
     }
 
-    private IndexWriter getWriter(String store, KeyInformation.IndexRetriever informations) throws BackendException {
+    //A writer which a tragic event closed (Lucene's term for a failure which closes the writer, such as a background
+    //merge failing on a full disk) is replaced rather than failing every later write of its store: closing released
+    //its lock of the store's directory
+    private IndexWriter getWriter(String store) throws BackendException {
         Preconditions.checkArgument(writerLock.isHeldByCurrentThread());
         IndexWriter writer = writers.get(store);
-        if (writer == null) {
-            final LuceneCustomAnalyzer analyzer = delegatingAnalyzerFor(store, informations);
+        if (writer == null || !writer.isOpen()) {
+            final LuceneCustomAnalyzer analyzer = delegatingAnalyzerFor(store);
             final IndexWriterConfig iwc = new IndexWriterConfig(analyzer);
             iwc.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
             try {
                 writer = new IndexWriter(getStoreDirectory(store), iwc);
                 writers.put(store, writer);
-            } catch (final IOException e) {
+            } catch (final LockObtainFailedException | CorruptIndexException e) {
                 throw new PermanentBackendException("Could not create writer", e);
+            } catch (final IOException e) {
+                //Such as too many open files, which may pass: BackendOperation reattempts the write
+                throw new TemporaryBackendException("Could not create writer", e);
             }
         }
         return writer;
@@ -269,24 +296,47 @@ public class LuceneIndex implements IndexProvider {
     @Override
     public void mutate(Map<String, Map<String, IndexMutation>> mutations, KeyInformation.IndexRetriever information, BaseTransaction tx) throws BackendException {
         final Transaction ltx = (Transaction) tx;
+        final Set<String> committedStores = new HashSet<>();
         writerLock.lock();
-        try {
+        try (KeyInformationScope ignored = analyzeWith(information)) {
             for (final Map.Entry<String, Map<String, IndexMutation>> stores : mutations.entrySet()) {
                 mutateStores(stores, information);
+                committedStores.add(stores.getKey());
             }
             ltx.postCommit();
         } catch (final IOException e) {
+            retainUncommittedStores(mutations, committedStores);
             throw new TemporaryBackendException("Could not update Lucene index", e);
+        } catch (final TemporaryBackendException e) {
+            //A store's writer could not be opened, which may pass
+            retainUncommittedStores(mutations, committedStores);
+            throw e;
         } finally {
             writerLock.unlock();
         }
     }
 
-    private void mutateStores(Map.Entry<String, Map<String, IndexMutation>> stores, KeyInformation.IndexRetriever information) throws IOException, BackendException {
-        IndexReader reader = null;
+    //BackendOperation reattempts a temporary failure by calling mutate again with the same map. Each store commits its
+    //changes on its own, and the store which failed rolls its changes back, so take out of the map the stores which
+    //committed before the failure. Applied again, they would add and remove their values once more: a value of a LIST
+    //key twice, or the words of a SET key's value, also those which a case variant of it shares
+    @VisibleForTesting
+    static void retainUncommittedStores(Map<String, Map<String, IndexMutation>> mutations,
+                                        Set<String> committedStores) {
         try {
-            final String storeName = stores.getKey();
-            final IndexWriter writer = getWriter(storeName, information);
+            mutations.keySet().removeAll(committedStores);
+        } catch (final UnsupportedOperationException e) {
+            //A map which the caller does not allow to change is applied whole again
+            log.debug("Could not take the committed stores out of the Lucene mutation before its reattempt", e);
+        }
+    }
+
+    private void mutateStores(Map.Entry<String, Map<String, IndexMutation>> stores, KeyInformation.IndexRetriever information) throws IOException, BackendException {
+        final String storeName = stores.getKey();
+        final IndexWriter writer = getWriter(storeName);
+        IndexReader reader = null;
+        boolean committed = false;
+        try {
             reader = DirectoryReader.open(writer, true, true);
             final IndexSearcher searcher = new IndexSearcher(reader);
             final KeyInformation.StoreRetriever storeRetriever = information.get(storeName);
@@ -315,26 +365,46 @@ public class LuceneIndex implements IndexProvider {
                     removeField(doc, del, ki);
                 }
 
-                addToDocument(doc, mutation.getAdditions(), storeRetriever, false);
+                addToDocument(doc, mutation.getAdditions(), storeRetriever, false, mutation::isReAddition);
 
                 //write the old document to the index with the modifications
                 writer.updateDocument(new Term(DOCID, documentId), doc);
             }
             writer.commit();
+            committed = true;
         } finally {
             IOUtils.closeQuietly(reader);
+            if (!committed) {
+                rollback(storeName, writer);
+            }
+        }
+    }
+
+    //Discards what a store's writer holds since its last commit, which is the writes of an attempt which failed
+    //before it committed: every write of a store commits while it holds writerLock. Left in the writer, they would be
+    //read by the reader of a reattempt, which would then apply them again, and made to last by the next commit of
+    //the store or by close(). The next write of the store opens a new writer from the last commit
+    private void rollback(String store, IndexWriter writer) {
+        writers.remove(store);
+        try {
+            writer.rollback();
+        } catch (final IOException | RuntimeException e) {
+            //The failure which led here is the one to report; a writer closes and releases its lock in a rollback
+            //which fails as well
+            log.warn("Could not roll back the uncommitted writes to Lucene store {}", store, e);
         }
     }
 
     @Override
     public void restore(Map<String, Map<String, List<IndexEntry>>> documents, KeyInformation.IndexRetriever information, BaseTransaction tx) throws BackendException {
         writerLock.lock();
-        try {
+        try (KeyInformationScope ignored = analyzeWith(information)) {
             for (final Map.Entry<String, Map<String, List<IndexEntry>>> stores : documents.entrySet()) {
+                final String store = stores.getKey();
+                final IndexWriter writer = getWriter(store);
                 IndexReader reader = null;
+                boolean committed = false;
                 try {
-                    final String store = stores.getKey();
-                    final IndexWriter writer = getWriter(store, information);
                     final KeyInformation.StoreRetriever storeRetriever = information.get(store);
                     reader = DirectoryReader.open(writer, true, true);
                     final IndexSearcher searcher = new IndexSearcher(reader);
@@ -353,14 +423,18 @@ public class LuceneIndex implements IndexProvider {
 
                         final Document doc = retrieveOrCreate(docID, searcher);
                         Iterators.removeIf(doc.iterator(), field -> !field.name().equals(DOCID));
-                        addToDocument(doc, content, storeRetriever, true);
+                        addToDocument(doc, content, storeRetriever, true, addition -> false);
 
                         //write the old document to the index with the modifications
                         writer.updateDocument(new Term(DOCID, docID), doc);
                     }
                     writer.commit();
+                    committed = true;
                 } finally {
                     IOUtils.closeQuietly(reader);
+                    if (!committed) {
+                        rollback(store, writer);
+                    }
                 }
             }
             tx.commit();
@@ -395,7 +469,8 @@ public class LuceneIndex implements IndexProvider {
         return doc;
     }
 
-    private void addToDocument(Document doc, List<IndexEntry> content, final KeyInformation.StoreRetriever information, boolean isNew) {
+    private void addToDocument(Document doc, List<IndexEntry> content, final KeyInformation.StoreRetriever information,
+                               boolean isNew, Predicate<IndexEntry> isReAddition) {
         Preconditions.checkNotNull(doc);
 
         for (final IndexEntry e : content) {
@@ -404,8 +479,10 @@ public class LuceneIndex implements IndexProvider {
                 log.trace("Adding field [{}] on document [{}]", e.field, doc.get(DOCID));
             }
             KeyInformation ki = information.get(e.field);
-            if (!(isNew || ki.getCardinality() == Cardinality.LIST)) {
+            if (!isNew && ki.getCardinality() == Cardinality.SINGLE) {
                 removeField(doc, e, ki);
+            } else if (!isNew && ki.getCardinality() == Cardinality.SET) {
+                removeHeldValue(doc, e, ki, isReAddition.test(e));
             }
             doc.add(buildStoreField(e.field, e.value, Mapping.getMapping(ki)));
             getDualFieldName(e.field, ki)
@@ -414,38 +491,63 @@ public class LuceneIndex implements IndexProvider {
         buildIndexFields(doc, information).forEach(doc::add);
     }
 
+    //A TEXTSTRING key's dual field stores its strings as a STRING key does, not lower-cased as its own field does, so a
+    //value is compared with each field's values as that field stores it
     private void removeField(Document doc, IndexEntry e, KeyInformation ki) {
-        removeFieldIfNeeded(doc, e.field, e.value, ki);
+        removeFieldIfNeeded(doc, e.field, e.value, ki, Mapping.getMapping(ki));
         getDualFieldName(e.field, ki)
-            .ifPresent(dualFieldName -> removeFieldIfNeeded(doc, dualFieldName, e.value, ki));
+            .ifPresent(dualFieldName -> removeFieldIfNeeded(doc, dualFieldName, e.value, ki, getDualMapping(ki)));
     }
 
-    private void removeFieldIfNeeded(Document doc, String fieldName, Object fieldValue, KeyInformation ki) {
+    //A SET holds each of its values once: a value added again, which the document holds, replaces its entries. A field
+    //which stores the value as it is has an entry equal to it only if the document holds the value. The text field of
+    //a string stores the value in lower case, in an entry which a case variant of it, another value of the SET, has as
+    //well, so that entry is replaced only if the document holds the value itself: as the field of the whole strings of
+    //a TEXTSTRING key tells, or for a DEFAULT or TEXT key, which has no such field, as when the mutation puts back a
+    //value which it deleted
+    private void removeHeldValue(Document doc, IndexEntry e, KeyInformation ki, boolean isReAddition) {
+        final Mapping mapping = Mapping.getMapping(ki);
+        final Optional<String> dualFieldName = getDualFieldName(e.field, ki);
+        final boolean isHeld = dualFieldName.isPresent()
+            ? removeFieldIfNeeded(doc, dualFieldName.get(), e.value, ki, getDualMapping(ki))
+            : isReAddition;
+        if (isHeld || !storesLowerCase(mapping, e.value)) {
+            removeFieldIfNeeded(doc, e.field, e.value, ki, mapping);
+        }
+    }
+
+    //Removes the field's entry equal to the value, or its entry of a SINGLE key, and tells whether there was one
+    private boolean removeFieldIfNeeded(Document doc, String fieldName, Object fieldValue, KeyInformation ki,
+                                        Mapping mapping) {
         boolean isSingle = ki.getCardinality() == Cardinality.SINGLE;
+        final String storedValue = isSingle ? null : convertToStringValue(mapping, fieldValue);
         Iterator<IndexableField> it = doc.iterator();
         while (it.hasNext()) {
             IndexableField field = it.next();
             if (!fieldName.equals(field.name())) {
                 continue;
             }
-            if (isSingle || convertToStringValue(ki, fieldValue).equals(field.stringValue())) {
+            if (isSingle || storedValue.equals(field.stringValue())) {
                 it.remove();
-                break;
+                return true;
             }
         }
+        return false;
     }
 
-    private String convertToStringValue(final KeyInformation ki, Object value) {
+    //Whether a field of the mapping stores the value in lower case, as the text of a string for case-insensitive search
+    private static boolean storesLowerCase(Mapping mapping, Object value) {
+        return AttributeUtils.isString(value)
+            && (mapping == Mapping.DEFAULT || mapping == Mapping.TEXT || mapping == Mapping.TEXTSTRING);
+    }
+
+    //The value as a field of the mapping stores it
+    private String convertToStringValue(final Mapping mapping, Object value) {
         String converted;
         if (value instanceof Number) {
             converted = value.toString();
         } else if (AttributeUtils.isString(value)) {
-            Mapping mapping = Mapping.getMapping(ki);
-            if (mapping == Mapping.DEFAULT || mapping == Mapping.TEXT || mapping == Mapping.TEXTSTRING) {
-                converted = ((String) value).toLowerCase();
-            } else {
-                converted = (String) value;
-            }
+            converted = storesLowerCase(mapping, value) ? lowerCaseCodePoints((String) value) : (String) value;
         } else if (value instanceof Date) {
             converted = String.valueOf(((Date) value).getTime());
         } else if (value instanceof Instant) {
@@ -476,7 +578,7 @@ public class LuceneIndex implements IndexProvider {
                 case TEXTSTRING:
                 case TEXT:
                     // lowering the case for case insensitive text search
-                    field = new TextField(fieldName, str.toLowerCase(), Field.Store.YES);
+                    field = new TextField(fieldName, lowerCaseCodePoints(str), Field.Store.YES);
                     break;
                 case STRING:
                     // if this field uses a custom analyzer, it must be stored as a TextField
@@ -557,8 +659,9 @@ public class LuceneIndex implements IndexProvider {
     }
 
     private static Sort getSortOrder(List<IndexQuery.OrderEntry> orders, KeyInformation.StoreRetriever information) {
-        final Sort sort = new Sort();
-        if (!orders.isEmpty()) {
+        if (orders.isEmpty()) {
+            return new Sort();
+        } else {
             final SortField[] fields = new SortField[orders.size()];
             for (int i = 0; i < orders.size(); i++) {
                 final IndexQuery.OrderEntry order = orders.get(i);
@@ -568,7 +671,8 @@ public class LuceneIndex implements IndexProvider {
                 else if (AttributeUtils.isWholeNumber(dataType)) sortType = SortField.Type.LONG;
                 else if (AttributeUtils.isDecimal(dataType)) sortType = SortField.Type.DOUBLE;
                 else if (dataType.equals(Instant.class) || dataType.equals(Date.class)) sortType = SortField.Type.LONG;
-                else if (dataType.equals(Boolean.class)) sortType = SortField.Type.LONG;
+                // booleans are indexed as IntPoint, and Lucene rejects a sort type of another width than the points
+                else if (dataType.equals(Boolean.class)) sortType = SortField.Type.INT;
                 else
                     Preconditions.checkArgument(false, "Unsupported order specified on field [%s] with datatype [%s]", order.getKey(), dataType);
                 KeyInformation ki = information.get(order.getKey());
@@ -578,19 +682,49 @@ public class LuceneIndex implements IndexProvider {
                 } else {
                     fieldKey = order.getKey();
                 }
-                fields[i] = new SortField(fieldKey, sortType, order.getOrder() == Order.DESC);
+                fields[i] = sortField(fieldKey, sortType, order.getOrder() == Order.DESC);
+                if (sortType == SortField.Type.STRING && ParameterType.STRING_ANALYZER.findParameter(ki.getParameters(), null) != null) {
+                    // Lucene skips non-competitive documents through the terms index of the field, which requires the
+                    // terms to equal the doc values. A custom string analyzer makes other terms than the doc values.
+                    fields[i].setOptimizeSortWithIndexedData(false);
+                }
             }
-            sort.setSort(fields);
+            return new Sort(fields);
         }
-        return sort;
+    }
+
+    // A sort which puts the documents without the field after those with a value, in either direction, as JanusGraph
+    // does when it orders elements in memory and as Elasticsearch does; Lucene sorts them as 0 by default, and strings
+    // without a value first when ascending. A number has no value past the range of its sort type, so these documents
+    // sort as that type's greatest value when ascending and its least when descending. So documents which hold that
+    // very value may come after them, and so may, when ascending, documents with a NaN decimal, which Lucene sorts
+    // above every other double.
+    private static SortField sortField(String field, SortField.Type type, boolean descending) {
+        final SortField sortField = new SortField(field, type, descending);
+        switch (type) {
+            case STRING:
+                sortField.setMissingValue(descending ? SortField.STRING_FIRST : SortField.STRING_LAST);
+                break;
+            case LONG:
+                sortField.setMissingValue(descending ? Long.MIN_VALUE : Long.MAX_VALUE);
+                break;
+            case DOUBLE:
+                sortField.setMissingValue(descending ? Double.NEGATIVE_INFINITY : Double.POSITIVE_INFINITY);
+                break;
+            case INT:
+                sortField.setMissingValue(descending ? Integer.MIN_VALUE : Integer.MAX_VALUE);
+                break;
+            default:
+                throw new IllegalArgumentException("Unexpected sort type: " + type);
+        }
+        return sortField;
     }
 
     @Override
     public Stream<String> query(IndexQuery query, KeyInformation.IndexRetriever information, BaseTransaction tx) throws BackendException {
         //Construct query
         final String store = query.getStore();
-        final LuceneCustomAnalyzer delegatingAnalyzer = delegatingAnalyzerFor(store, information);
-        final SearchParams searchParams = convertQuery(query.getCondition(), information.get(store), delegatingAnalyzer);
+        final SearchParams searchParams = searchParams(query.getCondition(), information, store);
 
         try {
             final IndexSearcher searcher = ((Transaction) tx).getSearcher(query.getStore());
@@ -621,41 +755,112 @@ public class LuceneIndex implements IndexProvider {
         }
     }
 
+    // A whole number is a long point and a decimal a double point. A range runs to the end of its type: Long.MIN_VALUE or
+    // Long.MAX_VALUE, and an infinity for a decimal, as Double.MIN_VALUE is the smallest positive double, which left out
+    // zero and every negative value. A strict bound at the end of its type has nothing beyond it, and matches nothing.
+    // A decimal comparison finds what it finds in memory, as Cmp.test has it: a zero bound finds the same values
+    // whichever sign the zero has, and NaN, which Lucene orders above positive infinity, equals NaN alone and compares
+    // to no other value. An equality or an inclusive comparison with NaN finds NaN, a strict one nothing, a not-equal
+    // every other value, and a not-equal of any other value finds NaN too
     private static Query numericQuery(String key, Cmp relation, Number value) {
+        if (AttributeUtils.isWholeNumber(value)) {
+            final long bound = value.longValue();
+            switch (relation) {
+                case EQUAL:
+                    return LongPoint.newExactQuery(key, bound);
+                case NOT_EQUAL:
+                    return disjunction(longsBelow(key, bound), longsAbove(key, bound));
+                case LESS_THAN:
+                    return longsBelow(key, bound);
+                case LESS_THAN_EQUAL:
+                    return LongPoint.newRangeQuery(key, Long.MIN_VALUE, bound);
+                case GREATER_THAN:
+                    return longsAbove(key, bound);
+                case GREATER_THAN_EQUAL:
+                    return LongPoint.newRangeQuery(key, bound, Long.MAX_VALUE);
+                default:
+                    throw new IllegalArgumentException("Unexpected relation: " + relation);
+            }
+        }
+        final double bound = value.doubleValue();
+        if (Double.isNaN(bound)) {
+            switch (relation) {
+                case EQUAL:
+                case LESS_THAN_EQUAL:
+                case GREATER_THAN_EQUAL:
+                    return DoublePoint.newExactQuery(key, Double.NaN);
+                case NOT_EQUAL:
+                    return DoublePoint.newRangeQuery(key, Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY);
+                case LESS_THAN:
+                case GREATER_THAN:
+                    return new MatchNoDocsQuery();
+                default:
+                    throw new IllegalArgumentException("Unexpected relation: " + relation);
+            }
+        }
         switch (relation) {
             case EQUAL:
-                return AttributeUtils.isWholeNumber(value) ?
-                    LongPoint.newRangeQuery(key, value.longValue(), value.longValue()) :
-                    DoublePoint.newRangeQuery(key, value.doubleValue(), value.doubleValue());
+                return DoublePoint.newExactQuery(key, bound);
             case NOT_EQUAL:
-                final BooleanQuery.Builder q = new BooleanQuery.Builder();
-                if (AttributeUtils.isWholeNumber(value)) {
-                    q.add(LongPoint.newRangeQuery(key, Long.MIN_VALUE, Math.addExact(value.longValue(), -1)), BooleanClause.Occur.SHOULD);
-                    q.add(LongPoint.newRangeQuery(key, Math.addExact(value.longValue(), 1), Long.MAX_VALUE), BooleanClause.Occur.SHOULD);
-                } else {
-                    q.add(DoublePoint.newRangeQuery(key, Double.MIN_VALUE, DoublePoint.nextDown(value.doubleValue())), BooleanClause.Occur.SHOULD);
-                    q.add(DoublePoint.newRangeQuery(key, DoublePoint.nextUp(value.doubleValue()), Double.MAX_VALUE), BooleanClause.Occur.SHOULD);
-                }
-                return q.build();
+                return disjunction(doublesBelow(key, bound), doublesAbove(key, bound),
+                    DoublePoint.newExactQuery(key, Double.NaN));
             case LESS_THAN:
-                return (AttributeUtils.isWholeNumber(value)) ?
-                    LongPoint.newRangeQuery(key, Long.MIN_VALUE, Math.addExact(value.longValue(), -1)) :
-                    DoublePoint.newRangeQuery(key, Double.MIN_VALUE, DoublePoint.nextDown(value.doubleValue()));
+                return doublesBelow(key, lowerZero(bound));
             case LESS_THAN_EQUAL:
-                return (AttributeUtils.isWholeNumber(value)) ?
-                    LongPoint.newRangeQuery(key, Long.MIN_VALUE, value.longValue()) :
-                    DoublePoint.newRangeQuery(key, Double.MIN_VALUE, value.doubleValue());
+                return DoublePoint.newRangeQuery(key, Double.NEGATIVE_INFINITY, upperZero(bound));
             case GREATER_THAN:
-                return (AttributeUtils.isWholeNumber(value)) ?
-                    LongPoint.newRangeQuery(key, Math.addExact(value.longValue(), 1), Long.MAX_VALUE) :
-                    DoublePoint.newRangeQuery(key, DoublePoint.nextUp(value.doubleValue()), Double.MAX_VALUE);
+                return doublesAbove(key, upperZero(bound));
             case GREATER_THAN_EQUAL:
-                return (AttributeUtils.isWholeNumber(value)) ?
-                    LongPoint.newRangeQuery(key, value.longValue(), Long.MAX_VALUE) :
-                    DoublePoint.newRangeQuery(key, value.doubleValue(), Double.MAX_VALUE);
+                return DoublePoint.newRangeQuery(key, lowerZero(bound), Double.POSITIVE_INFINITY);
             default:
                 throw new IllegalArgumentException("Unexpected relation: " + relation);
         }
+    }
+
+    // Lucene orders -0.0 below +0.0, while a comparison, as AttributeUtils.compare, holds them equal, and only
+    // equality, as Double.equals, tells them apart. A comparison's bound at either zero spans both: an inclusive bound
+    // moves to the zero on its far side and a strict one to the zero on its near side, beyond which Lucene's neighbour
+    // skips both
+    private static double lowerZero(double bound) {
+        return bound == 0.0 ? -0.0 : bound;
+    }
+
+    private static double upperZero(double bound) {
+        return bound == 0.0 ? 0.0 : bound;
+    }
+
+    private static Query longsBelow(String key, long bound) {
+        return bound == Long.MIN_VALUE ? new MatchNoDocsQuery() : LongPoint.newRangeQuery(key, Long.MIN_VALUE, bound - 1);
+    }
+
+    private static Query longsAbove(String key, long bound) {
+        return bound == Long.MAX_VALUE ? new MatchNoDocsQuery() : LongPoint.newRangeQuery(key, bound + 1, Long.MAX_VALUE);
+    }
+
+    private static Query doublesBelow(String key, double bound) {
+        return bound == Double.NEGATIVE_INFINITY ? new MatchNoDocsQuery()
+            : DoublePoint.newRangeQuery(key, Double.NEGATIVE_INFINITY, DoublePoint.nextDown(bound));
+    }
+
+    private static Query doublesAbove(String key, double bound) {
+        return bound == Double.POSITIVE_INFINITY ? new MatchNoDocsQuery()
+            : DoublePoint.newRangeQuery(key, DoublePoint.nextUp(bound), Double.POSITIVE_INFINITY);
+    }
+
+    // The documents any of the queries matches; a query which matches nothing is left out
+    private static Query disjunction(Query... queries) {
+        final List<Query> clauses = new ArrayList<>(queries.length);
+        for (final Query query : queries) {
+            if (!(query instanceof MatchNoDocsQuery)) {
+                clauses.add(query);
+            }
+        }
+        if (clauses.size() <= 1) {
+            return clauses.isEmpty() ? new MatchNoDocsQuery() : clauses.get(0);
+        }
+        final BooleanQuery.Builder builder = new BooleanQuery.Builder();
+        clauses.forEach(clause -> builder.add(clause, BooleanClause.Occur.SHOULD));
+        return builder.build();
     }
 
     // adapted from SolrIndex
@@ -684,47 +889,66 @@ public class LuceneIndex implements IndexProvider {
     private void tokenize(SearchParams params, final Mapping mapping, final LuceneCustomAnalyzer delegatingAnalyzer, String value, String key, JanusGraphPredicate janusgraphPredicate) {
         final Analyzer analyzer = delegatingAnalyzer.getWrappedAnalyzer(key);
         final List<List<String>> terms = customTokenize(analyzer, key, value);
-        if (terms.isEmpty()) {
+        if (janusgraphPredicate == Cmp.NOT_EQUAL) {
+            //The documents with a value which the equality doesn't find, as on Elasticsearch: those which lack one of
+            //the terms or more, and all of them when the analyzer gives no term
+            final BooleanQuery.Builder q = new BooleanQuery.Builder();
+            q.add(new MatchAllDocsQuery(), BooleanClause.Occur.MUST);
+            q.add(allTerms(key, terms), BooleanClause.Occur.MUST_NOT);
+            params.addQuery(q.build(), BooleanClause.Occur.MUST);
+            final SearchParams existParams = new SearchParams();
+            addExistsQuery(existParams, key);
+            params.addParams(existParams, BooleanClause.Occur.MUST);
+        } else if (terms.isEmpty()) {
             // This might happen with very short terms
             if (janusgraphPredicate == Text.CONTAINS_PREFIX) {
                 final Term term;
                 if (mapping == Mapping.STRING) {
                     term = new Term(key, value);
                 } else {
-                    term = new Term(key, value.toLowerCase());
+                    term = new Term(key, lowerCaseCodePoints(value));
                 }
                 params.addQuery(new PrefixQuery(term), BooleanClause.Occur.MUST);
+            } else {
+                params.addQuery(allTerms(key, terms));
             }
         } else if (terms.size() == 1) {
             if (janusgraphPredicate == Cmp.EQUAL || janusgraphPredicate == Text.CONTAINS) {
                 params.addQuery(combineTerms(key, terms.get(0), TermQuery::new));
-            } else if (janusgraphPredicate == Cmp.NOT_EQUAL) {
-                final BooleanQuery.Builder q = new BooleanQuery.Builder();
-                q.add(new MatchAllDocsQuery(), BooleanClause.Occur.MUST);
-                q.add(combineTerms(key, terms.get(0), TermQuery::new), BooleanClause.Occur.MUST_NOT);
-                params.addQuery(q.build(), BooleanClause.Occur.MUST);
             } else if (janusgraphPredicate == Text.CONTAINS_PREFIX) {
                 List<String> preparedTerms = new ArrayList<>(terms.get(0));
                 if (mapping != Mapping.STRING) {
-                    preparedTerms = terms.get(0).stream().map(String::toLowerCase).collect(Collectors.toList());
+                    preparedTerms = terms.get(0).stream().map(term -> lowerCaseCodePoints(term)).collect(Collectors.toList());
                 }
                 params.addQuery(combineTerms(key, preparedTerms, PrefixQuery::new), BooleanClause.Occur.MUST);
             } else throw new IllegalArgumentException("LuceneIndex does not support this predicate with 1 token : " + janusgraphPredicate);
         } else {
-            // at the moment, this is only walked for EQUAL, NOT_EQUAL and Text.CONTAINS (String and Text mappings)
-            final BooleanQuery.Builder q = new BooleanQuery.Builder();
-            BooleanClause.Occur occur;
-            if (janusgraphPredicate == Cmp.NOT_EQUAL) {
-                q.add(new MatchAllDocsQuery(), BooleanClause.Occur.MUST);
-                occur = BooleanClause.Occur.MUST_NOT;
-            } else {
-                occur = BooleanClause.Occur.MUST;
-            }
-            for (final List<String> stems : terms) {
-                q.add(combineTerms(key, stems, TermQuery::new), occur);
-            }
-            params.addQuery(q.build());
+            // at the moment, this is only walked for EQUAL, Text.CONTAINS and Text.CONTAINS_PREFIX
+            params.addQuery(allTerms(key, terms));
         }
+    }
+
+    //The documents which hold every term of the value, any one of the terms at a position. A value the analyzer gives
+    //no term for, such as a stop word or punctuation, matches none, as on Elasticsearch
+    private Query allTerms(String key, List<List<String>> terms) {
+        if (terms.size() == 1) {
+            return combineTerms(key, terms.get(0), TermQuery::new);
+        }
+        if (terms.isEmpty()) {
+            return new MatchNoDocsQuery("No terms for key " + key);
+        }
+        final BooleanQuery.Builder q = new BooleanQuery.Builder();
+        for (final List<String> stems : terms) {
+            q.add(combineTerms(key, stems, TermQuery::new), BooleanClause.Occur.MUST);
+        }
+        return q.build();
+    }
+
+    private void addExistsQuery(final SearchParams params, final String key) {
+        // some fields like Integer omit norms but have docValues
+        params.addQuery(new DocValuesFieldExistsQuery(key), BooleanClause.Occur.SHOULD);
+        // some fields like Text have no docValue but have norms
+        params.addQuery(new NormsFieldExistsQuery(key), BooleanClause.Occur.SHOULD);
     }
 
     private Query combineTerms(String key, List<String> terms, Function<Term, Query> queryCreator) {
@@ -741,11 +965,48 @@ public class LuceneIndex implements IndexProvider {
         }
     }
 
-    private LuceneCustomAnalyzer delegatingAnalyzerFor(String store, KeyInformation.IndexRetriever information2) {
-        if (!delegatingAnalyzers.containsKey(store)) {
-            delegatingAnalyzers.put(store, new LuceneCustomAnalyzer(store, information2, Analyzer.PER_FIELD_REUSE_STRATEGY));
+    private LuceneCustomAnalyzer delegatingAnalyzerFor(String store) {
+        return delegatingAnalyzers.computeIfAbsent(store,
+            s -> new LuceneCustomAnalyzer(s, this::keyInformationInScope, Analyzer.PER_FIELD_REUSE_STRATEGY));
+    }
+
+    private KeyInformation.IndexRetriever keyInformationInScope() {
+        final KeyInformation.IndexRetriever information = scopedKeyInformation.get();
+        Preconditions.checkState(information != null, "No key information in scope: a field is analyzed outside " +
+            "a call of the index, which sets the key information of its transaction");
+        return information;
+    }
+
+    /**
+     * Sets the key information through which the analyzers resolve the fields the current thread analyzes, until
+     * the returned scope is closed, which restores the previous one
+     */
+    private KeyInformationScope analyzeWith(KeyInformation.IndexRetriever information) {
+        Preconditions.checkNotNull(information);
+        final KeyInformation.IndexRetriever before = scopedKeyInformation.get();
+        scopedKeyInformation.set(information);
+        return () -> {
+            if (before == null) {
+                scopedKeyInformation.remove();
+            } else {
+                scopedKeyInformation.set(before);
+            }
+        };
+    }
+
+    private interface KeyInformationScope extends AutoCloseable {
+        @Override
+        void close();
+    }
+
+    /**
+     * Converts a condition with the key information of the transaction it belongs to, through which the analyzers of
+     * the store's text fields resolve the fields
+     */
+    private SearchParams searchParams(Condition<?> condition, KeyInformation.IndexRetriever information, String store) {
+        try (KeyInformationScope ignored = analyzeWith(information)) {
+            return convertQuery(condition, information.get(store), delegatingAnalyzerFor(store));
         }
-        return delegatingAnalyzers.get(store);
     }
 
     private SearchParams convertQuery(Condition<?> condition, final KeyInformation.StoreRetriever information, final LuceneCustomAnalyzer delegatingAnalyzer) {
@@ -757,36 +1018,31 @@ public class LuceneIndex implements IndexProvider {
             KeyInformation ki = information.get(key);
             final JanusGraphPredicate janusgraphPredicate = atom.getPredicate();
             if (value == null && janusgraphPredicate == Cmp.NOT_EQUAL) {
-                // some fields like Integer omit norms but have docValues
-                params.addQuery(new DocValuesFieldExistsQuery(key), BooleanClause.Occur.SHOULD);
-                // some fields like Text have no docValue but have norms
-                params.addQuery(new NormsFieldExistsQuery(key), BooleanClause.Occur.SHOULD);
+                addExistsQuery(params, key);
             } else if (value instanceof Number) {
                 Preconditions.checkArgument(janusgraphPredicate instanceof Cmp, "Relation not supported on numeric types: %s", janusgraphPredicate);
                 params.addQuery(numericQuery(key, (Cmp) janusgraphPredicate, (Number) value));
             } else if (value instanceof String) {
+                //A TEXTSTRING key holds the string whole in its dual field, which it is sorted by, and its words in its
+                //text field: the predicates on words, as CONTAINS is, read the text field, and the others the string
+                final String stringFieldKey = ki == null ? key : getDualFieldName(key, ki).orElse(key);
+                final String string = value.toString();
                 if (janusgraphPredicate == Cmp.LESS_THAN) {
-                    params.addQuery(TermRangeQuery.newStringRange(key, null, value.toString(), false, false));
+                    params.addQuery(TermRangeQuery.newStringRange(stringFieldKey, null, string, false, false));
                 } else if (janusgraphPredicate == Cmp.LESS_THAN_EQUAL) {
-                    params.addQuery(TermRangeQuery.newStringRange(key, null, value.toString(), false, true));
+                    params.addQuery(TermRangeQuery.newStringRange(stringFieldKey, null, string, false, true));
                 } else if (janusgraphPredicate == Cmp.GREATER_THAN) {
-                    params.addQuery(TermRangeQuery.newStringRange(key, value.toString(), null, false, false));
+                    params.addQuery(TermRangeQuery.newStringRange(stringFieldKey, string, null, false, false));
                 } else if (janusgraphPredicate == Cmp.GREATER_THAN_EQUAL) {
-                    params.addQuery(TermRangeQuery.newStringRange(key, value.toString(), null, true, false));
+                    params.addQuery(TermRangeQuery.newStringRange(stringFieldKey, string, null, true, false));
                 } else {
                     final Mapping map = Mapping.getMapping(ki);
-                    final String stringFieldKey;
-                    if (Mapping.getMapping(ki) == Mapping.TEXTSTRING) {
-                        stringFieldKey = getDualFieldName(key, ki).orElse(key);
-                    } else {
-                        stringFieldKey = key;
-                    }
                     if ((map == Mapping.DEFAULT || map == Mapping.TEXT) && !Text.HAS_CONTAINS.contains(janusgraphPredicate))
                         throw new IllegalArgumentException("Text mapped string values only support CONTAINS queries and not: " + janusgraphPredicate);
                     if (map == Mapping.STRING && Text.HAS_CONTAINS.contains(janusgraphPredicate))
                         throw new IllegalArgumentException("String mapped string values do not support CONTAINS queries: " + janusgraphPredicate);
                     if (janusgraphPredicate == Text.CONTAINS) {
-                        tokenize(params, map, delegatingAnalyzer, ((String) value).toLowerCase(), key, janusgraphPredicate);
+                        tokenize(params, map, delegatingAnalyzer, lowerCaseCodePoints((String) value), key, janusgraphPredicate);
                     } else if (janusgraphPredicate == Text.CONTAINS_PREFIX) {
                         tokenize(params, map, delegatingAnalyzer, (String) value, key, janusgraphPredicate);
                     } else if (janusgraphPredicate == Text.PREFIX) {
@@ -795,16 +1051,17 @@ public class LuceneIndex implements IndexProvider {
                         final RegexpQuery rq = new RegexpQuery(new Term(stringFieldKey, (String) value));
                         params.addQuery(rq);
                     } else if (janusgraphPredicate == Text.CONTAINS_REGEX) {
-                        // This is terrible -- there is probably a better way
-                        // putting this to lowercase because Text search is supposed to be case insensitive
-                        final RegexpQuery rq = new RegexpQuery(new Term(key, ".*" + (((String) value).toLowerCase()) + ".*"));
-                        params.addQuery(rq);
+                        //A word matches when the expression matches it whole, as a term matches a regexp query on
+                        //Elasticsearch and Solr. The words are in lower case, and the expression is put in lower case
+                        //as on Elasticsearch, so that its letters match whatever their case. That also turns an escape
+                        //such as \W into another one, \w, which matches what \W doesn't
+                        params.addQuery(new RegexpQuery(new Term(key, lowerCaseCodePoints((String) value))));
                     } else if (janusgraphPredicate == Cmp.EQUAL || janusgraphPredicate == Cmp.NOT_EQUAL) {
                         tokenize(params, map, delegatingAnalyzer, (String) value, stringFieldKey, janusgraphPredicate);
                     } else if (janusgraphPredicate == Text.FUZZY) {
                         params.addQuery(new FuzzyQuery(new Term(stringFieldKey, (String) value), Text.getMaxEditDistance((String) value)));
                     } else if (janusgraphPredicate == Text.CONTAINS_FUZZY) {
-                        value = ((String) value).toLowerCase();
+                        value = lowerCaseCodePoints((String) value);
                         final Builder b = new BooleanQuery.Builder();
                         for (final String term : Text.tokenize((String) value)) {
                             b.add(new FuzzyQuery(new Term(key, term), Text.getMaxEditDistance(term)), BooleanClause.Occur.MUST);
@@ -845,6 +1102,9 @@ public class LuceneIndex implements IndexProvider {
                 if (janusgraphPredicate == Cmp.EQUAL) {
                     params.addQuery(new TermQuery(new Term(key, value.toString())));
                 } else if (janusgraphPredicate == Cmp.NOT_EQUAL) {
+                    final SearchParams existParams = new SearchParams();
+                    addExistsQuery(existParams, key);
+                    params.addParams(existParams, BooleanClause.Occur.MUST);
                     final BooleanQuery.Builder q = new BooleanQuery.Builder();
                     q.add(new MatchAllDocsQuery(), BooleanClause.Occur.MUST);
                     q.add(new TermQuery(new Term(key, value.toString())), BooleanClause.Occur.MUST_NOT);
@@ -874,21 +1134,28 @@ public class LuceneIndex implements IndexProvider {
     }
 
     private QueryParser getQueryParser(String store, KeyInformation.IndexRetriever information) {
-        final Analyzer analyzer = delegatingAnalyzerFor(store, information);
+        final Analyzer analyzer = delegatingAnalyzerFor(store);
         final NumericTranslationQueryParser parser = new NumericTranslationQueryParser(information.get(store), "_all", analyzer);
         parser.setAllowLeadingWildcard(true);
         return parser;
     }
 
-    @Override
-    public Stream<RawQuery.Result<String>> query(RawQuery query, KeyInformation.IndexRetriever information, BaseTransaction tx) throws BackendException {
-        final Query q;
-        try {
-            q = getQueryParser(query.getStore(), information).parse(query.getQuery());
-            // Lucene query parser does not take additional parameters so any parameters on the RawQuery are ignored.
+    /**
+     * Parses a raw query with the key information of the transaction it belongs to, through which the analyzers of
+     * the store's text fields resolve the fields
+     */
+    private Query parse(RawQuery query, KeyInformation.IndexRetriever information) throws PermanentBackendException {
+        try (KeyInformationScope ignored = analyzeWith(information)) {
+            return getQueryParser(query.getStore(), information).parse(query.getQuery());
         } catch (final ParseException e) {
             throw new PermanentBackendException("Could not parse raw query: " + query.getQuery(), e);
         }
+    }
+
+    @Override
+    public Stream<RawQuery.Result<String>> query(RawQuery query, KeyInformation.IndexRetriever information, BaseTransaction tx) throws BackendException {
+        // Lucene query parser does not take additional parameters so any parameters on the RawQuery are ignored.
+        final Query q = parse(query, information);
 
         try {
             final IndexSearcher searcher = ((Transaction) tx).getSearcher(query.getStore());
@@ -920,49 +1187,136 @@ public class LuceneIndex implements IndexProvider {
     }
 
     @Override
-    public Long queryCount(IndexQuery query, KeyInformation.IndexRetriever information, BaseTransaction tx) throws BackendException {
+    public Number queryAggregation(IndexQuery query, KeyInformation.IndexRetriever information, BaseTransaction tx, Aggregation aggregation) throws BackendException {
         //Construct query
         final String store = query.getStore();
-        final LuceneCustomAnalyzer delegatingAnalyzer = delegatingAnalyzerFor(store, information);
-        final SearchParams searchParams = convertQuery(query.getCondition(), information.get(store), delegatingAnalyzer);
+        final SearchParams searchParams = searchParams(query.getCondition(), information, store);
 
         try {
             final IndexSearcher searcher = ((Transaction) tx).getSearcher(query.getStore());
             if (searcher == null) {
-                return 0L; //Index does not yet exist
+                //Index does not yet exist: nothing to count, and no values to aggregate
+                return aggregation.getType() == Aggregation.Type.COUNT ? 0L : null;
             }
             Query q = searchParams.getQuery();
 
-            final long time = System.currentTimeMillis();
-            // We ignore offset and limit for totals
-            final TopDocs docs = searcher.search(q, 1);
-            log.debug("Executed query [{}] in {} ms", q, System.currentTimeMillis() - time);
-            return docs.totalHits.value;
+            switch (aggregation.getType()) {
+                case COUNT: return QueryUtil.applyQueryLimitAfterCount(executeCount(searcher, q), query);
+                case MIN: return executeMin(searcher, q, aggregation.getFieldName(), aggregation.getDataType(),
+                    isSingleValued(information, store, aggregation.getFieldName()));
+                case MAX: return executeMax(searcher, q, aggregation.getFieldName(), aggregation.getDataType(),
+                    isSingleValued(information, store, aggregation.getFieldName()));
+                case AVG: return executeAvg(searcher, q, aggregation.getFieldName());
+                case SUM: return executeSum(searcher, q, aggregation.getFieldName(), aggregation.getDataType());
+                default: throw new UnsupportedOperationException();
+            }
         } catch (final IOException e) {
             throw new TemporaryBackendException("Could not execute Lucene query", e);
         }
     }
 
+    private long executeCount(IndexSearcher searcher, Query query) throws IOException {
+        final long time = System.currentTimeMillis();
+        // We ignore offset and limit for totals. The total hits of a search are only a lower bound past
+        // IndexSearcher.TOTAL_HITS_THRESHOLD hits, as Lucene may skip the hits which can't make the top, so they are
+        // counted instead
+        final long count = searcher.count(query);
+        log.debug("Executed query [{}] in {} ms", query, System.currentTimeMillis() - time);
+        return count;
+    }
+
+    /**
+     * The sort type has to match how {@link #buildIndexFields} indexes the field: Lucene rejects sorting a field with a
+     * type of another width than its points, and the doc values of decimals are doubles.
+     */
+    private SortField.Type sortFieldType(Class fieldType) {
+        if (fieldType != null) {
+            if (AttributeUtils.isDecimal(fieldType)) return SortField.Type.DOUBLE;
+            else if (Boolean.class.equals(fieldType)) return SortField.Type.INT;
+        }
+        return SortField.Type.LONG;
+    }
+
+    private Number adaptNumberType(Number value, Class<? extends Number> expectedType) {
+        if (value == null || expectedType == null) return value;
+        else if (Byte.class.isAssignableFrom(expectedType)) return value.byteValue();
+        else if (Short.class.isAssignableFrom(expectedType)) return value.shortValue();
+        else if (Integer.class.isAssignableFrom(expectedType)) return value.intValue();
+        else if (Long.class.isAssignableFrom(expectedType)) return value.longValue();
+        else if (Float.class.isAssignableFrom(expectedType)) return value.floatValue();
+        else if (Double.class.isAssignableFrom(expectedType)) return value.doubleValue();
+        else return value.doubleValue();
+    }
+
+    // Only a field of single values has the doc values to sort the documents by
+    private static boolean isSingleValued(KeyInformation.IndexRetriever information, String store, String fieldName) {
+        return information.get(store, fieldName).getCardinality() == Cardinality.SINGLE;
+    }
+
+    // The minimum and maximum are null when no matching document has a value, as those of no values are none
+    private Number executeMin(IndexSearcher searcher, Query query, String fieldName, Class fieldType, boolean singleValued) throws IOException {
+        return singleValued ? executeFirst(searcher, query, fieldName, fieldType, false)
+            : adaptNumberType(executeStats(searcher, query, fieldName).getMin(), fieldType);
+    }
+
+    private Number executeMax(IndexSearcher searcher, Query query, String fieldName, Class fieldType, boolean singleValued) throws IOException {
+        return singleValued ? executeFirst(searcher, query, fieldName, fieldType, true)
+            : adaptNumberType(executeStats(searcher, query, fieldName).getMax(), fieldType);
+    }
+
+    // The value of the first, by the field, of the matching documents which have one: null when none has. Only those
+    // are searched, as the documents without a value may tie with an extreme value in the sort
+    private Number executeFirst(IndexSearcher searcher, Query query, String fieldName, Class fieldType, boolean descending)
+            throws IOException {
+        final Query withValue = new BooleanQuery.Builder().add(query, BooleanClause.Occur.FILTER)
+            .add(new FieldExistsQuery(fieldName), BooleanClause.Occur.FILTER).build();
+        final TopFieldDocs docs = searcher.search(withValue, 1, new Sort(sortField(fieldName, sortFieldType(fieldType), descending)));
+        if (docs.scoreDocs.length == 0) {
+            return null;
+        }
+        final IndexableField field = searcher.doc(docs.scoreDocs[0].doc, Sets.newHashSet(fieldName)).getField(fieldName);
+        return adaptNumberType(field.numericValue(), fieldType);
+    }
+
+    private StatsCollector executeStats(IndexSearcher searcher, Query query, String fieldName) throws IOException {
+        final StatsCollector collector = new StatsCollector(fieldName, searcher);
+        searcher.search(query, collector);
+        return collector;
+    }
+
+    // The sum of the values of the matching documents, null when none has a value, as the sum of no values is none
+    private Number executeSum(IndexSearcher searcher, Query query, String fieldName, Class fieldType) throws IOException {
+        final StatsCollector stats = executeStats(searcher, query, fieldName);
+        if (stats.getCount() == 0) {
+            return null;
+        }
+
+        if (Float.class.isAssignableFrom(fieldType) || Double.class.isAssignableFrom(fieldType))
+            return stats.getSum();
+        else
+            return (long)stats.getSum();
+    }
+
+    // The mean of the values, over the values rather than the matching documents, which may not all have one
+    private Double executeAvg(IndexSearcher searcher, Query query, String fieldName) throws IOException {
+        final StatsCollector stats = executeStats(searcher, query, fieldName);
+        return stats.getCount() == 0 ? null : stats.getSum() / stats.getCount();
+    }
+
     @Override
     public Long totals(RawQuery query, KeyInformation.IndexRetriever information, BaseTransaction tx) throws BackendException {
-        final Query q;
-        try {
-            q = getQueryParser(query.getStore(), information).parse(query.getQuery());
-        } catch (final ParseException e) {
-            throw new PermanentBackendException("Could not parse raw query: " + query.getQuery(), e);
-        }
+        final Query q = parse(query, information);
 
         try {
             final IndexSearcher searcher = ((Transaction) tx).getSearcher(query.getStore());
             if (searcher == null) return 0L; //Index does not yet exist
 
             final long time = System.currentTimeMillis();
-            // Lucene doesn't like limits of 0.  Also, it doesn't efficiently build a total list.
-            query.setLimit(1);
-            // We ignore offset and limit for totals
-            final TopDocs docs = searcher.search(q, 1);
+            // The total hits of a search are only a lower bound past IndexSearcher.TOTAL_HITS_THRESHOLD hits, so the
+            // matches are counted instead; the offset and the query's limit are applied to the count below, as before
+            final long count = searcher.count(q);
             log.debug("Executed query [{}] in {} ms", q, System.currentTimeMillis() - time);
-            return docs.totalHits.value;
+            return QueryUtil.applyOffsetWithQueryLimitAfterCount(count, query.getOffset(), query);
         } catch (final IOException e) {
             throw new TemporaryBackendException("Could not execute Lucene query", e);
         }
@@ -993,7 +1347,12 @@ public class LuceneIndex implements IndexProvider {
                 case STRING:
                     return janusgraphPredicate instanceof Cmp || janusgraphPredicate == Text.PREFIX || janusgraphPredicate == Text.REGEX || janusgraphPredicate == Text.FUZZY;
                 case TEXTSTRING:
-                    return janusgraphPredicate instanceof Text || janusgraphPredicate instanceof Cmp;
+                    //The predicates convertQuery has a query for; the negated text predicates and CONTAINS_PHRASE are
+                    //checked in memory
+                    return janusgraphPredicate instanceof Cmp || janusgraphPredicate == Text.PREFIX
+                        || janusgraphPredicate == Text.REGEX || janusgraphPredicate == Text.FUZZY
+                        || janusgraphPredicate == Text.CONTAINS || janusgraphPredicate == Text.CONTAINS_PREFIX
+                        || janusgraphPredicate == Text.CONTAINS_REGEX || janusgraphPredicate == Text.CONTAINS_FUZZY;
             }
         } else if (dataType == Date.class || dataType == Instant.class) {
             return janusgraphPredicate instanceof Cmp;
@@ -1032,10 +1391,14 @@ public class LuceneIndex implements IndexProvider {
 
     @Override
     public void close() throws BackendException {
+        //Closing a writer commits it, so it takes writerLock as every other commit of a store does
+        writerLock.lock();
         try {
             for (final IndexWriter w : writers.values()) w.close();
         } catch (final IOException e) {
             throw new PermanentBackendException("Could not close writers", e);
+        } finally {
+            writerLock.unlock();
         }
     }
 
@@ -1046,6 +1409,11 @@ public class LuceneIndex implements IndexProvider {
         } catch (final IOException e) {
             throw new PermanentBackendException("Could not delete lucene directory: " + basePath, e);
         }
+    }
+
+    @Override
+    public void clearStore(String storeName) throws BackendException {
+        throw new PermanentBackendException("Lucene index does not yet support deleting single stores.");
     }
 
     @Override

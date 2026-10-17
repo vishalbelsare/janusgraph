@@ -218,7 +218,7 @@ g.V().or(__.has('name', textContains('hercules')), __.has('age', inside(20, 50))
 ```
 
 Mixed indexes support full-text search, range search, geo search and
-others. Refer to [Search Predicates and Data Types](../../interactions/search-predicates.md) for a list of predicates
+others. Refer to [Search Predicates and Data Types](../../basics/search-predicates.md) for a list of predicates
 supported by a particular indexing backend.
 
 !!! note
@@ -285,12 +285,25 @@ When using `order().by()` it is important to note that:
     results. All results will be retrieved and then sorted in-memory.
     For large result sets, this can be very expensive.
 
--   Mixed indexes support ordering natively and efficiently. However,
+-   Mixed indexes support ordering property keys with **SINGLE** cardinality
+    natively and efficiently. However,
     the property key used in the order().by() method must have been
     previously added to the mixed indexed for native result ordering
     support. This is important in cases where the the order().by() key
     is different from the query keys. If the property key is not part of
     the index, then sorting requires loading all results into memory.
+
+-   Only Elasticsearch and Solr mixed index backends support ordering
+    property keys with **LIST** cardinality natively and efficiently.
+
+-   Strings are ordered by their code points, as the mixed index
+    backends sort them, whether a mixed index or JanusGraph sorts the
+    results. The edges and properties of a vertex, which a
+    vertex-centric index sorts, are ordered by the UTF-16 code units
+    of their sort keys instead. The two orders differ only where, at
+    the first character in which two strings differ, one has a
+    character from U+10000 up, such as an emoji, and the other one
+    from U+E000 to U+FFFF.
 
 ### Label Constraint
 
@@ -323,6 +336,44 @@ index with label restriction is defined as unique, the uniqueness
 constraint only applies to properties on vertices or edges for the
 specified label.
 
+### Inlining vertex properties into a Composite Index
+
+Inlining vertex properties into a Composite Index structure can offer significant performance and efficiency benefits.
+
+1. **Performance Improvements**
+Faster Querying: Inlining vertex properties directly within the index allows the search engine to retrieve all relevant data from the index itself. 
+This means, queries don’t need to make additional calls to data stores to fetch full vertex information, significantly reducing lookup time.
+
+2. **Data Locality**
+In distributed storages, having inlined properties ensures that more complete data exists within individual partitions or shards.
+This reduces cross-node network calls and improves the overall query performance by ensuring data is more local to the request being processed.
+
+3. **Cost of Indexing vs. Storage Trade-off**
+While inlining properties increases the size of the index (potentially leading to more extensive index storage requirements), 
+it is often a worthwhile trade-off for performance, mainly when query speed is critical. 
+This is a typical pattern in systems optimized for read-heavy workloads.
+
+#### Usage
+In order to take advantage of the inlined properties feature, JanusGraph Transaction should be set to use `.propertyPrefetching(false)`
+
+Example:
+
+```groovy
+//Build index
+mgmt.buildIndex("composite", Vertex.class)
+    .addKey(idKey)
+    .addInlinePropertyKey(nameKey)
+    .buildCompositeIndex()
+mgmt.commit()
+
+//Query
+tx = graph.buildTransaction()
+    .propertyPrefetching(false) //this is important
+    .start()
+
+tx.traversal().V().has("id", 100).next().value("name")
+```
+
 ### Composite versus Mixed Indexes
 
 1.  Use a composite index for exact match index retrievals. Composite
@@ -337,6 +388,13 @@ specified label.
 2.  Use a mixed indexes for numeric range, full-text or geo-spatial
     indexing. Also, using a mixed index can speed up the order().by()
     queries.
+
+3.  A composite index requires all fields to be present, while a mixed
+    index only needs at least one field to be present. For example, say
+    you have a composite index with `key1` and `key2`, a mixed index with
+    `key1` and `key3`. If you add a vertex with only property `key1`, then
+    JanusGraph will create a new mixed index entry but not a composite index
+    entry.
 
 ## Vertex-centric Indexes
 

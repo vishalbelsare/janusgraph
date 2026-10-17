@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM debian:buster as builder
+FROM debian:bookworm-20240211 AS builder
 
-ARG HBASE_VERSION=2.2.7
-ARG HBASE_DIST="http://archive.apache.org/dist/hbase"
+ARG HBASE_VERSION=2.6.0
+ARG HBASE_DIST="https://archive.apache.org/dist/hbase"
 
 RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl=7.64.0-4+deb10u2
+    DEBIAN_FRONTEND=noninteractive apt-get install -y curl
 
 RUN curl -SL ${HBASE_DIST}/${HBASE_VERSION}/hbase-${HBASE_VERSION}-bin.tar.gz | tar -x -z && mv hbase-${HBASE_VERSION} /opt/hbase
 WORKDIR /opt/hbase
@@ -26,31 +26,28 @@ RUN rm -rf ./docs ./LEGAL ./*.txt ./*/*.cmd
 
 COPY ./hbase-site.xml /opt/hbase/conf/hbase-site.xml
 COPY ./hbase-policy.xml /opt/hbase/conf/hbase-policy.xml
-COPY ./zoo.cfg /opt/hbase/conf/zoo.cfg
 
-FROM openjdk:8-jre-buster
+FROM eclipse-temurin:8-jre
 
-ARG HBASE_UID=1000
-ARG HBASE_GID=1000
+ARG HBASE_UID=999
+ARG HBASE_GID=999
 
 ENV LOGS_DIR=/data/logs
 
 COPY --from=builder /opt/hbase/ /opt/hbase/
 
-RUN ln -sf /opt/hbase/bin/* /usr/bin/
-RUN mkdir -p $LOGS_DIR /data/hbase /data/run
-
 WORKDIR /opt/hbase
+COPY ./entrypoint.sh /entrypoint.sh
 
-EXPOSE 2181
-EXPOSE 16000
-EXPOSE 16010
-EXPOSE 16020
-EXPOSE 16030
+RUN ln -sf /opt/hbase/bin/* /usr/bin/ \
+ && mkdir -p $LOGS_DIR /data/hbase /data/wal /data/run /opt/hbase/logs \
+ && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y socat \
+ && groupadd -g ${HBASE_GID} hbase \
+ && useradd -s /bin/bash hbase -u ${HBASE_UID} -g ${HBASE_GID} \
+ && chmod +x /entrypoint.sh \
+ && chown -R ${HBASE_UID}:${HBASE_GID} /data /opt/hbase/logs
 
-CMD ["/usr/bin/hbase", "master", "start"]
+EXPOSE 2181 16000 16010 16020 16030
 
-RUN groupadd -g ${HBASE_GID} hbase && \
-    useradd -s /bin/bash hbase -u ${HBASE_UID} -g ${HBASE_GID} && \
-    chown -R ${HBASE_UID}:${HBASE_GID} /data
 USER hbase
+ENTRYPOINT ["/entrypoint.sh"]

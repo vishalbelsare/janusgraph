@@ -14,12 +14,15 @@
 
 package org.janusgraph.graphdb.cql;
 
+import io.github.artsok.RepeatedIfExceptionsTest;
 import org.janusgraph.JanusGraphCassandraContainer;
 import org.janusgraph.StorageSetup;
 import org.janusgraph.diskstorage.configuration.WriteConfiguration;
 import org.janusgraph.graphdb.JanusGraphTest;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+
+import java.util.concurrent.ExecutionException;
 
 @Testcontainers
 public class CQLGraphCacheTest extends JanusGraphTest {
@@ -30,5 +33,78 @@ public class CQLGraphCacheTest extends JanusGraphTest {
     @Override
     public WriteConfiguration getConfiguration() {
         return StorageSetup.addPermanentCache(cqlContainer.getConfiguration(getClass().getSimpleName()));
+    }
+
+    // flaky test: https://github.com/JanusGraph/janusgraph/issues/1457
+    // The parameterized variant of rerunner-jupiter's retry annotation does not work with JUnit 5.13+, so the
+    // parameterized test of the base class is overridden without a test annotation (which excludes it from this
+    // class) and its two parameter values are expanded into the dedicated repeatable tests below.
+    @Override
+    public void simpleLogTest(boolean useStringId) throws InterruptedException {
+        super.simpleLogTest(useStringId);
+    }
+
+    @RepeatedIfExceptionsTest(repeats = 3)
+    public void simpleLogTestWithLongId() throws InterruptedException {
+        simpleLogTest(false);
+    }
+
+    @RepeatedIfExceptionsTest(repeats = 3)
+    public void simpleLogTestWithStringId() throws InterruptedException {
+        simpleLogTest(true);
+    }
+
+    // flaky test: https://github.com/JanusGraph/janusgraph/issues/1457
+    // The parameterized variant of rerunner-jupiter's retry annotation does not work with JUnit 5.13+, so the
+    // parameterized test of the base class is overridden without a test annotation (which excludes it from this
+    // class) and its two parameter values are expanded into the dedicated repeatable tests below.
+    @Override
+    public void simpleLogTestWithFailure(boolean useStringId) throws InterruptedException {
+        super.simpleLogTestWithFailure(useStringId);
+    }
+
+    @RepeatedIfExceptionsTest(repeats = 3)
+    public void simpleLogTestWithFailureWithLongId() throws InterruptedException {
+        simpleLogTestWithFailure(false);
+    }
+
+    @RepeatedIfExceptionsTest(repeats = 3)
+    public void simpleLogTestWithFailureWithStringId() throws InterruptedException {
+        simpleLogTestWithFailure(true);
+    }
+
+    // flaky test: https://github.com/JanusGraph/janusgraph/issues/1497
+    @RepeatedIfExceptionsTest(repeats = 3)
+    @Override
+    public void testEdgeTTLTiming() throws Exception {
+        super.testEdgeTTLTiming();
+    }
+
+    // flaky test: https://github.com/JanusGraph/janusgraph/issues/1462
+    @RepeatedIfExceptionsTest(repeats = 3)
+    @Override
+    public void testEdgeTTLWithTransactions() throws Exception {
+        super.testEdgeTTLWithTransactions();
+    }
+
+    // flaky test: https://github.com/JanusGraph/janusgraph/issues/1464
+    @RepeatedIfExceptionsTest(repeats = 3)
+    @Override
+    public void testVertexTTLWithCompositeIndex() throws Exception {
+        super.testVertexTTLWithCompositeIndex();
+    }
+
+    // flaky test: https://github.com/JanusGraph/janusgraph/issues/1465
+    @RepeatedIfExceptionsTest(repeats = 3)
+    @Override
+    public void testVertexTTLImplicitKey() throws Exception {
+        super.testVertexTTLImplicitKey();
+    }
+
+    // flaky test: https://github.com/JanusGraph/janusgraph/issues/3142
+    @RepeatedIfExceptionsTest(repeats = 3)
+    @Override
+    public void testReindexingForEdgeIndex() throws ExecutionException, InterruptedException {
+        super.testReindexingForEdgeIndex();
     }
 }

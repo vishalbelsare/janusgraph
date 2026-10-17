@@ -1,0 +1,100 @@
+# Copyright 2023 JanusGraph Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+services:
+  janusgraph:
+    image: janusgraph/janusgraph:latest
+    container_name: jce-janusgraph
+    environment:
+      JANUS_PROPS_TEMPLATE: cql-es
+      janusgraph.storage.hostname: jce-cassandra
+      janusgraph.index.search.hostname: jce-elastic
+    ports:
+      - "8182:8182"
+    networks:
+      - jce-network
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bin/gremlin.sh", "-e", "scripts/remote-connect.groovy"]
+      interval: 10s
+      timeout: 30s
+      retries: 3
+
+  cassandra:
+    image: cassandra:4.0.20
+    container_name: jce-cassandra
+    volumes:
+      - ${JCE_CASSANDRA_DATA:-janusgraph-cassandra-data}:/var/lib/cassandra
+    ports:
+      - "9042:9042"
+      - "9160:9160"
+    networks:
+      - jce-network
+    healthcheck:
+      test: ["CMD", "nodetool", "status"]
+      interval: 10s
+      timeout: 30s
+      retries: 10
+
+  elasticsearch:
+    image: elasticsearch:8.19.15
+    container_name: jce-elastic
+    volumes:
+      - ${JCE_ELASTICSEARCH_DATA:-janusgraph-elasticsearch-data}:/usr/share/elasticsearch/data/
+    environment:
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - "http.host=0.0.0.0"
+      - "network.host=0.0.0.0"
+      - "transport.host=127.0.0.1"
+      - "cluster.name=docker-cluster"
+      - "xpack.security.enabled=false"
+      - "discovery.type=single-node"
+    ports:
+      - "9200:9200"
+    networks:
+      - jce-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200"]
+      interval: 10s
+      timeout: 30s
+      retries: 6
+
+  janusgraph-visualizer:
+    image: janusgraph/janusgraph-visualizer:1.0.4
+    container_name: jce-visualizer
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+    networks:
+      - jce-network
+    depends_on:
+      janusgraph:
+        condition: service_healthy
+    environment:
+      - GREMLIN_HOST=jce-janusgraph
+    healthcheck:
+      test: ["CMD", "nc", "-v", "-w", "2", "localhost", "3001"]
+      interval: 10s
+      retries: 3
+
+networks:
+  jce-network:
+volumes:
+  janusgraph-default-data:
+  janusgraph-cassandra-data:
+  janusgraph-elasticsearch-data:

@@ -17,13 +17,21 @@ package org.janusgraph.graphdb.configuration;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicate;
 import org.apache.commons.lang3.ClassUtils;
+import org.apache.tinkerpop.gremlin.groovy.jsr223.GremlinGroovyScriptEngine;
+import org.apache.tinkerpop.gremlin.jsr223.GremlinLangScriptEngine;
+import org.apache.tinkerpop.gremlin.jsr223.GremlinScriptEngine;
+import org.apache.tinkerpop.gremlin.process.traversal.strategy.optimization.LazyBarrierStrategy;
 import org.apache.tinkerpop.gremlin.structure.Graph;
+import org.janusgraph.core.JanusGraphConfigurationException;
 import org.janusgraph.core.JanusGraphFactory;
 import org.janusgraph.core.schema.DefaultSchemaMaker;
 import org.janusgraph.core.schema.DisableDefaultSchemaMaker;
 import org.janusgraph.core.schema.IgnorePropertySchemaMaker;
 import org.janusgraph.core.schema.JanusGraphDefaultSchemaMaker;
+import org.janusgraph.core.schema.SchemaInitStrategy;
+import org.janusgraph.core.schema.SchemaInitType;
 import org.janusgraph.core.schema.Tp3DefaultSchemaMaker;
+import org.janusgraph.core.schema.IndicesActivationType;
 import org.janusgraph.diskstorage.Backend;
 import org.janusgraph.diskstorage.StandardIndexProvider;
 import org.janusgraph.diskstorage.StandardStoreManager;
@@ -53,6 +61,11 @@ import org.janusgraph.graphdb.query.index.ApproximateIndexSelectionStrategy;
 import org.janusgraph.graphdb.query.index.BruteForceIndexSelectionStrategy;
 import org.janusgraph.graphdb.query.index.IndexSelectionStrategy;
 import org.janusgraph.graphdb.query.index.ThresholdBasedIndexSelectionStrategy;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryDropStepStrategyMode;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryLabelStepStrategyMode;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryPropertiesStrategyMode;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryStrategyRepeatStepMode;
+import org.janusgraph.graphdb.tinkerpop.optimize.strategy.MultiQueryHasStepStrategyMode;
 import org.janusgraph.graphdb.transaction.StandardTransactionBuilder;
 import org.janusgraph.graphdb.types.system.ImplicitKey;
 import org.janusgraph.util.StringUtils;
@@ -67,10 +80,15 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.EnumMap;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
 import javax.management.MBeanServerFactory;
 
@@ -99,10 +117,19 @@ public class GraphDatabaseConfiguration {
             "General configuration options");
 
     public static final ConfigOption<Boolean> ALLOW_SETTING_VERTEX_ID = new ConfigOption<>(GRAPH_NS,"set-vertex-id",
-            "Whether user provided vertex ids should be enabled and JanusGraph's automatic id allocation be disabled. " +
+            "Whether user provided vertex ids should be enabled and JanusGraph's automatic vertex id allocation be disabled. " +
             "Useful when operating JanusGraph in concert with another storage system that assigns long ids but disables some " +
-            "of JanusGraph's advanced features which can lead to inconsistent data. EXPERT FEATURE - USE WITH GREAT CARE.",
-            ConfigOption.Type.FIXED, false);
+            "of JanusGraph's advanced features which can lead to inconsistent data. For example, users must ensure the vertex ids " +
+            "are unique to avoid duplication. Must use `graph.getIDManager().toVertexId(long)` to convert your id first. Once " +
+            "this is enabled, you have to provide vertex id when creating new vertices. EXPERT FEATURE - USE WITH GREAT CARE.",
+            ConfigOption.Type.GLOBAL_OFFLINE, false);
+
+    public static final ConfigOption<Boolean> ALLOW_CUSTOM_VERTEX_ID_TYPES = new ConfigOption<>(GRAPH_NS, "allow-custom-vid-types",
+            "Whether non long-type vertex ids are allowed. " + ALLOW_SETTING_VERTEX_ID.getName() +
+            " must be enabled in order to use this functionality. Currently, only string-type is supported. This does not " +
+            "prevent users from using custom ids with long type. If your storage backend does not support unordered " +
+            "scan, then some scan operations will be disabled. You cannot use this feature with Berkeley DB. EXPERT FEATURE - USE WITH GREAT CARE.",
+            ConfigOption.Type.GLOBAL_OFFLINE, false);
 
     public static final ConfigOption<String> GRAPH_NAME = new ConfigOption<>(GRAPH_NS, "graphname",
             "This config option is an optional configuration setting that you may supply when opening a graph. " +
@@ -154,7 +181,7 @@ public class GraphDatabaseConfiguration {
 
     public static final ConfigOption<Boolean> REPLACE_INSTANCE_IF_EXISTS = new ConfigOption<>(GRAPH_NS, "replace-instance-if-exists",
             "If a JanusGraph instance with the same instance identifier already exists, the usage of this " +
-            "configuration option results in the opening of this graph anwyay.",
+            "configuration option results in the opening of this graph anyway.",
             ConfigOption.Type.LOCAL, Boolean.class, false);
 
     public static final ConfigOption<String> TITAN_COMPATIBLE_VERSIONS = new ConfigOption<>(GRAPH_NS,"titan-version",
@@ -197,6 +224,18 @@ public class GraphDatabaseConfiguration {
             "How the graph computer should return the computed results. 'persist' for writing them into the graph, " +
                     "'localtx' for writing them into the local transaction, or 'none' (default)", ConfigOption.Type.MASKABLE, "none");
 
+    public static final ConfigOption<Integer> COMPUTER_JOB_POOL_SIZE = new ConfigOption<>(COMPUTER_NS,"job-pool-size",
+            "The number of threads which run the jobs of the graph's computers, a job on each, while further jobs wait. " +
+                "If not set, which is recommended, as many as the JVM's common pool has threads (by default the number of " +
+                "processors less one, at least one), or a thread per job where that is a single thread. Set it to run " +
+                "fewer of the graph's jobs at once, or more.",
+            ConfigOption.Type.MASKABLE, Integer.class, ConfigOption.positiveInt());
+
+    public static final ConfigOption<Duration> COMPUTER_JOB_KEEP_ALIVE_TIME = new ConfigOption<>(COMPUTER_NS,"job-keep-alive-time",
+            "How long a thread which runs the jobs of the graph's computers waits for the next job before it ends. " +
+                "The default is recommended.",
+            ConfigOption.Type.MASKABLE, Duration.class, Duration.ofMinutes(1), d -> d != null && d.toMillis() > 0);
+
 
     // ################ Transaction #######################
     // ################################################
@@ -209,10 +248,26 @@ public class GraphDatabaseConfiguration {
             ConfigOption.Type.GLOBAL, false);
 
     public static final ConfigOption<Duration> MAX_COMMIT_TIME = new ConfigOption<>(TRANSACTION_NS,"max-commit-time",
-            "Maximum time (in ms) that a transaction might take to commit against all backends. This is used by the distributed " +
-                    "write-ahead log processing to determine when a transaction can be considered failed (i.e. after this time has elapsed)." +
-                    "Must be longer than the maximum allowed write time.",
-            ConfigOption.Type.GLOBAL, Duration.ofSeconds(10));
+            "Maximum time that a transaction might take to commit against all backends; a value without a unit is in " +
+                    "milliseconds. This is used by the distributed " +
+                    "write-ahead log processing to determine when a transaction can be considered failed. Transaction recovery " +
+                    "considers a transaction failed once it has read the transaction log up to this long past the first " +
+                    "of the transaction's log entries it read, however long reading the log takes. A value shorter than the commit " +
+                    "really takes lets recovery restore the index documents of a transaction which is still committing, underneath " +
+                    "the index writes that commit has yet to make. A commit reattempts its storage write and then each of its index " +
+                    "writes for up to storage.write-time in turn, so this must exceed storage.write-time multiplied by one plus the " +
+                    "number of configured index backends; a warning is logged at graph open when transaction logging is enabled and " +
+                    "it does not. That is only the minimum: the time a commit spends preparing its writes counts as well; a " +
+                    "transaction with more than storage.buffer-size mutations writes storage in several chunks, each reattempted " +
+                    "for up to storage.write-time; on a storage backend without transaction isolation, a transaction which " +
+                    "creates schema elements first commits them in a storage write of their own, reattempted the same way; and " +
+                    "the last attempt of each write can run past its write time. So leave headroom for the largest transactions. " +
+                    "A transaction which writes a user log (TransactionBuilder.logIdentifier) is exposed for longer: until " +
+                    "recovery has read its final status, an expiry makes recovery send its user-log event again, so its " +
+                    "user-log write (up to log.user.max-write-time when log.user.send-delay is 0) counts as well. The final " +
+                    "status's own write does not: its log entry is timed from before the write, and has to become visible " +
+                    "within log.tx.read-lag-time like every entry.",
+            ConfigOption.Type.GLOBAL, Duration.ofSeconds(300));
 
 
     public static final ConfigNamespace TRANSACTION_RECOVERY_NS = new ConfigNamespace(TRANSACTION_NS,"recovery",
@@ -221,6 +276,18 @@ public class GraphDatabaseConfiguration {
     public static final ConfigOption<Boolean> VERBOSE_TX_RECOVERY = new ConfigOption<>(TRANSACTION_RECOVERY_NS,"verbose",
             "Whether the transaction recovery system should print recovered transactions and other activity to standard output",
             ConfigOption.Type.MASKABLE, false);
+
+    public static final ConfigOption<Integer> TX_RECOVERY_REPAIR_POOL_SIZE = new ConfigOption<>(TRANSACTION_RECOVERY_NS,"repair-pool-size",
+            "The number of threads which repair the transactions the recovery finds incomplete: a repair reads the " +
+                "storage backend and writes the index backends and the user log. If not set, which is recommended, as many " +
+                "as the JVM's common pool has threads (by default the number of processors less one, at least one). As the " +
+                "repairs mostly wait for I/O, more threads catch up faster with many incomplete transactions.",
+            ConfigOption.Type.MASKABLE, Integer.class, ConfigOption.positiveInt());
+
+    public static final ConfigOption<Duration> TX_RECOVERY_REPAIR_KEEP_ALIVE_TIME = new ConfigOption<>(TRANSACTION_RECOVERY_NS,"repair-keep-alive-time",
+            "How long a thread which repairs incomplete transactions waits for the next repair before it ends. " +
+                "The default is recommended.",
+            ConfigOption.Type.MASKABLE, Duration.class, Duration.ofMinutes(1), d -> d != null && d.toMillis() > 0);
 
     // ################ Query Processing #######################
     // ################################################
@@ -236,16 +303,22 @@ public class GraphDatabaseConfiguration {
 
 
     public static final ConfigOption<Boolean> FORCE_INDEX_USAGE = new ConfigOption<>(QUERY_NS,"force-index",
-            "Whether JanusGraph should throw an exception if a graph query cannot be answered using an index. Doing so" +
+            "Whether JanusGraph should throw an exception if a graph query cannot be answered using an index. Doing so " +
                     "limits the functionality of JanusGraph's graph queries but ensures that slow graph queries are avoided " +
                     "on large graphs. Recommended for production use of JanusGraph.",
             ConfigOption.Type.MASKABLE, false);
 
-
     public static final ConfigOption<Boolean> PROPERTY_PREFETCHING = new ConfigOption<>(QUERY_NS,"fast-property",
             "Whether to pre-fetch all properties on first singular vertex property access. This can eliminate backend calls on subsequent " +
                     "property access for the same vertex at the expense of retrieving all properties at once. This can be " +
-                    "expensive for vertices with many properties",
+                    "expensive for vertices with many properties. <br>" +
+                    "This setting is applicable to direct vertex properties access " +
+                    "(like `vertex.properties(\"foo\")` but not to `vertex.properties(\"foo\",\"bar\")` because the latter case " +
+                    "is not a singular property access). <br>" +
+                    "This setting is not applicable to the next Gremlin steps: `valueMap`, `propertyMap`, `elementMap`, `properties`, `values` " +
+                    "(configuration option `query.batch.properties-mode` should be used to configure their behavior).<br>" +
+                    "When `true` this setting overwrites `query.batch.has-step-mode` to `"+MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName()+"` unless `"+
+                    MultiQueryHasStepStrategyMode.NONE.getConfigName()+"` mode is used.",
             ConfigOption.Type.MASKABLE, true);
 
     public static final ConfigOption<Boolean> ADJUST_LIMIT = new ConfigOption<>(QUERY_NS,"smart-limit",
@@ -259,18 +332,6 @@ public class GraphDatabaseConfiguration {
                     "usually a large number. Default value is Integer.MAX_VALUE which effectively disables this behavior. " +
                     "This option does not take effect when smart-limit is enabled.",
             ConfigOption.Type.MASKABLE, Integer.MAX_VALUE);
-
-    public static final ConfigOption<Boolean> USE_MULTIQUERY = new ConfigOption<>(QUERY_NS,"batch",
-            "Whether traversal queries should be batched when executed against the storage backend. This can lead to significant " +
-                    "performance improvement if there is a non-trivial latency to the backend.",
-            ConfigOption.Type.MASKABLE, false);
-
-    public static final ConfigOption<Boolean> LIMIT_BATCH_SIZE = new ConfigOption<>(QUERY_NS,"limit-batch-size",
-            "Configure a maximum batch size for queries against the storage backend. This can be used to ensure " +
-                    "responsiveness if batches tend to grow very large. The used batch size is equivalent to the " +
-                    "barrier size of a preceding barrier() step. If a step has no preceding barrier(), the default barrier of TinkerPop " +
-                    "will be inserted. This option only takes effect if query.batch is enabled.",
-            ConfigOption.Type.MASKABLE, false);
 
     public static final ConfigOption<String> INDEX_SELECT_STRATEGY = new ConfigOption<>(QUERY_NS, "index-select-strategy",
             String.format("Name of the index selection strategy or full class name. Following shorthands can be used: <br>" +
@@ -286,11 +347,117 @@ public class GraphDatabaseConfiguration {
                 "will give the optimizer a chance to find more efficient execution plan but also increase the optimization overhead.",
             ConfigOption.Type.MASKABLE, true);
 
-    public static final ConfigOption<Boolean> BATCH_PROPERTY_PREFETCHING = new ConfigOption<>(QUERY_NS,"batch-property-prefetch",
-            "Whether to do a batched pre-fetch of all properties on adjacent vertices against the storage backend prior to evaluating a has condition against those vertices. " +
-                    "Because these vertex properties will be loaded into the transaction-level cache of recently-used vertices when the condition is evaluated this can " +
-                    "lead to significant performance improvement if there are many edges to adjacent vertices and there is a non-trivial latency to the backend.",
-            ConfigOption.Type.MASKABLE, false);
+    // ################ BATCH QUERY CONFIGURATION #######################
+
+    public static final ConfigNamespace QUERY_BATCH_NS = new ConfigNamespace(QUERY_NS,"batch",
+        "Configuration options to configure batch queries optimization behavior");
+
+    public static final ConfigOption<Boolean> USE_MULTIQUERY = new ConfigOption<>(QUERY_BATCH_NS,"enabled",
+        "Whether traversal queries should be batched when executed against the storage backend. This can lead to significant " +
+            "performance improvement if there is a non-trivial latency to the backend. It also lets a composite " +
+            "index lookup of several values, such as `has(key, within(values))`, read their index rows together, and " +
+            "a commit read the labels which the index updates of its vertices check together, on a storage backend " +
+            "with multi-key queries. It is the default of each transaction's own multi-query setting, which " +
+            "`TransactionBuilder.multiQuery(boolean)` can change for a transaction; where that setting is `false`, " +
+            "all other configuration options under `" + QUERY_BATCH_NS.toStringWithoutRoot() + "` namespace are " +
+            "ignored.",
+        ConfigOption.Type.MASKABLE, true);
+
+    public static final ConfigOption<Boolean> LIMITED_BATCH = new ConfigOption<>(QUERY_BATCH_NS,"limited",
+        "Configure a maximum batch size for queries against the storage backend. This can be used to ensure " +
+            "responsiveness if batches tend to grow very large. The used batch size is equivalent to the " +
+            "barrier size of a preceding `barrier()` step. If a step has no preceding `barrier()`, the default barrier of TinkerPop " +
+            "will be inserted. This option only takes effect if `"+USE_MULTIQUERY.toStringWithoutRoot()+"` is `true`.",
+        ConfigOption.Type.MASKABLE, true);
+
+    public static final ConfigOption<Integer> LIMITED_BATCH_SIZE = new ConfigOption<>(QUERY_BATCH_NS,"limited-size",
+        "Default batch size (barrier() step size) for queries. This size is applied only for cases where `"
+            + LazyBarrierStrategy.class.getSimpleName()+"` strategy didn't apply `barrier` step and where user didn't apply " +
+            "barrier step either. This option is used only when `"+LIMITED_BATCH.toStringWithoutRoot()+"` is `true`. " +
+            "Notice, value `"+Integer.MAX_VALUE+"` is considered to be unlimited.",
+        ConfigOption.Type.MASKABLE, 2500);
+
+    public static final ConfigOption<Integer> MAX_KEYS_PER_READ = new ConfigOption<>(QUERY_BATCH_NS,"max-keys-per-read",
+        "The most keys which one read of several keys at once asks the storage backend for, where JanusGraph splits " +
+            "such a read on its own: a composite index lookup of several values, such as `has(key, within(values))`, " +
+            "reading their index rows, and a commit reading the labels which the index updates of its vertices " +
+            "check. A read which fails temporarily is reattempted whole, and its results are held all at once, so " +
+            "a smaller value makes smaller reads, and more of them. The default is the recommended value. Used only " +
+            "where reads are batched (`" + USE_MULTIQUERY.toStringWithoutRoot() + "`, unless a transaction sets its " +
+            "own multi-query setting), on a storage backend with multi-key queries.",
+        ConfigOption.Type.MASKABLE, 1000, ConfigOption.positiveInt());
+
+    public static final ConfigOption<String> REPEAT_STEP_BATCH_MODE = new ConfigOption<>(QUERY_BATCH_NS,"repeat-step-mode",
+        String.format("Batch mode for `repeat` step. Used only when "+USE_MULTIQUERY.toStringWithoutRoot()+" is `true`.<br>" +
+                "These modes are controlling how the child steps with batch support are behaving if they are placed to the start " +
+                "of the `repeat`, `emit`, or `until` traversals.<br>" +
+                "Supported modes:<br>" +
+                "- `%s` - Child start steps are receiving vertices for batching from the closest `repeat` step parent only.<br>" +
+                "- `%s` - Child start steps are receiving vertices for batching from all `repeat` step parents.<br>" +
+                "- `%s` - Child start steps are receiving vertices for batching from the closest `repeat` step parent (both for the parent start and for next iterations) " +
+                "and also from all `repeat` step parents for the parent start.",
+            MultiQueryStrategyRepeatStepMode.CLOSEST_REPEAT_PARENT.getConfigName(),
+            MultiQueryStrategyRepeatStepMode.ALL_REPEAT_PARENTS.getConfigName(),
+            MultiQueryStrategyRepeatStepMode.STARTS_ONLY_OF_ALL_REPEAT_PARENTS.getConfigName()),
+        ConfigOption.Type.MASKABLE, MultiQueryStrategyRepeatStepMode.ALL_REPEAT_PARENTS.getConfigName());
+
+    public static final ConfigOption<String> HAS_STEP_BATCH_MODE = new ConfigOption<>(QUERY_BATCH_NS,"has-step-mode",
+        String.format("Properties pre-fetching mode for `has` step. Used only when `"+USE_MULTIQUERY.toStringWithoutRoot()+"` is `true`.<br>" +
+                "Supported modes:<br>" +
+                "- `%s` - Pre-fetch all vertex properties on any property access (fetches all vertex properties in a single slice query)<br>" +
+                "- `%s` - Pre-fetch necessary vertex properties for the whole chain of foldable `has` steps (uses a separate slice query per each required property)<br>" +
+                "- `%s` - Prefetch the same properties as with `%s` mode, but also prefetch<br>" +
+                "properties which may be needed in the next properties access step like `values`, `properties,` `valueMap`, `elementMap`, or `propertyMap`.<br>" +
+                "In case the next step is not one of those properties access steps then this mode behaves same as `%s`.<br>" +
+                "In case the next step is one of the properties access steps with limited scope of properties, those properties will be<br>" +
+                "pre-fetched together in the same multi-query.<br>" +
+                "In case the next step is one of the properties access steps with unspecified scope of property keys then this mode<br>" +
+                "behaves same as `%s`.<br>"+
+                "- `%s` - Prefetch the same properties as with `%s`, but in case the next step is not<br>" +
+                "`values`, `properties,` `valueMap`, `elementMap`, or `propertyMap` then acts like `%s`.<br>"+
+                "- `%s` - Skips `has` step batch properties pre-fetch optimization.<br>",
+            MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName(),
+            MultiQueryHasStepStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName(),
+            MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName(),
+            MultiQueryHasStepStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName(),
+            MultiQueryHasStepStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName(),
+            MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName(),
+            MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES_OR_ALL.getConfigName(),
+            MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName(),
+            MultiQueryHasStepStrategyMode.ALL_PROPERTIES.getConfigName(),
+            MultiQueryHasStepStrategyMode.NONE.getConfigName()),
+        ConfigOption.Type.MASKABLE, MultiQueryHasStepStrategyMode.REQUIRED_AND_NEXT_PROPERTIES.getConfigName());
+
+    public static final ConfigOption<String> PROPERTIES_BATCH_MODE = new ConfigOption<>(QUERY_BATCH_NS,"properties-mode",
+        String.format("Properties pre-fetching mode for `values`, `properties`, `valueMap`, `propertyMap`, `elementMap` steps. Used only when `"+USE_MULTIQUERY.toStringWithoutRoot()+"` is `true`.<br>" +
+                "Supported modes:<br>" +
+                "- `%s` - Pre-fetch all vertex properties on non-singular property access (fetches all vertex properties in a single slice query). " +
+                "On single property access this mode behaves the same as `%s` mode.<br>" +
+                "- `%s` - Pre-fetch necessary vertex properties only (uses a separate slice query per each required property)<br>" +
+                "- `%s` - Skips vertex properties pre-fetching optimization.<br>",
+            MultiQueryPropertiesStrategyMode.ALL_PROPERTIES.getConfigName(),
+            MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName(),
+            MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName(),
+            MultiQueryPropertiesStrategyMode.NONE.getConfigName()),
+        ConfigOption.Type.MASKABLE, MultiQueryPropertiesStrategyMode.REQUIRED_PROPERTIES_ONLY.getConfigName());
+
+    public static final ConfigOption<String> LABEL_STEP_BATCH_MODE = new ConfigOption<>(QUERY_BATCH_NS,"label-step-mode",
+        String.format("Labels pre-fetching mode for `label()` step. Used only when `"+USE_MULTIQUERY.toStringWithoutRoot()+"` is `true`.<br>" +
+                "Supported modes:<br>" +
+                "- `%s` - Pre-fetch labels for all vertices in a batch.<br>" +
+                "- `%s` - Skips vertex labels pre-fetching optimization.<br>",
+            MultiQueryLabelStepStrategyMode.ALL.getConfigName(),
+            MultiQueryLabelStepStrategyMode.NONE.getConfigName()),
+        ConfigOption.Type.MASKABLE, MultiQueryLabelStepStrategyMode.ALL.getConfigName());
+
+    public static final ConfigOption<String> DROP_STEP_BATCH_MODE = new ConfigOption<>(QUERY_BATCH_NS,"drop-step-mode",
+        String.format("Batching mode for `drop()` step. Used only when `"+USE_MULTIQUERY.toStringWithoutRoot()+"` is `true`.<br>" +
+                "Supported modes:<br>" +
+                "- `%s` - Drops all vertices in a batch.<br>" +
+                "- `%s` - Skips drop batching optimization.<br>",
+            MultiQueryDropStepStrategyMode.ALL.getConfigName(),
+            MultiQueryDropStepStrategyMode.NONE.getConfigName()),
+        ConfigOption.Type.MASKABLE, MultiQueryDropStepStrategyMode.ALL.getConfigName());
 
     // ################ SCHEMA #######################
     // ################################################
@@ -342,6 +509,90 @@ public class GraphDatabaseConfiguration {
             "If 'schema.constraints' is set to 'true' and 'schema.default' is not set 'none', schema constraints are automatically created "+
             "as described in the config option 'schema.default'. If 'schema.constraints' is set to 'false' which is the default, then no schema constraints are applied.",
             ConfigOption.Type.GLOBAL_OFFLINE, false);
+
+    public static final ConfigNamespace SCHEMA_REINDEX = new ConfigNamespace(SCHEMA_NS, "reindex",
+        "Configuration options for schema reindex operations.");
+
+    public static final ConfigOption<Boolean> MIXED_INDEX_REINDEX_BATCH_ENABLED = new ConfigOption<>(SCHEMA_REINDEX,
+        "mixed-index-batch-enabled",
+        "Whether mixed-index reindex jobs should batch document restore calls independently from the storage page size.",
+        ConfigOption.Type.MASKABLE, true);
+
+    public static final ConfigOption<Integer> MIXED_INDEX_REINDEX_BATCH_SIZE = new ConfigOption<>(SCHEMA_REINDEX,
+        "mixed-index-batch-size",
+        "Number of graph elements a mixed-index reindex worker should process before flushing restored documents " +
+            "to the index backend. Larger values can improve Elasticsearch bulk restore throughput at the cost " +
+            "of additional worker memory.",
+        ConfigOption.Type.MASKABLE, Integer.class, 1000, size -> size > 0);
+
+    public static final ConfigNamespace SCHEMA_INIT = new ConfigNamespace(SCHEMA_NS,"init",
+        "Configuration options for schema initialization on startup.");
+
+    public static final ConfigOption<String> SCHEMA_INIT_STRATEGY = new ConfigOption<>(SCHEMA_INIT,"strategy",
+        String.format("Specifies the strategy for schema initialization before starting JanusGraph. You must provide the full " +
+                "class path of a class that implements the `%s` interface and has parameterless constructor.<br>" +
+                "The following shortcuts are also available:<br>" +
+                "- `%s` - Skips schema initialization.<br>" +
+                "- `%s` - Schema initialization via provided JSON file or JSON string.<br>",
+            SchemaInitStrategy.class.getSimpleName(),
+            SchemaInitType.NONE.getConfigName(),
+            SchemaInitType.JSON.getConfigName()),
+        ConfigOption.Type.LOCAL, SchemaInitType.NONE.getConfigName());
+
+    public static final ConfigOption<Boolean> SCHEMA_DROP_BEFORE_INIT = new ConfigOption<>(SCHEMA_INIT,"drop-before-startup",
+        String.format("Drops the entire schema with graph data before JanusGraph schema initialization. " +
+            "Note that the schema will be dropped regardless of the selected initialization strategy, " +
+            "including when `%s` is set to `%s`.",
+            SCHEMA_INIT_STRATEGY.toStringWithoutRoot(),
+            SchemaInitType.NONE.getConfigName()),
+        ConfigOption.Type.LOCAL, false);
+
+    public static final ConfigNamespace SCHEMA_INIT_JSON = new ConfigNamespace(SCHEMA_INIT,"json",
+        "Options for JSON schema initialization strategy.");
+
+    public static final ConfigOption<String> SCHEMA_INIT_JSON_FILE = new ConfigOption<>(SCHEMA_INIT_JSON,"file",
+        "File path to JSON formated schema definition.", ConfigOption.Type.LOCAL, String.class);
+
+    public static final ConfigOption<String> SCHEMA_INIT_JSON_STR = new ConfigOption<>(SCHEMA_INIT_JSON,"string",
+        "JSON formated schema definition string. This option takes precedence if both `file` and `string` are used.",
+        ConfigOption.Type.LOCAL, String.class);
+
+    public static final ConfigOption<Boolean> SCHEMA_INIT_JSON_SKIP_ELEMENTS = new ConfigOption<>(SCHEMA_INIT_JSON,"skip-elements",
+        "Skip creation of VertexLabel, EdgeLabel, and PropertyKey.",
+        ConfigOption.Type.LOCAL, false);
+
+    public static final ConfigOption<Boolean> SCHEMA_INIT_JSON_SKIP_INDICES = new ConfigOption<>(SCHEMA_INIT_JSON,"skip-indices",
+        "Skip creation of indices.",
+        ConfigOption.Type.LOCAL, false);
+
+    public static final ConfigOption<String> SCHEMA_INIT_JSON_INDICES_ACTIVATION_TYPE = new ConfigOption<>(SCHEMA_INIT_JSON,"indices-activation",
+        String.format("Indices activation type:<br>" +
+                "- `%s` - Reindex process will be triggered for any updated index. After this all updated indexes will be enabled.<br>" +
+                "- `%s` - Reindex process will be triggered for any index which is not enabled (including previously created indices). After reindexing all indices will be enabled.<br>" +
+                "- `%s` - Skip reindex process for any updated indexes.<br>" +
+                "- `%s` - Force enable all updated indexes without running any reindex process (previous data may not be available for such indices).<br>" +
+                "- `%s` - Force enable all indexes (including previously created indices) without running any reindex process (previous data may not be available for such indices).<br>",
+            IndicesActivationType.REINDEX_AND_ENABLE_UPDATED_ONLY.getConfigName(),
+            IndicesActivationType.REINDEX_AND_ENABLE_NON_ENABLED.getConfigName(),
+            IndicesActivationType.SKIP_ACTIVATION.getConfigName(),
+            IndicesActivationType.FORCE_ENABLE_UPDATED_ONLY.getConfigName(),
+            IndicesActivationType.FORCE_ENABLE_NON_ENABLED.getConfigName()
+        ),
+        ConfigOption.Type.LOCAL, IndicesActivationType.REINDEX_AND_ENABLE_NON_ENABLED.getConfigName());
+
+    public static final ConfigOption<Boolean> SCHEMA_INIT_JSON_FORCE_CLOSE_OTHER_INSTANCES = new ConfigOption<>(SCHEMA_INIT_JSON,"force-close-other-instances",
+        String.format("Force closes other JanusGraph instances before schema initialization, regardless if they are active or not. " +
+            "This is a dangerous operation. This option exists to help people initialize schema who struggle with zombie JanusGraph instances. " +
+            "It's not recommended to be used unless you know what you are doing. Instead of this parameter, " +
+            "it's recommended to check `%s` and `%s` options to not create zombie instances in the cluster.",
+                UNIQUE_INSTANCE_ID.toStringWithoutRoot(),
+                REPLACE_INSTANCE_IF_EXISTS.toStringWithoutRoot()
+            ),
+        ConfigOption.Type.LOCAL, false);
+
+    public static final ConfigOption<Long> SCHEMA_INIT_JSON_AWAIT_INDEX_STATUS_TIMEOUT = new ConfigOption<>(SCHEMA_INIT_JSON,"await-index-status-timeout",
+        "Timeout for awaiting index status operation defined in milliseconds. If the status await timeouts the exception will be thrown during schema initialization process.",
+        ConfigOption.Type.LOCAL, TimeUnit.MINUTES.toMillis(3));
 
     // ################ CACHE #######################
     // ################################################
@@ -488,6 +739,13 @@ public class GraphDatabaseConfiguration {
             "Whether to enable batch loading into the storage backend",
             ConfigOption.Type.LOCAL, false);
 
+    public static final ConfigOption<Boolean> DROP_WHOLE_ROW_ON_VERTEX_REMOVAL = new ConfigOption<>(STORAGE_NS,"drop-whole-row-on-vertex-removal",
+            "When a vertex is removed, delete its entire storage row in a single operation (e.g. a Cassandra " +
+            "partition-level delete producing one tombstone) instead of deleting each edge/property column " +
+            "individually. This greatly reduces tombstone pressure when removing super-nodes. Only takes effect " +
+            "on storage backends that support optimized whole-row deletion; ignored otherwise.",
+            ConfigOption.Type.MASKABLE, true);
+
     /**
      * Enables transactions on storage backends that support them
      */
@@ -510,13 +768,25 @@ public class GraphDatabaseConfiguration {
             "Size of the batch in which mutations are persisted",
             ConfigOption.Type.MASKABLE, 1024, ConfigOption.positiveInt());
 
+    /**
+     * Number of mutations in a transaction after which use parallel processing for transaction aggregations.
+     * This might give a boost in transaction commit time.
+     * Default value is 100.
+     */
+    public static final ConfigOption<Integer> NUM_MUTATIONS_PARALLEL_THRESHOLD = new ConfigOption<>(STORAGE_NS,"num-mutations-parallel-threshold",
+        "This parameter determines the minimum number of mutations a transaction must have before parallel processing is applied during aggregation. " +
+            "Leveraging parallel processing can enhance the commit times for transactions involving a large number of mutations. " +
+            "However, it is advisable not to set the threshold too low (e.g., 0 or 1) due to the overhead associated with parallelism synchronization. " +
+            "This overhead is more efficiently offset in the context of larger transactions.",
+    ConfigOption.Type.MASKABLE, 100, ConfigOption.positiveInt());
+
     public static final ConfigOption<Duration> STORAGE_WRITE_WAITTIME = new ConfigOption<>(STORAGE_NS,"write-time",
-            "Maximum time (in ms) to wait for a backend write operation to complete successfully. If a backend write operation" +
+            "Maximum time (in ms) to wait for a backend write operation to complete successfully. If a backend write operation " +
             "fails temporarily, JanusGraph will backoff exponentially and retry the operation until the wait time has been exhausted. ",
             ConfigOption.Type.MASKABLE, Duration.ofSeconds(100L));
 
     public static final ConfigOption<Duration> STORAGE_READ_WAITTIME = new ConfigOption<>(STORAGE_NS,"read-time",
-            "Maximum time (in ms) to wait for a backend read operation to complete successfully. If a backend read operation" +
+            "Maximum time (in ms) to wait for a backend read operation to complete successfully. If a backend read operation " +
                     "fails temporarily, JanusGraph will backoff exponentially and retry the operation until the wait time has been exhausted. ",
             ConfigOption.Type.MASKABLE, Duration.ofSeconds(10L));
 
@@ -539,7 +809,7 @@ public class GraphDatabaseConfiguration {
         "core-pool-size",
         "Core pool size for executor service. May be ignored if custom executor service is used " +
             "(depending on the implementation of the executor service)."+
-            "If not set the core pool size will be equal to number of processors multiplied by "
+            "If not set or set to -1 the core pool size will be equal to number of processors multiplied by "
             +ExecutorServiceBuilder.THREAD_POOL_SIZE_SCALE_FACTOR+".",
         ConfigOption.Type.LOCAL,
         Integer.class);
@@ -575,7 +845,7 @@ public class GraphDatabaseConfiguration {
             +PARALLEL_BACKEND_EXECUTOR_SERVICE_CORE_POOL_SIZE.getName()+"`; `cached` - cached thread pool;",
         ConfigOption.Type.LOCAL,
         String.class,
-        "fixed");
+        ExecutorServiceBuilder.FIXED_THREAD_POOL_CLASS);
 
     public static final ConfigOption<Long> PARALLEL_BACKEND_EXECUTOR_SERVICE_MAX_SHUTDOWN_WAIT_TIME = new ConfigOption<>(
         PARALLEL_BACKEND_EXECUTOR_SERVICE,
@@ -640,6 +910,10 @@ public class GraphDatabaseConfiguration {
             "into a series of requests for small chunks/pages of results, where each chunk contains " +
             "up to this many elements.",
             ConfigOption.Type.MASKABLE, 100);
+
+    public static final ConfigOption<Integer> KEYS_SIZE = new ConfigOption<>(STORAGE_NS,"keys-size",
+        "The maximum amount of keys/partitions to retrieve from distributed storage system by JanusGraph in a single request.",
+        ConfigOption.Type.MASKABLE, 100);
 
     public static final ConfigOption<Boolean> DROP_ON_CLEAR = new ConfigOption<>(STORAGE_NS, "drop-on-clear",
             "Whether to drop the graph database (true) or delete rows (false) when clearing storage. " +
@@ -799,6 +1073,20 @@ public class GraphDatabaseConfiguration {
             "This helps avoid transaction commits waiting on ID reservation even if the block size is relatively small.",
             ConfigOption.Type.MASKABLE, 0.3);
 
+    public static final ConfigOption<Integer> IDS_RENEW_POOL_SIZE = new ConfigOption<>(IDS_NS,"renew-pool-size",
+            "The number of threads which reserve new ID blocks for the instance's ID pools, each pool one block at a " +
+                "time. If not set, which is recommended, as many as the instance can have pools: three for each partition " +
+                "of cluster.max-partitions (vertices, vertices of unmodifiable labels and relations), one for schema ids " +
+                "and one for partitioned vertices, so that every pool can reserve a block at once. The threads end after " +
+                "ids.renew-keep-alive-time without a reservation. Set it to bound them, at the price of reservations " +
+                "queueing when more pools need blocks at once.",
+            ConfigOption.Type.MASKABLE, Integer.class, ConfigOption.positiveInt());
+
+    public static final ConfigOption<Duration> IDS_RENEW_KEEP_ALIVE_TIME = new ConfigOption<>(IDS_NS,"renew-keep-alive-time",
+            "How long a thread which reserves ID blocks waits for the next reservation before it ends. " +
+                "The default is recommended.",
+            ConfigOption.Type.MASKABLE, Duration.class, Duration.ofMinutes(1), d -> d != null && d.toMillis() > 0);
+
     // ################ IDAUTHORITY ###################
     // ################################################
 
@@ -916,7 +1204,9 @@ public class GraphDatabaseConfiguration {
 
     public static final ConfigOption<Integer> INDEX_MAX_RESULT_SET_SIZE = new ConfigOption<>(INDEX_NS, "max-result-set-size",
             "Maximum number of results to return if no limit is specified. For index backends that support scrolling, it represents " +
-                    "the number of results in each batch",
+                    "the number of results in each batch, except that Elasticsearch reads a query with a limit " +
+                    "too large for a single request in batches of up to " +
+                    "`index.[X].elasticsearch.limited-result-max-page-size` results, though never smaller than this",
             ConfigOption.Type.MASKABLE, 50);
 
     public static final ConfigOption<Boolean> INDEX_NAME_MAPPING = new ConfigOption<>(INDEX_NS,"map-name",
@@ -925,11 +1215,87 @@ public class GraphDatabaseConfiguration {
                     "and its the developers responsibility to avoid field collisions.",
             ConfigOption.Type.GLOBAL, true);
 
+    public static final ConfigNamespace INDEX_CDC_NS = new ConfigNamespace(INDEX_NS, "cdc",
+            "Configuration options for Change-Data-Capture (CDC) based maintenance of this mixed index backend");
+
+    public static final ConfigOption<Boolean> INDEX_CDC_ENABLED = new ConfigOption<>(INDEX_CDC_NS, "enabled",
+            "Whether this mixed index backend is maintained via the CDC pipeline (the janusgraph-cdc worker consumes " +
+            "Change-Data-Capture events of the graph data and reindexes affected elements) instead of, or in addition " +
+            "to, synchronous index writes during the transaction. Has no effect unless an external CDC pipeline " +
+            "(e.g. Cassandra CDC + Debezium + Kafka) and the janusgraph-cdc worker are running. The stored value can " +
+            "be changed on a running cluster via mgmt.set(\"index.[X].cdc.enabled\", ...), which JanusGraph " +
+            "instances and the CDC worker pick up when they next open the graph, and the local configuration of an " +
+            "instance overrides it. Keep the instances and the CDC worker consistent: every index an instance " +
+            "writes in cdc-only mode must be maintained by the worker.",
+            ConfigOption.Type.MASKABLE, false);
+
+    public static final ConfigOption<Boolean> INDEX_CDC_SYNCHRONOUS = new ConfigOption<>(INDEX_CDC_NS, "synchronous",
+            "Only relevant when index.[X].cdc.enabled is true. When true (default), the mixed index is ALSO written " +
+            "synchronously during the transaction (dual mode: safe and redundant - CDC repairs any synchronous failure). " +
+            "When false, synchronous mixed index additions are skipped (cdc-only mode) and performed by the CDC worker " +
+            "instead, which maximizes efficiency at the cost of the index lagging the graph by the CDC propagation " +
+            "latency; the few deletions of edge and meta-property documents that change events cannot identify are " +
+            "still applied synchronously. Can be changed on a running cluster and overridden by the local " +
+            "configuration of an instance, like index.[X].cdc.enabled.",
+            ConfigOption.Type.MASKABLE, true);
+
+    /**
+     * The names of the index backends with {@link #INDEX_CDC_ENABLED} true. With {@code cdcOnly}, restricted to those
+     * additionally configured with {@link #INDEX_CDC_SYNCHRONOUS} false (cdc-only mode: the synchronous mixed-index
+     * write is skipped). The commit-side skip ({@code StandardJanusGraph}) and the CDC worker's index discovery
+     * ({@code janusgraph-cdc}) are the two halves of one contract -- every cdc-only index must be worker-managed --
+     * so both derive their sets from this one method. They only agree when the JanusGraph instances and the worker
+     * run with the same effective index.[X].cdc.* values: the options are MASKABLE, so the local configuration of a
+     * process can override the stored ones.
+     */
+    public static Set<String> getCdcBackingIndexNames(Configuration configuration, boolean cdcOnly) {
+        final Set<String> result = new HashSet<>();
+        for (String indexName : configuration.getContainedNamespaces(INDEX_NS)) {
+            final Configuration indexConfig = configuration.restrictTo(indexName);
+            if (indexConfig.get(INDEX_CDC_ENABLED)) {
+                if (!cdcOnly || !indexConfig.get(INDEX_CDC_SYNCHRONOUS)) {
+                    result.add(indexName);
+                }
+            } else if (indexConfig.has(INDEX_CDC_SYNCHRONOUS) && !indexConfig.get(INDEX_CDC_SYNCHRONOUS)) {
+                // cdc.synchronous=false without cdc.enabled=true is a dead setting (the whole cdc.* namespace is
+                // inert then), but an operator who set it plausibly believes cdc-only mode is active -- say so
+                // loudly instead of leaving them to discover it from indexing behavior.
+                log.warn("Ignoring index.{}.cdc.synchronous=false because index.{}.cdc.enabled is false: CDC is off "
+                    + "for this backend and its mixed indexes are written synchronously. Set index.{}.cdc.enabled=true "
+                    + "to activate cdc-only mode.", indexName, indexName, indexName);
+            }
+        }
+        return Collections.unmodifiableSet(result);
+    }
+
 
     // ############## Logging System ######################
     // ################################################
 
     public static final ConfigNamespace LOG_NS = new ConfigNamespace(GraphDatabaseConfiguration.ROOT_NS,"log","Configuration options for JanusGraph's logging system",true);
+
+    public static final ConfigOption<Boolean> MANAGEMENT_AUTO_CLOSE_STALE_INSTANCES = new ConfigOption<>(GRAPH_NS,
+            "management-auto-close-stale-instances",
+            "Whether to automatically force-close instances that fail to acknowledge schema changes within the " +
+                "configured timeout (graph.management-ack-timeout). When enabled, unresponsive instances are removed " +
+                "from the registration store so they no longer block schema status transitions.",
+            ConfigOption.Type.MASKABLE, false);
+
+    public static final ConfigOption<Duration> MANAGEMENT_ACK_TIMEOUT = new ConfigOption<>(GRAPH_NS,
+            "management-ack-timeout",
+            "Maximum time to wait for an instance to acknowledge a schema change before treating it as stale. " +
+                "Only effective when graph.management-auto-close-stale-instances is enabled.",
+            ConfigOption.Type.MASKABLE, Duration.ofSeconds(120));
+
+    public static final ConfigOption<Duration> MANAGEMENT_TX_CLOSE_WAIT_TIME = new ConfigOption<>(GRAPH_NS,
+            "management-tx-close-wait-time",
+            "Maximum time an instance waits for the transactions which were open when a schema change reached it to " +
+                "close, before it acknowledges the change. If they are still open by then, it logs a stale transaction " +
+                "alert and doesn't acknowledge the change. The default is recommended; raise it if transactions stay open " +
+                "longer and schema changes should wait for them. With graph.management-auto-close-stale-instances, an " +
+                "instance which hasn't acknowledged a change within graph.management-ack-timeout is force-closed, whether " +
+                "it still waits or has given up, so a value above that timeout gains nothing.",
+            ConfigOption.Type.MASKABLE, Duration.class, Duration.ofSeconds(60), d -> d != null && !d.isNegative());
 
     public static final String MANAGEMENT_LOG = "janusgraph";
     public static final String TRANSACTION_LOG = "tx";
@@ -939,7 +1305,11 @@ public class GraphDatabaseConfiguration {
     public static final Duration TRANSACTION_LOG_DEFAULT_TTL = Duration.ofDays(7);
 
     public static final ConfigOption<String> LOG_BACKEND = new ConfigOption<>(LOG_NS,"backend",
-            "Define the log backed to use",
+            "Define the log backend to use. A reserved shortcut `default` can be used to use graph's storage backend to manage logs. " +
+                "A custom log implementation can be specified by providing " +
+                "full class path which implements " +
+                "`org.janusgraph.diskstorage.log.LogManager` and accepts a single parameter " +
+                "`org.janusgraph.diskstorage.configuration.Configuration` in the public constructor.",
             ConfigOption.Type.GLOBAL_OFFLINE, "default");
 
     public static final ConfigOption<Integer> LOG_NUM_BUCKETS = new ConfigOption<>(LOG_NS,"num-buckets",
@@ -967,8 +1337,8 @@ public class GraphDatabaseConfiguration {
             ConfigOption.Type.MASKABLE, 1, ConfigOption.positiveInt());
 
     public static final ConfigOption<Duration> LOG_STORE_TTL = new ConfigOption<Duration>(LOG_NS,"ttl",
-            "Sets a TTL on all log entries, meaning" +
-                    "that all entries added to this log expire after the configured amount of time. Requires" +
+            "Sets a TTL on all log entries, meaning " +
+                    "that all entries added to this log expire after the configured amount of time. Requires " +
                     "that the log implementation supports TTL.",
             ConfigOption.Type.GLOBAL, Duration.class, sd -> null != sd && !sd.isZero());
 
@@ -1168,6 +1538,48 @@ public class GraphDatabaseConfiguration {
             "A Graphite-specific prefix for reported metrics",
             ConfigOption.Type.MASKABLE, String.class);
 
+    // ################### SCRIPT EVALUATION #######################
+    // #############################################################
+
+    public static final ConfigNamespace SCRIPT_ENGINE_NS = new ConfigNamespace(GRAPH_NS, "script-eval",
+        "Configuration options for gremlin script engine.");
+
+    public static final ConfigOption<Boolean> SCRIPT_EVAL_ENABLED = new ConfigOption<>(SCRIPT_ENGINE_NS, "enabled",
+        "Whether to enable Gremlin script evaluation. If it is enabled, a gremlin script engine will be " +
+            "instantiated together with the JanusGraph instance, with which one can use `eval` method to evaluate a gremlin " +
+            "script in plain string format. This is usually only useful when JanusGraph is used as an embedded Java library.",
+        ConfigOption.Type.MASKABLE, false);
+
+    public static final ConfigOption<String> SCRIPT_EVAL_ENGINE = new ConfigOption<>(SCRIPT_ENGINE_NS, "engine",
+        "Full class name of script engine that implements `GremlinScriptEngine` interface. Following shorthands " +
+            "can be used: <br> " +
+            "- `GremlinLangScriptEngine` (A script engine that only accepts standard gremlin queries. Anything else " +
+            "including lambda function is not accepted. We recommend using this because it's generally safer, but it is " +
+            "not guaranteed that it has no security problem.)" +
+            "- `GremlinGroovyScriptEngine` (A script engine that accepts arbitrary groovy code. This can be dangerous " +
+            "and you should use it at your own risk. See https://tinkerpop.apache.org/docs/current/reference/#script-execution " +
+            "for potential security problems.)",
+        ConfigOption.Type.MASKABLE, "GremlinLangScriptEngine", new Predicate<String>() {
+        @Override
+        public boolean apply(@Nullable String s) {
+            if (s == null) return false;
+            if (PREREGISTERED_SCRIPT_ENGINE.containsKey(s)) return true;
+            try {
+                Class<?> clazz = ClassUtils.getClass(s);
+                return GremlinScriptEngine.class.isAssignableFrom(clazz);
+            } catch (ClassNotFoundException e) {
+                return false;
+            }
+        }
+    });
+
+    private static final Map<String, String> PREREGISTERED_SCRIPT_ENGINE = Collections.unmodifiableMap(
+        new HashMap<String, String>(2) {{
+            put("GremlinLangScriptEngine", GremlinLangScriptEngine.class.getName());
+            put("GremlinGroovyScriptEngine", GremlinGroovyScriptEngine.class.getName());
+        }}
+    );
+
     public static final ConfigNamespace GREMLIN_NS = new ConfigNamespace(ROOT_NS,"gremlin",
             "Gremlin configuration options");
 
@@ -1193,6 +1605,8 @@ public class GraphDatabaseConfiguration {
     private final ModifiableConfiguration localConfiguration;
 
     private boolean readOnly;
+    private boolean evalScript;
+    private GremlinScriptEngine scriptEngine;
     private boolean flushIDs;
     private boolean forceIndexUsage;
     private boolean batchLoading;
@@ -1204,14 +1618,34 @@ public class GraphDatabaseConfiguration {
     private boolean adjustQueryLimit;
     private int hardMaxLimit;
     private Boolean useMultiQuery;
-    private boolean limitBatchSize;
+    private int maxKeysPerRead;
+    private boolean limitedBatch;
+    private int limitedBatchSize;
+    private MultiQueryStrategyRepeatStepMode repeatStepMode;
     private boolean optimizerBackendAccess;
     private IndexSelectionStrategy indexSelectionStrategy;
-    private Boolean batchPropertyPrefetching;
     private boolean allowVertexIdSetting;
+    private boolean allowCustomVertexIdType;
     private boolean logTransactions;
+    private boolean dropWholeRowOnVertexRemoval;
     private String metricsPrefix;
     private String unknownIndexKeyName;
+    private MultiQueryHasStepStrategyMode hasStepStrategyMode;
+    private MultiQueryPropertiesStrategyMode propertiesStrategyMode;
+    private MultiQueryLabelStepStrategyMode labelStepStrategyMode;
+    private MultiQueryDropStepStrategyMode dropStepStrategyMode;
+    private String schemaInitStrategy;
+    private boolean dropSchemaBeforeInit;
+    private String schemaInitJsonFile;
+    private String schemaInitJsonString;
+    private boolean schemaInitJsonSkipElements;
+    private boolean schemaInitJsonSkipIndices;
+    private IndicesActivationType schemaInitJsonIndicesActivationType;
+    private boolean schemaInitJsonForceCloseOtherInstances;
+    private long schemaInitJsonIndexStatusAwaitTimeout;
+
+    //The Metrics reporters which this configuration asks for, with what starts each
+    private final Map<MetricManager.GraphReporter, Runnable> metricsReporters = new EnumMap<>(MetricManager.GraphReporter.class);
 
     private StoreFeatures storeFeatures = null;
 
@@ -1232,6 +1666,14 @@ public class GraphDatabaseConfiguration {
 
     public boolean isReadOnly() {
         return readOnly;
+    }
+
+    public boolean hasScriptEval() {
+        return evalScript;
+    }
+
+    public GremlinScriptEngine getScriptEngine() {
+        return scriptEngine;
     }
 
     public boolean hasFlushIDs() {
@@ -1262,6 +1704,30 @@ public class GraphDatabaseConfiguration {
         return metricsPrefix;
     }
 
+    /**
+     * Starts the Metrics reporters which this configuration asks for, unless reporters of their kinds run already, for
+     * a graph which opens with it. The graph gives back the claims it gets with
+     * {@link MetricManager#releaseGraphReporters(Map)} when it closes, which stops the reporters that graphs started
+     * once no graph which uses them is open.
+     *
+     * @return the graph's claims on the reporters, by their kind
+     */
+    public Map<MetricManager.GraphReporter, Object> startMetricsReporters() {
+        final Map<MetricManager.GraphReporter, Object> claims = new EnumMap<>(MetricManager.GraphReporter.class);
+        try {
+            metricsReporters.forEach((reporter, start) -> {
+                final Object claim = MetricManager.INSTANCE.addGraphReporter(reporter, start);
+                if (claim != null) {
+                    claims.put(reporter, claim);
+                }
+            });
+        } catch (RuntimeException | Error e) {
+            MetricManager.INSTANCE.releaseGraphReporters(claims);
+            throw e;
+        }
+        return claims;
+    }
+
     public DefaultSchemaMaker getDefaultSchemaMaker() {
         return defaultSchemaMaker;
     }
@@ -1272,6 +1738,10 @@ public class GraphDatabaseConfiguration {
 
     public boolean allowVertexIdSetting() {
         return allowVertexIdSetting;
+    }
+
+    public boolean allowCustomVertexIdType() {
+        return allowCustomVertexIdType;
     }
 
     public Duration getMaxCommitTime() {
@@ -1294,8 +1764,20 @@ public class GraphDatabaseConfiguration {
         return useMultiQuery;
     }
 
-    public boolean limitBatchSize() {
-        return limitBatchSize;
+    public boolean limitedBatch() {
+        return limitedBatch;
+    }
+
+    public int limitedBatchSize() {
+        return limitedBatchSize;
+    }
+
+    public int maxKeysPerRead() {
+        return maxKeysPerRead;
+    }
+
+    public MultiQueryStrategyRepeatStepMode repeatStepMode() {
+        return repeatStepMode;
     }
 
     public boolean optimizerBackendAccess() {
@@ -1306,8 +1788,20 @@ public class GraphDatabaseConfiguration {
         return indexSelectionStrategy;
     }
 
-    public boolean batchPropertyPrefetching() {
-        return batchPropertyPrefetching;
+    public MultiQueryHasStepStrategyMode hasStepStrategyMode() {
+        return hasStepStrategyMode;
+    }
+
+    public MultiQueryPropertiesStrategyMode propertiesStrategyMode() {
+        return propertiesStrategyMode;
+    }
+
+    public MultiQueryLabelStepStrategyMode labelStepStrategyMode() {
+        return labelStepStrategyMode;
+    }
+
+    public MultiQueryDropStepStrategyMode dropStepStrategyMode() {
+        return dropStepStrategyMode;
     }
 
     public boolean adjustQueryLimit() {
@@ -1322,8 +1816,96 @@ public class GraphDatabaseConfiguration {
         return unknownIndexKeyName;
     }
 
+    /**
+     * The longest transaction recovery waits for a transaction, about 146 years: half the nanoseconds a long holds.
+     * Its cache times a transaction by the nanoseconds of the log left to read before the wait is over, the wait plus
+     * the transaction's first entry's distance from the read progress, which overflows a long for a longer wait; the
+     * cache caps its own durations at the same value. Recovery waits no longer than this for a longer
+     * {@link #MAX_COMMIT_TIME}.
+     * <p>
+     * This is an internal limit, not a configuration option: it is public only so that the transaction recovery
+     * processor and the check of {@link #MAX_COMMIT_TIME} at graph open share one value.
+     */
+    public static final Duration LONGEST_RECOVERY_WAIT = Duration.ofNanos(Long.MAX_VALUE >>> 1);
+
+    //Transaction recovery treats a transaction as failed once it has read the log up to max-commit-time past the
+    //transaction's first log entry, and restores the index documents of the elements it changed from the storage
+    //backend. While the commit still has index writes to make, those then land on top of documents which already
+    //reflect the transaction. The warning is for a value which cannot outlast even a commit whose storage write is a
+    //single chunk; how much more the largest transactions need depends on their size and on the backends, which are not
+    //known here. A GLOBAL option which was never set explicitly resolves to the code default, so an existing graph
+    //picks a new default up when its instances restart; only an explicitly stored value survives an upgrade.
+    private static void warnIfMaxCommitTimeIsTooShort(Duration maxCommitTime, Duration maxWriteTime, int indexBackends) {
+        final int writes = 1 + indexBackends;
+        final Optional<Duration> minimum = singleChunkCommitBudget(maxWriteTime, indexBackends);
+        if (minimum.isEmpty()) {
+            //No value of max-commit-time can outlast a budget which reaches the longest recovery can wait, so the
+            //remedy is the write time.
+            log.warn("Transaction recovery cannot wait longer than {} for a transaction, but the writes of a commit may "
+                + "keep being reattempted for at least as long: {} ({}) for each of its {} writes, the storage write and "
+                + "{} index backend(s). No {} can outlast that, so transaction recovery can restore the index documents of a "
+                + "transaction which is still committing. Lower {} to a realistic value.", LONGEST_RECOVERY_WAIT,
+                STORAGE_WRITE_WAITTIME.toStringWithoutRoot(), maxWriteTime, writes, indexBackends,
+                MAX_COMMIT_TIME.toStringWithoutRoot(), STORAGE_WRITE_WAITTIME.toStringWithoutRoot());
+        } else if (maxCommitTime.compareTo(minimum.get()) <= 0) {
+            log.warn("{} is {}, which does not exceed the {} for which even a small commit may keep reattempting its "
+                + "writes: {} ({}) for each of its {} writes, the storage write and {} index backend(s). Transaction "
+                + "recovery considers a transaction failed once it has read the transaction log {} past the first "
+                + "of the transaction's entries it read, so it can restore the index documents "
+                + "of a transaction which is still committing, underneath the index writes that commit has yet to make. "
+                + "Set {} to more than {}, with headroom for transactions whose storage write spans several {} chunks, "
+                + "which create schema elements or which write a user log, through the management system, for "
+                + "instance {} followed by mgmt.commit().",
+                MAX_COMMIT_TIME.toStringWithoutRoot(), maxCommitTime, minimum.get(),
+                STORAGE_WRITE_WAITTIME.toStringWithoutRoot(), maxWriteTime, writes, indexBackends,
+                MAX_COMMIT_TIME.toStringWithoutRoot(), MAX_COMMIT_TIME.toStringWithoutRoot(), minimum.get(),
+                BUFFER_SIZE.toStringWithoutRoot(), suggestedManagementSystemCall(maxWriteTime, indexBackends));
+        }
+    }
+
+    //The time for which the writes of a commit whose storage write is a single chunk may be reattempted before it gives
+    //up: the storage write and then one write per index backend, each for up to write-time. It is the least a
+    //max-commit-time has to exceed, not a bound on a commit: the preparation of the writes counts as well, a transaction
+    //with more than storage.buffer-size mutations writes storage in several chunks, each with a write-time of its own,
+    //a storage backend without transaction isolation commits the schema elements a transaction creates in a storage
+    //write of their own before the rest, and the last attempt of each write can run past its write time. Empty when no
+    //max-commit-time which transaction recovery can wait for exceeds it.
+    static Optional<Duration> singleChunkCommitBudget(Duration maxWriteTime, int indexBackends) {
+        try {
+            final Duration budget = maxWriteTime.multipliedBy(1 + indexBackends);
+            return budget.compareTo(LONGEST_RECOVERY_WAIT) < 0 ? Optional.of(budget) : Optional.empty();
+        } catch (ArithmeticException e) {
+            return Optional.empty();
+        }
+    }
+
+    //Whether max-commit-time exceeds that budget. Equality is not enough, since the last attempt of each write can
+    //start just before its write time runs out, and a budget which reaches the longest recovery can wait cannot be
+    //exceeded at all.
+    static boolean outlastsASingleChunkCommit(Duration maxCommitTime, Duration maxWriteTime, int indexBackends) {
+        return singleChunkCommitBudget(maxWriteTime, indexBackends).map(budget -> maxCommitTime.compareTo(budget) > 0).orElse(false);
+    }
+
+    //The management system call the warning suggests, written so that it can be pasted as it is. It sets that budget
+    //and one write time more, the headroom the default leaves over the storage write and one index backend, but no
+    //more than transaction recovery can wait, as an ISO-8601 duration, which any Duration can be written as. The sum
+    //cannot overflow, a budget being shorter than recovery can wait and at least one write time. A placeholder only
+    //when there is no budget, for which the warning suggests no value.
+    static String suggestedManagementSystemCall(Duration maxWriteTime, int indexBackends) {
+        final String value = singleChunkCommitBudget(maxWriteTime, indexBackends)
+            .map(budget -> budget.plus(maxWriteTime))
+            .map(suggested -> suggested.compareTo(LONGEST_RECOVERY_WAIT) < 0 ? suggested : LONGEST_RECOVERY_WAIT)
+            .map(suggested -> "java.time.Duration.parse(\"" + suggested + "\")")
+            .orElse("<duration>");
+        return "mgmt.set(\"" + MAX_COMMIT_TIME.toStringWithoutRoot() + "\", " + value + ")";
+    }
+
     public boolean hasLogTransactions() {
         return logTransactions;
+    }
+
+    public boolean getDropWholeRowOnVertexRemoval() {
+        return dropWholeRowOnVertexRemoval;
     }
 
     public TimestampProvider getTimestampProvider() {
@@ -1395,11 +1977,55 @@ public class GraphDatabaseConfiguration {
     }
 
     public org.apache.commons.configuration2.Configuration getConfigurationAtOpen() {
-        return ReadConfigurationConverter.getInstance().convert(configurationAtOpen);
+        return ReadConfigurationConverter.getInstance().convertToBaseConfiguration(configurationAtOpen);
+    }
+
+    public String getSchemaInitStrategy(){
+        return schemaInitStrategy;
+    }
+
+    public boolean isDropSchemaBeforeInit(){
+        return dropSchemaBeforeInit;
+    }
+
+    public String getSchemaInitJsonFile(){
+        return schemaInitJsonFile;
+    }
+
+    public String getSchemaInitJsonString(){
+        return schemaInitJsonString;
+    }
+
+    public boolean getSchemaInitJsonSkipElements(){
+        return schemaInitJsonSkipElements;
+    }
+
+    public boolean getSchemaInitJsonSkipIndices(){
+        return schemaInitJsonSkipIndices;
+    }
+
+    public IndicesActivationType getSchemaInitJsonIndicesActivationType(){
+        return schemaInitJsonIndicesActivationType;
+    }
+
+    public boolean getSchemaInitJsonForceCloseOtherInstances(){
+        return schemaInitJsonForceCloseOtherInstances;
+    }
+
+    public long getSchemaInitJsonIndexStatusAwaitTimeout(){
+        return schemaInitJsonIndexStatusAwaitTimeout;
     }
 
     private void preLoadConfiguration() {
         readOnly = configuration.get(STORAGE_READONLY);
+        evalScript = configuration.get(SCRIPT_EVAL_ENABLED);
+        if (evalScript) {
+            String scriptEngineName = configuration.get(SCRIPT_EVAL_ENGINE);
+            if (PREREGISTERED_SCRIPT_ENGINE.containsKey(scriptEngineName)) {
+                scriptEngineName = PREREGISTERED_SCRIPT_ENGINE.get(scriptEngineName);
+            }
+            scriptEngine = ConfigurationUtil.instantiate(scriptEngineName);
+        }
         flushIDs = configuration.get(IDS_FLUSH);
         forceIndexUsage = configuration.get(FORCE_INDEX_USAGE);
         batchLoading = configuration.get(STORAGE_BATCH);
@@ -1426,19 +2052,62 @@ public class GraphDatabaseConfiguration {
 
         propertyPrefetching = configuration.get(PROPERTY_PREFETCHING);
         useMultiQuery = configuration.get(USE_MULTIQUERY);
-        limitBatchSize = configuration.get(LIMIT_BATCH_SIZE);
+        limitedBatch = configuration.get(LIMITED_BATCH);
+        limitedBatchSize = configuration.get(LIMITED_BATCH_SIZE);
+        maxKeysPerRead = configuration.get(MAX_KEYS_PER_READ);
+        repeatStepMode = selectExactConfig(REPEAT_STEP_BATCH_MODE, MultiQueryStrategyRepeatStepMode.values());
+        hasStepStrategyMode = selectExactConfig(HAS_STEP_BATCH_MODE, MultiQueryHasStepStrategyMode.values());
+        propertiesStrategyMode = selectExactConfig(PROPERTIES_BATCH_MODE, MultiQueryPropertiesStrategyMode.values());
+        labelStepStrategyMode = selectExactConfig(LABEL_STEP_BATCH_MODE, MultiQueryLabelStepStrategyMode.values());
+        dropStepStrategyMode = selectExactConfig(DROP_STEP_BATCH_MODE, MultiQueryDropStepStrategyMode.values());
+
         indexSelectionStrategy = Backend.getImplementationClass(configuration, configuration.get(INDEX_SELECT_STRATEGY),
             REGISTERED_INDEX_SELECTION_STRATEGIES);
         optimizerBackendAccess = configuration.get(OPTIMIZER_BACKEND_ACCESS);
-        batchPropertyPrefetching = configuration.get(BATCH_PROPERTY_PREFETCHING);
+
         adjustQueryLimit = configuration.get(ADJUST_LIMIT);
         hardMaxLimit = configuration.get(HARD_MAX_LIMIT);
+
         allowVertexIdSetting = configuration.get(ALLOW_SETTING_VERTEX_ID);
+        allowCustomVertexIdType = configuration.get(ALLOW_CUSTOM_VERTEX_ID_TYPES);
+        if (allowCustomVertexIdType && !allowVertexIdSetting) {
+            throw new JanusGraphConfigurationException(String.format("%s is enabled but %s is disabled",
+                ALLOW_CUSTOM_VERTEX_ID_TYPES.getName(), ALLOW_SETTING_VERTEX_ID.getName()));
+        }
+
         logTransactions = configuration.get(SYSTEM_LOG_TRANSACTIONS);
+        if (logTransactions) {
+            //The transaction log's own writes add nothing to the budget of the index documents: the precommit entry is
+            //written before recovery can read it, the primary success is committed together with the storage write,
+            //and the secondary status follows the index writes, after which a restore only rewrites documents which
+            //are right. A transaction which writes a user log is the exception: until recovery has read that status
+            //it would send the user-log event again, so the user-log write counts for it as well; the final status's
+            //own write does not, its entry being timed from before the write. The log identifier is set per
+            //transaction, so the warning cannot take it into account.
+            warnIfMaxCommitTimeIsTooShort(configuration.get(MAX_COMMIT_TIME),
+                configuration.get(STORAGE_WRITE_WAITTIME), configuration.getContainedNamespaces(INDEX_NS).size());
+        }
+        dropWholeRowOnVertexRemoval = configuration.get(DROP_WHOLE_ROW_ON_VERTEX_REMOVAL);
 
         unknownIndexKeyName = configuration.get(IGNORE_UNKNOWN_INDEX_FIELD) ? UNKNOWN_FIELD_NAME : null;
 
+        schemaInitStrategy = configuration.get(SCHEMA_INIT_STRATEGY);
+        dropSchemaBeforeInit = configuration.get(SCHEMA_DROP_BEFORE_INIT);
+        schemaInitJsonFile = configuration.has(SCHEMA_INIT_JSON_FILE) ? configuration.get(SCHEMA_INIT_JSON_FILE) : null;
+        schemaInitJsonString = configuration.has(SCHEMA_INIT_JSON_STR) ? configuration.get(SCHEMA_INIT_JSON_STR) : null;
+        schemaInitJsonSkipElements = configuration.get(SCHEMA_INIT_JSON_SKIP_ELEMENTS);
+        schemaInitJsonSkipIndices = configuration.get(SCHEMA_INIT_JSON_SKIP_INDICES);
+        schemaInitJsonIndicesActivationType = selectExactConfig(SCHEMA_INIT_JSON_INDICES_ACTIVATION_TYPE, IndicesActivationType.values());
+        schemaInitJsonForceCloseOtherInstances = configuration.get(SCHEMA_INIT_JSON_FORCE_CLOSE_OTHER_INSTANCES);
+        schemaInitJsonIndexStatusAwaitTimeout = configuration.get(SCHEMA_INIT_JSON_AWAIT_INDEX_STATUS_TIMEOUT);
+
         configureMetrics();
+    }
+
+    private <T extends ConfigName> T selectExactConfig(ConfigOption<String> configOption, T ... configs){
+        final String configName = configuration.get(configOption);
+        T resultConfig = Arrays.stream(configs).filter(config -> config.getConfigName().equals(configName)).findAny().orElse(null);
+        return Preconditions.checkNotNull(resultConfig, configName+" is not recognized as one of the supported values of `"+configOption.toStringWithoutRoot()+"`");
     }
 
     private void configureMetrics() {
@@ -1461,37 +2130,47 @@ public class GraphDatabaseConfiguration {
 
     private void configureMetricsConsoleReporter() {
         if (configuration.has(METRICS_CONSOLE_INTERVAL)) {
-            MetricManager.INSTANCE.addConsoleReporter(configuration.get(METRICS_CONSOLE_INTERVAL));
+            addMetricsReporter(MetricManager.GraphReporter.CONSOLE,
+                () -> MetricManager.INSTANCE.addConsoleReporter(configuration.get(METRICS_CONSOLE_INTERVAL)));
         }
     }
 
     private void configureMetricsCsvReporter() {
         if (configuration.has(METRICS_CSV_DIR)) {
-            MetricManager.INSTANCE.addCsvReporter(configuration.get(METRICS_CSV_INTERVAL), configuration.get(METRICS_CSV_DIR));
+            addMetricsReporter(MetricManager.GraphReporter.CSV,
+                () -> MetricManager.INSTANCE.addCsvReporter(configuration.get(METRICS_CSV_INTERVAL), configuration.get(METRICS_CSV_DIR)));
         }
     }
 
     private void configureMetricsJmxReporter() {
         if (configuration.get(METRICS_JMX_ENABLED)) {
-            MetricManager.INSTANCE.addJmxReporter(configuration.get(METRICS_JMX_DOMAIN), configuration.get(METRICS_JMX_AGENTID));
+            addMetricsReporter(MetricManager.GraphReporter.JMX,
+                () -> MetricManager.INSTANCE.addJmxReporter(configuration.get(METRICS_JMX_DOMAIN), configuration.get(METRICS_JMX_AGENTID)));
         }
     }
 
     private void configureMetricsSlf4jReporter() {
         if (configuration.has(METRICS_SLF4J_INTERVAL)) {
             // null loggerName is allowed -- that means Metrics will use its internal default
-            MetricManager.INSTANCE.addSlf4jReporter(configuration.get(METRICS_SLF4J_INTERVAL),
-                configuration.has(METRICS_SLF4J_LOGGER) ? configuration.get(METRICS_SLF4J_LOGGER) : null);
+            addMetricsReporter(MetricManager.GraphReporter.SLF4J,
+                () -> MetricManager.INSTANCE.addSlf4jReporter(configuration.get(METRICS_SLF4J_INTERVAL),
+                    configuration.has(METRICS_SLF4J_LOGGER) ? configuration.get(METRICS_SLF4J_LOGGER) : null));
         }
     }
 
     private void configureMetricsGraphiteReporter() {
         if (configuration.has(GRAPHITE_HOST)) {
-            MetricManager.INSTANCE.addGraphiteReporter(configuration.get(GRAPHITE_HOST),
-                configuration.get(GRAPHITE_PORT),
-                configuration.get(GRAPHITE_PREFIX),
-                configuration.get(GRAPHITE_INTERVAL));
+            addMetricsReporter(MetricManager.GraphReporter.GRAPHITE,
+                () -> MetricManager.INSTANCE.addGraphiteReporter(configuration.get(GRAPHITE_HOST),
+                    configuration.get(GRAPHITE_PORT),
+                    configuration.get(GRAPHITE_PREFIX),
+                    configuration.get(GRAPHITE_INTERVAL)));
         }
+    }
+
+    //Started by the graphs which open with this configuration, see startMetricsReporters()
+    private void addMetricsReporter(MetricManager.GraphReporter reporter, Runnable start) {
+        metricsReporters.put(reporter, start);
     }
 
 }

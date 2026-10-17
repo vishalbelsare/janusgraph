@@ -18,6 +18,8 @@ import com.google.common.base.Preconditions;
 import org.janusgraph.graphdb.query.profile.ProfileObservable;
 import org.janusgraph.graphdb.query.profile.QueryProfiler;
 
+import java.util.Objects;
+
 /**
  * Holds a {@link BackendQuery} and captures additional information that pertains to its execution and to be used by a
  * {@link QueryExecutor}:
@@ -72,6 +74,19 @@ public class BackendQueryHolder<E extends BackendQuery<E>> implements ProfileObs
         return profiler;
     }
 
+    /**
+     * Returns this holder with the given backend query in place of its own, observed by this holder's profiler, so that
+     * a profile shows the executions of the given query where it would show this holder's.
+     *
+     * @param query the backend query which runs in place of this holder's
+     * @return a holder of the given query, fitted and sorted as this one
+     */
+    public BackendQueryHolder<E> withBackendQuery(E query) {
+        final BackendQueryHolder<E> holder = new BackendQueryHolder<>(query, isFitted, isSorted, executionInfo);
+        holder.profiler = profiler;
+        return holder;
+    }
+
     @Override
     public void observeWith(QueryProfiler parentProfiler, boolean hasSiblings) {
         Preconditions.checkArgument(parentProfiler!=null);
@@ -80,5 +95,22 @@ public class BackendQueryHolder<E extends BackendQuery<E>> implements ProfileObs
         profiler.setAnnotation(QueryProfiler.ORDERED_ANNOTATION,isSorted);
         profiler.setAnnotation(QueryProfiler.QUERY_ANNOTATION,backendQuery);
         if (backendQuery instanceof ProfileObservable) ((ProfileObservable)backendQuery).observeWith(profiler);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(backendQuery, isFitted, isFitted);
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+        if(!(other instanceof BackendQueryHolder)){
+            return false;
+        }
+        BackendQueryHolder oth = (BackendQueryHolder) other;
+        return isFitted == oth.isFitted && isSorted == oth.isSorted && Objects.equals(backendQuery, oth.backendQuery);
     }
 }

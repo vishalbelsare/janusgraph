@@ -18,6 +18,7 @@ import com.datastax.oss.driver.api.core.CqlSession;
 import org.janusgraph.diskstorage.common.DistributedStoreManager;
 import org.janusgraph.diskstorage.configuration.Configuration;
 import org.janusgraph.diskstorage.cql.CQLStoreManager;
+import org.janusgraph.diskstorage.cql.TokenOrderKeyComparator;
 import org.janusgraph.diskstorage.keycolumnvalue.StandardStoreFeatures;
 import org.janusgraph.diskstorage.keycolumnvalue.StoreFeatures;
 import org.janusgraph.util.system.NetworkUtil;
@@ -26,6 +27,7 @@ import static org.janusgraph.diskstorage.cql.CQLConfigOptions.METADATA_TOKEN_MAP
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.ONLY_USE_LOCAL_CONSISTENCY_FOR_SYSTEM_OPERATIONS;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.PARTITIONER_NAME;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.READ_CONSISTENCY;
+import static org.janusgraph.diskstorage.cql.CQLConfigOptions.TTL_ENABLED;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.USE_EXTERNAL_LOCKING;
 import static org.janusgraph.diskstorage.cql.CQLConfigOptions.WRITE_CONSISTENCY;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.METRICS_PREFIX;
@@ -60,7 +62,12 @@ public class CQLStoreFeaturesBuilder {
         fb.keyConsistent((onlyUseLocalConsistency ? local : global), local);
         fb.locking(useExternalLocking);
         fb.optimisticLocking(true);
-        fb.multiQuery(false);
+        fb.optimizedWholeRowDeletion(true);
+        fb.multiQuery(true);
+
+        if (!configuration.get(TTL_ENABLED)) {
+            fb.cellTTL(false).storeTTL(false);
+        }
 
         String partitioner = null;
         if (configuration.has(PARTITIONER_NAME)) {
@@ -79,16 +86,27 @@ public class CQLStoreFeaturesBuilder {
                 "server, please check %s and %s options", PARTITIONER_NAME.getName(), METADATA_TOKEN_MAP_ENABLED.getName()));
         }
         switch (partitioner) {
-            case "DefaultPartitioner": // Amazon managed KeySpace uses com.amazonaws.cassandra.DefaultPartitioner
-                fb.timestamps(false).cellTTL(false);
+            case "DefaultPartitioner": // Amazon managed KeySpace supports com.amazonaws.cassandra.DefaultPartitioner
             case "RandomPartitioner":
             case "Murmur3Partitioner": {
                 fb.keyOrdered(false).orderedScan(false).unorderedScan(true);
+                // Murmur3 ring order is client-computable through the driver's token factory; declaring it
+                // puts multi-query scans (e.g. a reindex) on the lossless merge-join strategy instead of the
+                // bounded-buffer one, whose recovery from writes concurrent with the scan is capped. The
+                // TokenMap is absent when metadata token-map support is disabled (the escape hatch back to
+                // the buffered merge) or the partitioner is unknown to the driver (e.g. Amazon Keyspaces'
+                // DefaultPartitioner); RandomPartitioner is deliberately not declared - its order would be
+                // computable the same way, but no CI covers it and an undetected deviation would fail every
+                // multi-query scan via the framework's order verification.
+                if ("Murmur3Partitioner".equals(partitioner)) {
+                    session.getMetadata().getTokenMap()
+                        .ifPresent(tokenMap -> fb.scanKeyOrder(new TokenOrderKeyComparator(tokenMap)));
+                }
                 deployment = DistributedStoreManager.Deployment.REMOTE;
                 break;
             }
             case "ByteOrderedPartitioner": {
-                fb.keyOrdered(true).orderedScan(true).unorderedScan(false);
+                fb.keyOrdered(true).orderedScan(true).unorderedScan(true);
                 deployment = (hostnames.length == 1)// mark deployment as local only in case we have byte ordered partitioner and local
                     // connection
                     ? (NetworkUtil.isLocalConnection(hostnames[0])) ? DistributedStoreManager.Deployment.LOCAL : DistributedStoreManager.Deployment.REMOTE

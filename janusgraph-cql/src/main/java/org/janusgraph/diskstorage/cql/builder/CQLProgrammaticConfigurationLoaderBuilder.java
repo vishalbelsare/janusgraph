@@ -86,9 +86,7 @@ public class CQLProgrammaticConfigurationLoaderBuilder {
 
         configLoaderBuilder.withString(DefaultDriverOption.SESSION_NAME, configuration.get(SESSION_NAME));
 
-        if(configuration.has(REQUEST_TIMEOUT)) {
-            configLoaderBuilder.withDuration(DefaultDriverOption.REQUEST_TIMEOUT, Duration.ofMillis(configuration.get(REQUEST_TIMEOUT)));
-        }
+        configLoaderBuilder.withDuration(DefaultDriverOption.REQUEST_TIMEOUT, Duration.ofMillis(configuration.get(REQUEST_TIMEOUT)));
 
         configLoaderBuilder.withDuration(DefaultDriverOption.CONNECTION_CONNECT_TIMEOUT, connectionTimeoutMS);
 
@@ -160,10 +158,13 @@ public class CQLProgrammaticConfigurationLoaderBuilder {
 
     private void configureCqlNetty(Configuration configuration, ProgrammaticDriverConfigLoaderBuilder configLoaderBuilder){
         // The following sets the size of Netty ThreadPool executor used by Cassandra driver:
-        // https://docs.datastax.com/en/developer/java-driver/4.8/manual/core/async/#threading-model
-        configLoaderBuilder.withInt(DefaultDriverOption.NETTY_IO_SIZE, configuration.get(NETTY_IO_SIZE));
-        configLoaderBuilder.withInt(DefaultDriverOption.NETTY_ADMIN_SIZE, configuration.get(NETTY_ADMIN_SIZE));
-
+        // https://docs.datastax.com/en/developer/java-driver/4.13/manual/core/performance/#thread-pooling
+        if(configuration.has(NETTY_IO_SIZE)) {
+            configLoaderBuilder.withInt(DefaultDriverOption.NETTY_IO_SIZE, configuration.get(NETTY_IO_SIZE));
+        }
+        if(configuration.has(NETTY_ADMIN_SIZE)) {
+            configLoaderBuilder.withInt(DefaultDriverOption.NETTY_ADMIN_SIZE, configuration.get(NETTY_ADMIN_SIZE));
+        }
         if(configuration.has(NETTY_TIMER_TICK_DURATION)){
             configLoaderBuilder.withDuration(DefaultDriverOption.NETTY_TIMER_TICK_DURATION,
                 Duration.ofMillis(configuration.get(NETTY_TIMER_TICK_DURATION)));

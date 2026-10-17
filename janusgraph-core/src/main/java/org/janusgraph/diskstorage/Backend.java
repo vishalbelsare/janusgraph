@@ -20,7 +20,6 @@ import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.commons.lang3.StringUtils;
 import org.janusgraph.core.JanusGraphConfigurationException;
 import org.janusgraph.core.JanusGraphException;
-import org.janusgraph.core.schema.JanusGraphManagement;
 import org.janusgraph.diskstorage.configuration.BasicConfiguration;
 import org.janusgraph.diskstorage.configuration.ConfigOption;
 import org.janusgraph.diskstorage.configuration.Configuration;
@@ -48,6 +47,7 @@ import org.janusgraph.diskstorage.keycolumnvalue.cache.KCVSCache;
 import org.janusgraph.diskstorage.keycolumnvalue.cache.NoKCVSCache;
 import org.janusgraph.diskstorage.keycolumnvalue.keyvalue.OrderedKeyValueStoreManager;
 import org.janusgraph.diskstorage.keycolumnvalue.keyvalue.OrderedKeyValueStoreManagerAdapter;
+import org.janusgraph.diskstorage.keycolumnvalue.scan.ScanJobFuture;
 import org.janusgraph.diskstorage.keycolumnvalue.scan.StandardScanner;
 import org.janusgraph.diskstorage.locking.Locker;
 import org.janusgraph.diskstorage.locking.LockerProvider;
@@ -74,14 +74,17 @@ import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.ALLOW_CUSTOM_VERTEX_ID_TYPES;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.BASIC_METRICS;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.BUFFER_SIZE;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.DB_CACHE;
@@ -98,6 +101,7 @@ import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.LO
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.MANAGEMENT_LOG;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.METRICS_MERGE_STORES;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.METRICS_PREFIX;
+import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.NUM_MUTATIONS_PARALLEL_THRESHOLD;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.PAGE_SIZE;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.PARALLEL_BACKEND_EXECUTOR_SERVICE_CLASS;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.PARALLEL_BACKEND_EXECUTOR_SERVICE_CORE_POOL_SIZE;
@@ -160,6 +164,8 @@ public class Backend implements LockerProvider, AutoCloseable {
 
     private static final long ETERNAL_CACHE_EXPIRATION = 1000L *3600*24*365*200; //200 years
 
+    private static final AtomicLong NAME_COUNTER = new AtomicLong();
+
     //############ Registered Storage Managers ##############
 
     private static final Map<StandardStoreManager, ConfigOption<?>> STORE_SHORTHAND_OPTIONS = Collections.unmodifiableMap(new HashMap<StandardStoreManager, ConfigOption<?>>() {{
@@ -167,6 +173,7 @@ public class Backend implements LockerProvider, AutoCloseable {
         put(StandardStoreManager.CQL, STORAGE_HOSTS);
         put(StandardStoreManager.HBASE, STORAGE_HOSTS);
         //put(StandardStorageBackend.IN_MEMORY, null);
+        put(StandardStoreManager.SCYLLA, STORAGE_HOSTS);
     }});
 
     public static final Map<String,String> REGISTERED_LOG_MANAGERS = new HashMap<String, String>() {{
@@ -216,8 +223,10 @@ public class Backend implements LockerProvider, AutoCloseable {
     private final Map<String, IndexProvider> indexes;
 
     private final int bufferSize;
+    private final int numMutationsParallelThreshold;
     private final Duration maxWriteTime;
     private final Duration maxReadTime;
+    private final boolean allowCustomVertexIdType;
     private final boolean cacheEnabled;
     private final ExecutorService threadPool;
     private final long threadPoolShutdownMaxWaitTime;
@@ -243,6 +252,7 @@ public class Backend implements LockerProvider, AutoCloseable {
         txLogManager = getKCVSLogManager(TRANSACTION_LOG);
         userLogManager = getLogManager(USER_LOG);
 
+        allowCustomVertexIdType = configuration.get(ALLOW_CUSTOM_VERTEX_ID_TYPES);
 
         cacheEnabled = !configuration.get(STORAGE_BATCH) && configuration.get(DB_CACHE);
 
@@ -251,6 +261,9 @@ public class Backend implements LockerProvider, AutoCloseable {
         if (!storeFeatures.hasBatchMutation()) {
             bufferSize = Integer.MAX_VALUE;
         } else bufferSize = bufferSizeTmp;
+
+        this.numMutationsParallelThreshold = configuration.get(NUM_MUTATIONS_PARALLEL_THRESHOLD);
+        Preconditions.checkArgument(numMutationsParallelThreshold > 0, "Parallel-threshold for number of mutations should be positive");
 
         maxWriteTime = configuration.get(STORAGE_WRITE_WAITTIME);
         maxReadTime = configuration.get(STORAGE_READ_WAITTIME);
@@ -262,7 +275,18 @@ public class Backend implements LockerProvider, AutoCloseable {
             storeManagerLocking = storeManager;
         }
 
-        threadPool = configuration.get(PARALLEL_BACKEND_OPS) ? buildExecutorService(configuration) : null;
+        if(configuration.get(PARALLEL_BACKEND_OPS)){
+            if(storeFeatures.hasMultiQuery()){
+                log.info("{} supports multi-key queries. Thus, option {} is ignored in favor of multi-key queries. " +
+                    "Backend-ops executor pool will not be created for this storage backend.", storeManager.getName(), PARALLEL_BACKEND_OPS);
+                threadPool = null;
+            } else {
+                threadPool = buildExecutorService(configuration);
+            }
+        } else {
+            threadPool = null;
+        }
+
         threadPoolShutdownMaxWaitTime = configuration.get(PARALLEL_BACKEND_EXECUTOR_SERVICE_MAX_SHUTDOWN_WAIT_TIME);
 
         final String lockBackendName = configuration.get(LOCK_BACKEND);
@@ -376,7 +400,9 @@ public class Backend implements LockerProvider, AutoCloseable {
             userConfig = kcvsConfigurationBuilder.buildConfiguration(new BackendOperation.TransactionalProvider() {
                 @Override
                 public StoreTransaction openTx() throws BackendException {
-                    return storeManagerLocking.beginTransaction(StandardBaseTransactionConfig.of(configuration.get(TIMESTAMP_PROVIDER)));
+                    return storeManagerLocking.beginTransaction(StandardBaseTransactionConfig.of(
+                        configuration.get(TIMESTAMP_PROVIDER),
+                        storeFeatures.getKeyConsistentTxConfig()));
                 }
 
                 @Override
@@ -436,7 +462,7 @@ public class Backend implements LockerProvider, AutoCloseable {
                 .setWorkBlockSize(this.configuration.get(PAGE_SIZE));
     }
 
-    public JanusGraphManagement.IndexJobFuture getScanJobStatus(Object jobId) {
+    public ScanJobFuture getScanJobStatus(Object jobId) {
         return scanner.getRunningJob(jobId);
     }
 
@@ -455,6 +481,14 @@ public class Backend implements LockerProvider, AutoCloseable {
 
     public KCVSConfiguration getUserConfiguration() {
         return userConfig;
+    }
+
+    public int getBufferSize() {
+        return this.bufferSize;
+    }
+
+    public int getNumMutationsParallelThreshold() {
+        return this.numMutationsParallelThreshold;
     }
 
     private String getMetricsCacheName(String storeName) {
@@ -489,6 +523,9 @@ public class Backend implements LockerProvider, AutoCloseable {
         StoreManager manager = getImplementationClass(storageConfig, storageConfig.get(STORAGE_BACKEND),
                 StandardStoreManager.getAllManagerClasses());
         if (manager instanceof OrderedKeyValueStoreManager) {
+            if (storageConfig.get(ALLOW_CUSTOM_VERTEX_ID_TYPES)) {
+                throw new JanusGraphException(ALLOW_CUSTOM_VERTEX_ID_TYPES.getName() + " is not supported for OrderedKeyValueStore");
+            }
             Map<String, Integer> keyLength = new HashMap<>(3);
             keyLength.put(EDGESTORE_NAME, 8);
             keyLength.put(EDGESTORE_NAME + LOCK_STORE_SUFFIX, 8);
@@ -518,8 +555,9 @@ public class Backend implements LockerProvider, AutoCloseable {
     }
 
     public static <T> T getImplementationClass(Configuration config, String className, Map<String, String> registeredImplementations) {
-        if (registeredImplementations.containsKey(className.toLowerCase())) {
-            className = registeredImplementations.get(className.toLowerCase());
+        final String shorthand = className.toLowerCase(Locale.ROOT);
+        if (registeredImplementations.containsKey(shorthand)) {
+            className = registeredImplementations.get(shorthand);
         }
 
         return ConfigurationUtil.instantiate(className, new Object[]{config}, new Class[]{Configuration.class});
@@ -570,7 +608,8 @@ public class Backend implements LockerProvider, AutoCloseable {
         StoreTransaction tx = storeManagerLocking.beginTransaction(configuration);
 
         // Cache
-        CacheTransaction cacheTx = new CacheTransaction(tx, storeManagerLocking, bufferSize, maxWriteTime, configuration.hasEnabledBatchLoading());
+        CacheTransaction cacheTx = new CacheTransaction(tx, storeManagerLocking, bufferSize, numMutationsParallelThreshold,
+            maxWriteTime, configuration.hasEnabledBatchLoading());
 
         // Index transactions
         final Map<String, IndexTransaction> indexTx = new HashMap<>(indexes.size());
@@ -580,7 +619,7 @@ public class Backend implements LockerProvider, AutoCloseable {
 
         return new BackendTransaction(cacheTx, configuration, storeFeatures,
                 edgeStore, indexStore, txLogStore,
-                maxReadTime, indexTx, threadPool);
+                maxReadTime, indexTx, threadPool, !configuration.isSkipDBCacheRead(), allowCustomVertexIdType);
     }
 
     public synchronized void close() throws BackendException {
@@ -600,12 +639,14 @@ public class Backend implements LockerProvider, AutoCloseable {
             if (idAuthority != null) executeWithCatching(idAuthority::close, exceptionWrapper);
             if (systemConfig != null) executeWithCatching(systemConfig::close, exceptionWrapper);
             if (userConfig != null) executeWithCatching(userConfig::close, exceptionWrapper);
-            executeWithCatching(storeManager::close, exceptionWrapper);
-            gracefulExecutorServiceShutdown(threadPool, threadPoolShutdownMaxWaitTime);
-            //Indexes
+            //The index providers before the store manager, whose close may shut executors down and so restore an
+            //interrupt which ended its wait (the CQL store manager does), and the pool last for the same reason: an
+            //interrupt can break the I/O of the steps after it
             for (IndexProvider index : indexes.values()){
                 executeWithCatching(index::close, exceptionWrapper);
             }
+            executeWithCatching(storeManager::close, exceptionWrapper);
+            gracefulExecutorServiceShutdown(threadPool, threadPoolShutdownMaxWaitTime);
             throwIfException(exceptionWrapper);
         } else {
             log.debug("Backend {} has already been closed or cleared", this);
@@ -623,23 +664,32 @@ public class Backend implements LockerProvider, AutoCloseable {
         if (!hasAttemptedClose) {
             hasAttemptedClose = true;
 
-            managementLogManager.close();
-            txLogManager.close();
-            userLogManager.close();
+            //Every step runs, as in close(), so that a provider which fails to clear leaves none of the others open or
+            //uncleared; the first failure is thrown afterwards, the others suppressed
+            ExceptionWrapper exceptionWrapper = new ExceptionWrapper();
+            try {
+                executeWithCatching(() -> managementLogManager.close(), exceptionWrapper);
+                executeWithCatching(() -> txLogManager.close(), exceptionWrapper);
+                executeWithCatching(() -> userLogManager.close(), exceptionWrapper);
 
-            scanner.close();
-            edgeStore.close();
-            indexStore.close();
-            idAuthority.close();
-            systemConfig.close();
-            userConfig.close();
-            storeManager.clearStorage();
-            storeManager.close();
-            //Indexes
-            for (IndexProvider index : indexes.values()) {
-                index.clearStorage();
-                index.close();
+                executeWithCatching(() -> scanner.close(), exceptionWrapper);
+                executeWithCatching(() -> edgeStore.close(), exceptionWrapper);
+                executeWithCatching(() -> indexStore.close(), exceptionWrapper);
+                executeWithCatching(() -> idAuthority.close(), exceptionWrapper);
+                executeWithCatching(() -> systemConfig.close(), exceptionWrapper);
+                executeWithCatching(() -> userConfig.close(), exceptionWrapper);
+                //The index providers before the store manager, as in close()
+                for (IndexProvider index : indexes.values()) {
+                    executeWithCatching(index::clearStorage, exceptionWrapper);
+                    executeWithCatching(index::close, exceptionWrapper);
+                }
+                executeWithCatching(storeManager::clearStorage, exceptionWrapper);
+                executeWithCatching(storeManager::close, exceptionWrapper);
+            } finally {
+                //A later close() does nothing, so the threads of the pool end here, however the clearing went
+                gracefulExecutorServiceShutdown(threadPool, threadPoolShutdownMaxWaitTime);
             }
+            throwIfException(exceptionWrapper);
         } else {
             log.debug("Backend {} has already been closed or cleared", this);
         }
@@ -655,7 +705,7 @@ public class Backend implements LockerProvider, AutoCloseable {
         if (null == shorthand)
             return null;
 
-        shorthand = shorthand.toLowerCase();
+        shorthand = shorthand.toLowerCase(Locale.ROOT);
 
         for (StandardStoreManager m : STORE_SHORTHAND_OPTIONS.keySet()) {
             if (m.getShorthands().contains(shorthand))
@@ -695,15 +745,23 @@ public class Backend implements LockerProvider, AutoCloseable {
 
         ThreadFactory threadFactory = new ThreadFactoryBuilder().setNameFormat("Backend[%02d]").build();
         if (configuration.get(BASIC_METRICS)) {
-            threadFactory = ExecutorServiceInstrumentation.instrument(configuration.get(METRICS_PREFIX), "backend", threadFactory);
+            threadFactory = ExecutorServiceInstrumentation.instrument(configuration.get(METRICS_PREFIX), "backend-" + NAME_COUNTER.incrementAndGet(), threadFactory);
         }
 
         ExecutorServiceConfiguration executorServiceConfiguration =
             new ExecutorServiceConfiguration(executorServiceClass, corePoolSize, maxPoolSize, keepAliveTime, threadFactory);
         ExecutorService executorService = ExecutorServiceBuilder.build(executorServiceConfiguration);
         if (configuration.get(BASIC_METRICS)) {
-            executorService = ExecutorServiceInstrumentation.instrument(configuration.get(METRICS_PREFIX), "backend", executorService);
+            executorService = ExecutorServiceInstrumentation.instrument(configuration.get(METRICS_PREFIX), "backend-" + NAME_COUNTER.incrementAndGet(), executorService);
         }
         return executorService;
+    }
+
+    public KCVSCache getEdgeStoreCache(){
+        return edgeStore;
+    }
+
+    public KCVSCache getIndexStoreCache(){
+        return indexStore;
     }
 }

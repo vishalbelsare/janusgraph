@@ -75,7 +75,7 @@ public abstract class AbstractIndexManagementIT extends JanusGraphBaseTest {
         MapReduceIndexManagement mri = new MapReduceIndexManagement(graph);
         JanusGraphManagement m = graph.openManagement();
         JanusGraphIndex index = m.getGraphIndex("name");
-        ScanMetrics metrics = mri.updateIndex(index, SchemaAction.REMOVE_INDEX).get();
+        ScanMetrics metrics = mri.updateIndex(index, SchemaAction.DISCARD_INDEX).get();
 
         assertEquals(12, metrics.getCustom(IndexRemoveJob.DELETED_RECORDS_COUNT));
     }
@@ -89,7 +89,7 @@ public abstract class AbstractIndexManagementIT extends JanusGraphBaseTest {
         assertThrows(FileNotFoundException.class, () -> ToolRunner.run(app, new String[] {"-files", "invalid-file.txt"}));
 
         // submit the MapReduce job together with a dummy file
-        ToolRunner.run(app, new String[] {"-files", getClass().getClassLoader().getResource("log4j.properties").getPath()});
+        ToolRunner.run(app, new String[] {"-files", getClass().getClassLoader().getResource("log4j2-test.xml").getPath()});
         assertEquals(12, app.getMetrics().getCustom(IndexRemoveJob.DELETED_RECORDS_COUNT));
     }
 
@@ -118,7 +118,7 @@ public abstract class AbstractIndexManagementIT extends JanusGraphBaseTest {
         m = graph.openManagement();
         battled = m.getRelationType("battled");
         battlesByTime = m.getRelationIndex(battled, "battlesByTime");
-        ScanMetrics metrics = mri.updateIndex(battlesByTime, SchemaAction.REMOVE_INDEX).get();
+        ScanMetrics metrics = mri.updateIndex(battlesByTime, SchemaAction.DISCARD_INDEX).get();
 
         assertEquals(6, metrics.getCustom(IndexRemoveJob.DELETED_RECORDS_COUNT));
     }

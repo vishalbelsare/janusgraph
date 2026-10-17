@@ -29,13 +29,14 @@ import org.janusgraph.graphdb.database.IndexSerializer;
 import org.janusgraph.graphdb.internal.ElementCategory;
 import org.janusgraph.graphdb.query.BaseQuery;
 import org.janusgraph.graphdb.transaction.StandardJanusGraphTx;
-import org.janusgraph.graphdb.util.StreamIterable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
+import java.util.function.Function;
 import java.util.stream.Stream;
 
 /**
@@ -211,22 +212,24 @@ public class IndexQueryBuilder extends BaseQuery implements JanusGraphIndexQuery
         Preconditions.checkNotNull(query);
         if (tx.hasModifications())
             log.warn("Modifications in this transaction might not be accurately reflected in this index query: {}",query);
-        return serializer.executeQuery(this, resultType, tx.getTxHandle(),tx).map(r -> (Result<E>) new ResultImpl<>(tx.getConversionFunction(resultType).apply(r.getResult()), r.getScore())).filter(r -> !r.getElement().isRemoved());
+        final Function<Object, ? extends JanusGraphElement> toElement = tx.getConversionFunction(resultType);
+        return serializer.executeQuery(this, resultType, tx.getTxHandle(),tx)
+            //An id which converts to no element, as that of a relation which this transaction removed, or of one which
+            //no longer exists, is left out before it makes a result
+            .map(r -> {
+                final JanusGraphElement element = toElement.apply(r.getResult());
+                return element == null || element.isRemoved() ? null
+                    : (Result<E>) new ResultImpl<>((E) element, r.getScore());
+            })
+            .filter(Objects::nonNull);
     }
 
     private Long executeTotals(ElementCategory resultType) {
         Preconditions.checkNotNull(indexName);
         Preconditions.checkNotNull(query);
-        this.setLimit(0);
         if (tx.hasModifications())
             log.warn("Modifications in this transaction might not be accurately reflected in this index query: {}",query);
         return serializer.executeTotals(this,resultType,tx.getTxHandle(),tx);
-    }
-
-    @Deprecated
-    @Override
-    public Iterable<Result<JanusGraphVertex>> vertices() {
-        return new StreamIterable<>(vertexStream());
     }
 
     @Override
@@ -235,22 +238,10 @@ public class IndexQueryBuilder extends BaseQuery implements JanusGraphIndexQuery
         return execute(ElementCategory.VERTEX, JanusGraphVertex.class);
     }
 
-    @Deprecated
-    @Override
-    public Iterable<Result<JanusGraphEdge>> edges() {
-        return new StreamIterable<>(edgeStream());
-    }
-
     @Override
     public Stream<Result<JanusGraphEdge>> edgeStream() {
         setPrefixInternal(EDGE_PREFIX);
         return execute(ElementCategory.EDGE, JanusGraphEdge.class);
-    }
-
-    @Deprecated
-    @Override
-    public Iterable<Result<JanusGraphVertexProperty>> properties() {
-        return new StreamIterable<>(propertyStream());
     }
 
     @Override

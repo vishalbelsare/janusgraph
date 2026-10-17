@@ -161,13 +161,17 @@ public class ConfigurationManagementGraph {
      * graphName has been closed and reopened on every JanusGraph Node.
      */
     public void updateConfiguration(final String graphName, final Configuration config) {
-        final Map<Object, Object> map = ConfigurationConverter.getMap(config);
+        final Map<Object, Object> map;
         if (config.containsKey(PROPERTY_GRAPH_NAME)) {
+            map = ConfigurationConverter.getMap(config);
+
             final String graphNameOnConfig = (String) map.get(PROPERTY_GRAPH_NAME);
             Preconditions.checkArgument(graphName.equals(graphNameOnConfig),
                                         "Supplied graphName %s does not match property value supplied on config: %s.",
                                         graphName, graphNameOnConfig);
         } else {
+            // Make a copy of the map to avoid updating the user-provided Configuration
+            map = new HashMap<>(ConfigurationConverter.getMap(config));
             map.put(PROPERTY_GRAPH_NAME, graphName);
         }
         log.warn("Configuration {} is only guaranteed to take effect when graph {} has been closed and reopened on all Janus Graph Nodes.",
@@ -199,6 +203,22 @@ public class ConfigurationManagementGraph {
      */
     public void removeConfiguration(final String graphName) {
         removeVertex(PROPERTY_GRAPH_NAME, graphName);
+    }
+
+    /**
+     * Remove configuration corresponding to supplied graphName; we remove supplied existing
+     * properties.
+     * NOTE: The updated configuration is only guaranteed to take effect if the {@link Graph} corresponding to
+     * graphName has been closed and reopened on every JanusGraph Node.
+     */
+    public void removeConfiguration(final String graphName, final Set<String> configKeys) {
+        Preconditions.checkArgument(!configKeys.contains(PROPERTY_GRAPH_NAME),
+            "The list of configuration keys to remove cannot contain the property \"%s\".", PROPERTY_GRAPH_NAME);
+        log.warn("Configuration {} is only guaranteed to take effect when graph {} has been closed and reopened on all Janus Graph Nodes.",
+            graphName,
+            graphName
+        );
+        removeVertexProperties(PROPERTY_GRAPH_NAME, graphName, configKeys);
     }
 
     /**
@@ -327,6 +347,14 @@ public class ConfigurationManagementGraph {
         if (g.V().has(propertyKey, propertyValue).hasNext()) {
             final Vertex v = g.V().has(propertyKey, propertyValue).next();
             map.forEach((key, value) -> v.property((String) key, value));
+            graph.tx().commit();
+        }
+    }
+
+    private void removeVertexProperties(String propertyKey, Object propertyValue, Set<String> set) {
+        final GraphTraversalSource g = getTraversal();
+        if (g.V().has(propertyKey, propertyValue).hasNext()) {
+            g.V().has(propertyKey, propertyValue).properties(set.toArray(new String[0])).drop().iterate();
             graph.tx().commit();
         }
     }

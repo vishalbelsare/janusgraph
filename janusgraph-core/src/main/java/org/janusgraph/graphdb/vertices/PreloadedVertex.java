@@ -23,7 +23,9 @@ import org.apache.tinkerpop.gremlin.structure.Edge;
 import org.apache.tinkerpop.gremlin.structure.Vertex;
 import org.apache.tinkerpop.gremlin.structure.VertexProperty;
 import org.janusgraph.core.JanusGraphEdge;
+import org.janusgraph.core.JanusGraphRelation;
 import org.janusgraph.core.JanusGraphVertexProperty;
+import org.janusgraph.core.RelationType;
 import org.janusgraph.diskstorage.EntryList;
 import org.janusgraph.diskstorage.keycolumnvalue.SliceQuery;
 import org.janusgraph.graphdb.internal.ElementLifeCycle;
@@ -35,6 +37,7 @@ import org.janusgraph.util.datastructures.Retriever;
 
 import java.util.Collections;
 import java.util.Iterator;
+import java.util.Set;
 
 /**
  * @author Matthias Broecheler (me@matthiasb.com)
@@ -46,7 +49,7 @@ public class PreloadedVertex extends CacheVertex {
     private PropertyMixing mixin = NO_MIXIN;
     private AccessCheck accessCheck = DEFAULT_CHECK;
 
-    public PreloadedVertex(StandardJanusGraphTx tx, long id, byte lifecycle) {
+    public PreloadedVertex(StandardJanusGraphTx tx, Object id, byte lifecycle) {
         super(tx, id, lifecycle);
         assert lifecycle == ElementLifeCycle.Loaded : "Invalid lifecycle encountered: " + lifecycle;
     }
@@ -66,12 +69,23 @@ public class PreloadedVertex extends CacheVertex {
         super.addToQueryCache(query, entries);
     }
 
-    public EntryList getFromCache(final SliceQuery query) {
-        return queryCache.get(query);
+    @Override
+    public Iterable<InternalRelation> getAddedRelations(Predicate<InternalRelation> query) {
+        return Collections.EMPTY_LIST;
     }
 
     @Override
-    public Iterable<InternalRelation> getAddedRelations(Predicate<InternalRelation> query) {
+    public Iterable<InternalRelation> getAddedRelations(Set<? extends RelationType> types, Predicate<InternalRelation> query) {
+        return Collections.emptyList();
+    }
+
+    @Override
+    public Iterable<InternalRelation> findAddedProperty(Predicate<InternalRelation> query) {
+        return Collections.EMPTY_LIST;
+    }
+
+    @Override
+    public Iterable<InternalRelation> findPreviousRelation(long id) {
         return Collections.EMPTY_LIST;
     }
 
@@ -99,6 +113,11 @@ public class PreloadedVertex extends CacheVertex {
     @Override
     public EntryList loadRelations(SliceQuery query, Retriever<SliceQuery, EntryList> lookup) {
         return super.loadRelations(query, accessCheck.retrieveSliceQuery());
+    }
+
+    @Override
+    public EntryList loadRelations(SliceQuery query, Retriever<SliceQuery, EntryList> lookup, long refreshesBefore) {
+        return super.loadRelations(query, accessCheck.retrieveSliceQuery(), refreshesBefore);
     }
 
     @Override
@@ -139,6 +158,11 @@ public class PreloadedVertex extends CacheVertex {
 
     @Override
     public void remove() {
+
+    }
+
+    @Override
+    public void remove(Iterable<JanusGraphRelation> loadedRelations) {
 
     }
 

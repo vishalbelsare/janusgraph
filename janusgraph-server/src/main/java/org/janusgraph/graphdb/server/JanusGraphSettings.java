@@ -16,6 +16,7 @@ package org.janusgraph.graphdb.server;
 
 import org.apache.tinkerpop.gremlin.server.Settings;
 import org.janusgraph.graphdb.server.util.JanusGraphSettingsUtils;
+import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.TypeDescription;
 import org.yaml.snakeyaml.Yaml;
 import org.yaml.snakeyaml.constructor.Constructor;
@@ -27,6 +28,13 @@ import java.util.Objects;
 public class JanusGraphSettings extends Settings {
     private JanusGraphSettings.GrpcServerSettings grpcServer = new JanusGraphSettings.GrpcServerSettings();
 
+    /**
+     * Whether the Gremlin pool, which evaluates requests, runs them on virtual threads instead of platform threads.
+     * Requires Java 24 or later. The pool keeps the bounds of Gremlin Server's own pool: {@link #gremlinPool} requests
+     * run at once and up to {@link #maxWorkQueueSize} more wait, beyond which requests are rejected.
+     */
+    private boolean gremlinPoolVirtualThreads = false;
+
     public static JanusGraphSettings read(final String file) throws Exception {
         InputStream input = new FileInputStream(file);
         return read(input);
@@ -34,7 +42,7 @@ public class JanusGraphSettings extends Settings {
 
     public static JanusGraphSettings read(final InputStream stream) {
         Objects.requireNonNull(stream);
-        Constructor constructor = new Constructor(JanusGraphSettings.class);
+        Constructor constructor = new Constructor(JanusGraphSettings.class, new LoaderOptions());
         TypeDescription grpcServerSettings = new TypeDescription(JanusGraphSettings.GrpcServerSettings.class);
         constructor.addTypeDescription(grpcServerSettings);
 
@@ -49,6 +57,14 @@ public class JanusGraphSettings extends Settings {
 
     public void setGrpcServer(GrpcServerSettings grpcServer) {
         this.grpcServer = grpcServer;
+    }
+
+    public boolean isGremlinPoolVirtualThreads() {
+        return gremlinPoolVirtualThreads;
+    }
+
+    public void setGremlinPoolVirtualThreads(boolean gremlinPoolVirtualThreads) {
+        this.gremlinPoolVirtualThreads = gremlinPoolVirtualThreads;
     }
 
     public static class GrpcServerSettings {

@@ -48,8 +48,9 @@ public abstract class AbstractTypedRelation extends AbstractElement implements I
         if (isLoadedInThisTx()) {
             return this;
         }
-
-        InternalRelation next = (InternalRelation) RelationIdentifierUtils.findRelation(RelationIdentifierUtils.get(this), tx());
+        StandardJanusGraphTx tx = tx();
+        InternalRelation next = (InternalRelation) RelationIdentifierUtils.findRelation(
+            RelationIdentifierUtils.get(this, longId()), tx);
         if (next == null) {
             throw InvalidElementException.removedException(this);
         }
@@ -114,8 +115,13 @@ public abstract class AbstractTypedRelation extends AbstractElement implements I
     }
 
     @Override
+    public long longId() {
+        return ((Number) super.id()).longValue();
+    }
+
+    @Override
     public RelationIdentifier id() {
-        return RelationIdentifierUtils.get(this);
+        return RelationIdentifierUtils.get(this, longId());
     }
 
     /* ---------------------------------------------------------------
@@ -157,6 +163,11 @@ public abstract class AbstractTypedRelation extends AbstractElement implements I
     }
 
     @Override
+    public Object getCompareId() {
+        return longId();
+    }
+
+    @Override
     public <O> O value(String key) {
         verifyAccess();
         O val = valueInternal(tx().getPropertyKey(key));
@@ -182,8 +193,11 @@ public abstract class AbstractTypedRelation extends AbstractElement implements I
         if (keyNames == null || keyNames.length == 0) {
             keys = IteratorUtils.stream(it().getPropertyKeysDirect().iterator());
         } else {
-            keys = Stream.of(keyNames)
-                         .map(s -> tx().getPropertyKey(s)).filter(rt -> rt != null && getValueDirect(rt) != null);
+            keys =
+                Stream.of(keyNames)
+                    .filter(s -> s != null)
+                    .map(s -> tx().getPropertyKey(s))
+                    .filter(rt -> rt != null && getValueDirect(rt) != null);
         }
         return keys.map(rt -> (Property<V>) new SimpleJanusGraphProperty<V>(this, rt, valueInternal(rt))).iterator();
     }
